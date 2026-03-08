@@ -1,0 +1,3333 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "now.h"
+#include "pasta.h"
+
+/* Internal headers for unit testing */
+#include "now_lang.h"
+#include "now_fs.h"
+#include "now_version.h"
+#include "now_manifest.h"
+#include "now_resolve.h"
+#include "now_procure.h"
+#include "now_build.h"
+#include "now_package.h"
+#include "now_workspace.h"
+#include "now_plugin.h"
+#include "now_ci.h"
+#include "now_layer.h"
+#include "now_arch.h"
+#include "now_export.h"
+#include "now_trust.h"
+#include "now_repro.h"
+#include "now_advisory.h"
+#include "pico_http.h"
+#include "pico_ws.h"
+
+#ifndef NOW_TEST_RESOURCES
+  #define NOW_TEST_RESOURCES "."
+#endif
+
+static int tests_run    = 0;
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+#define TEST(name) \
+    do { tests_run++; printf("  %-50s", name); } while (0)
+#define PASS() \
+    do { tests_passed++; printf("PASS\n"); } while (0)
+#define FAIL(msg) \
+    do { tests_failed++; printf("FAIL: %s\n", msg); } while (0)
+#define ASSERT_STR(actual, expected) \
+    do { \
+        if (!(actual) || strcmp((actual), (expected)) != 0) { \
+            FAIL("expected '" expected "'"); return; \
+        } \
+    } while (0)
+#define ASSERT_EQ(actual, expected) \
+    do { \
+        if ((actual) != (expected)) { FAIL(#actual " != " #expected); return; } \
+    } while (0)
+#define ASSERT_NOT_NULL(ptr) \
+    do { if (!(ptr)) { FAIL(#ptr " is NULL"); return; } } while (0)
+
+/* ---- Version ---- */
+
+static void test_version(void) {
+    TEST("now_version");
+    const char *v = now_version();
+    ASSERT_NOT_NULL(v);
+    PASS();
+}
+
+/* ---- POM: load from string ---- */
+
+static void test_pom_minimal_string(void) {
+    TEST("pom: load minimal from string");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"demo\", version: \"1.0.0\","
+        "  langs: [\"c\"], std: \"c11\","
+        "  output: { type: \"executable\", name: \"demo\" } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_STR(now_project_group(p), "io.test");
+    ASSERT_STR(now_project_artifact(p), "demo");
+    ASSERT_STR(now_project_version(p), "1.0.0");
+    ASSERT_STR(now_project_std(p), "c11");
+    ASSERT_EQ(now_project_lang_count(p), (size_t)1);
+    ASSERT_STR(now_project_lang(p, 0), "c");
+    ASSERT_STR(now_project_output_type(p), "executable");
+    ASSERT_STR(now_project_output_name(p), "demo");
+    /* default source dirs */
+    ASSERT_STR(now_project_source_dir(p), "src/main/c");
+    ASSERT_STR(now_project_header_dir(p), "src/main/include");
+    now_project_free(p);
+    PASS();
+}
+
+static void test_pom_lang_scalar(void) {
+    TEST("pom: lang scalar shorthand");
+    const char *input =
+        "{ group: \"x\", artifact: \"x\", version: \"0.1.0\","
+        "  lang: \"c\", std: \"c11\" }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(now_project_lang_count(p), (size_t)1);
+    ASSERT_STR(now_project_lang(p, 0), "c");
+    now_project_free(p);
+    PASS();
+}
+
+static void test_pom_lang_mixed(void) {
+    TEST("pom: lang 'mixed' expands to c + c++");
+    const char *input =
+        "{ group: \"x\", artifact: \"x\", version: \"0.1.0\","
+        "  lang: \"mixed\" }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(now_project_lang_count(p), (size_t)2);
+    ASSERT_STR(now_project_lang(p, 0), "c");
+    ASSERT_STR(now_project_lang(p, 1), "c++");
+    now_project_free(p);
+    PASS();
+}
+
+static void test_pom_compile(void) {
+    TEST("pom: compile warnings and defines");
+    const char *input =
+        "{ group: \"x\", artifact: \"x\", version: \"0.1.0\","
+        "  compile: { warnings: [\"Wall\", \"Wextra\"],"
+        "             defines: [\"NDEBUG\", \"FOO=1\"],"
+        "             opt: \"speed\" } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(now_project_warning_count(p), (size_t)2);
+    ASSERT_STR(now_project_warning(p, 0), "Wall");
+    ASSERT_STR(now_project_warning(p, 1), "Wextra");
+    ASSERT_EQ(now_project_define_count(p), (size_t)2);
+    ASSERT_STR(now_project_define(p, 0), "NDEBUG");
+    ASSERT_STR(now_project_opt(p), "speed");
+    now_project_free(p);
+    PASS();
+}
+
+static void test_pom_deps(void) {
+    TEST("pom: dependency loading");
+    const char *input =
+        "{ group: \"x\", artifact: \"x\", version: \"0.1.0\","
+        "  deps: ["
+        "    { id: \"org.acme:core:^1.5\", scope: \"compile\" },"
+        "    { id: \"unity:unity:2.5.2\",  scope: \"test\"    }"
+        "  ] }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(now_project_dep_count(p), (size_t)2);
+    ASSERT_STR(now_project_dep_id(p, 0), "org.acme:core:^1.5");
+    ASSERT_STR(now_project_dep_scope(p, 0), "compile");
+    ASSERT_STR(now_project_dep_id(p, 1), "unity:unity:2.5.2");
+    ASSERT_STR(now_project_dep_scope(p, 1), "test");
+    now_project_free(p);
+    PASS();
+}
+
+static void test_pom_convergence(void) {
+    TEST("pom: convergence policy");
+    const char *input =
+        "{ group: \"x\", artifact: \"x\", version: \"0.1.0\","
+        "  convergence: \"lowest\" }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_STR(now_project_convergence(p), "lowest");
+    now_project_free(p);
+    PASS();
+}
+
+/* ---- POM: load from file ---- */
+
+static void test_pom_load_file(void) {
+    TEST("pom: load minimal.pasta from file");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/minimal.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    NowProject *p = now_project_load(path, &res);
+    if (!p) { FAIL(res.message); return; }
+    ASSERT_STR(now_project_group(p), "io.example");
+    ASSERT_STR(now_project_artifact(p), "hello");
+    ASSERT_STR(now_project_output_type(p), "executable");
+    ASSERT_EQ(now_project_dep_count(p), (size_t)1);
+    ASSERT_STR(now_project_dep_id(p, 0), "unity:unity:2.5.2");
+    now_project_free(p);
+    PASS();
+}
+
+static void test_pom_load_rich(void) {
+    TEST("pom: load rich.pasta from file");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/rich.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    NowProject *p = now_project_load(path, &res);
+    if (!p) { FAIL(res.message); return; }
+    ASSERT_STR(now_project_group(p), "org.acme");
+    ASSERT_STR(now_project_artifact(p), "rocketlib");
+    ASSERT_STR(now_project_version(p), "3.0.0-beta.1");
+    ASSERT_STR(now_project_name(p), "Rocket Library");
+    ASSERT_STR(now_project_license(p), "Apache-2.0");
+    ASSERT_EQ(now_project_lang_count(p), (size_t)2);
+    ASSERT_STR(now_project_lang(p, 0), "c");
+    ASSERT_STR(now_project_lang(p, 1), "c++");
+    ASSERT_STR(now_project_output_type(p), "shared");
+    ASSERT_STR(now_project_output_name(p), "rocket");
+    ASSERT_EQ(now_project_warning_count(p), (size_t)3);
+    ASSERT_STR(now_project_opt(p), "speed");
+    ASSERT_EQ(now_project_dep_count(p), (size_t)2);
+    ASSERT_STR(now_project_convergence(p), "lowest");
+    /* sources overridden */
+    ASSERT_STR(now_project_source_dir(p), "src/main");
+    ASSERT_STR(now_project_header_dir(p), "include");
+    now_project_free(p);
+    PASS();
+}
+
+/* ---- POM: error handling ---- */
+
+static void test_pom_syntax_error(void) {
+    TEST("pom: syntax error reported");
+    const char *input = "{ broken ]]]";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    if (p) { now_project_free(p); FAIL("should have failed"); return; }
+    ASSERT_EQ(res.code, NOW_ERR_SYNTAX);
+    PASS();
+}
+
+static void test_pom_not_a_map(void) {
+    TEST("pom: non-map root rejected");
+    const char *input = "[1, 2, 3]";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    if (p) { now_project_free(p); FAIL("should have failed"); return; }
+    ASSERT_EQ(res.code, NOW_ERR_SCHEMA);
+    PASS();
+}
+
+static void test_pom_file_not_found(void) {
+    TEST("pom: missing file error");
+    NowResult res;
+    NowProject *p = now_project_load("/nonexistent/now.pasta", &res);
+    if (p) { now_project_free(p); FAIL("should have failed"); return; }
+    ASSERT_EQ(res.code, NOW_ERR_IO);
+    PASS();
+}
+
+/* ---- Language type system ---- */
+
+static void test_lang_find_c(void) {
+    TEST("lang: find C definition");
+    now_lang_registry_init();
+    const NowLangDef *c = now_lang_find("c");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR(c->id, "c");
+    PASS();
+}
+
+static void test_lang_find_cxx(void) {
+    TEST("lang: find C++ definition");
+    const NowLangDef *cxx = now_lang_find("c++");
+    ASSERT_NOT_NULL(cxx);
+    ASSERT_STR(cxx->id, "c++");
+    PASS();
+}
+
+static void test_lang_classify_c(void) {
+    TEST("lang: classify .c file as c-source");
+    const char *langs[] = { "c" };
+    const NowLangDef *lang = NULL;
+    const NowLangType *type = now_lang_classify("foo/bar.c", langs, 1, &lang);
+    ASSERT_NOT_NULL(type);
+    ASSERT_STR(type->id, "c-source");
+    ASSERT_EQ(type->role, NOW_ROLE_SOURCE);
+    ASSERT_STR(type->output_ext, ".c.o");
+    ASSERT_NOT_NULL(lang);
+    ASSERT_STR(lang->id, "c");
+    PASS();
+}
+
+static void test_lang_classify_h(void) {
+    TEST("lang: classify .h file as c-header");
+    const char *langs[] = { "c" };
+    const NowLangDef *lang = NULL;
+    const NowLangType *type = now_lang_classify("include/api.h", langs, 1, &lang);
+    ASSERT_NOT_NULL(type);
+    ASSERT_STR(type->id, "c-header");
+    ASSERT_EQ(type->role, NOW_ROLE_HEADER);
+    PASS();
+}
+
+static void test_lang_classify_cpp(void) {
+    TEST("lang: classify .cpp as cxx-source");
+    const char *langs[] = { "c", "c++" };
+    const NowLangDef *lang = NULL;
+    const NowLangType *type = now_lang_classify("src/engine.cpp", langs, 2, &lang);
+    ASSERT_NOT_NULL(type);
+    ASSERT_STR(type->id, "cxx-source");
+    PASS();
+}
+
+static void test_lang_classify_unknown(void) {
+    TEST("lang: unknown extension returns NULL");
+    const char *langs[] = { "c" };
+    const NowLangType *type = now_lang_classify("readme.txt", langs, 1, NULL);
+    if (type) { FAIL("should be NULL"); return; }
+    PASS();
+}
+
+static void test_lang_source_exts(void) {
+    TEST("lang: source extensions for C");
+    const char *langs[] = { "c" };
+    const char **exts = now_lang_source_exts(langs, 1);
+    ASSERT_NOT_NULL(exts);
+    /* Should contain .c and .i */
+    int found_c = 0, found_i = 0;
+    for (const char **e = exts; *e; e++) {
+        if (strcmp(*e, ".c") == 0) found_c = 1;
+        if (strcmp(*e, ".i") == 0) found_i = 1;
+    }
+    free(exts);
+    if (!found_c) { FAIL("missing .c"); return; }
+    if (!found_i) { FAIL("missing .i"); return; }
+    PASS();
+}
+
+/* ---- Filesystem utilities ---- */
+
+static void test_fs_path_join(void) {
+    TEST("fs: path_join");
+    char *p = now_path_join("foo", "bar.c");
+    ASSERT_NOT_NULL(p);
+    ASSERT_STR(p, "foo/bar.c");
+    free(p);
+    PASS();
+}
+
+static void test_fs_path_join_trailing_sep(void) {
+    TEST("fs: path_join with trailing separator");
+    char *p = now_path_join("foo/", "bar.c");
+    ASSERT_NOT_NULL(p);
+    ASSERT_STR(p, "foo/bar.c");
+    free(p);
+    PASS();
+}
+
+static void test_fs_path_ext(void) {
+    TEST("fs: path_ext");
+    ASSERT_STR(now_path_ext("foo/bar.c"), ".c");
+    ASSERT_STR(now_path_ext("foo/bar.cpp"), ".cpp");
+    ASSERT_STR(now_path_ext("foo/bar"), "");
+    PASS();
+}
+
+static void test_fs_obj_path(void) {
+    TEST("fs: obj_path derivation");
+    char *obj = now_obj_path("/proj", "src/main/c/net/parser.c",
+                              "src/main/c", "target");
+    ASSERT_NOT_NULL(obj);
+    /* Should end with net/parser.c.o */
+    if (!strstr(obj, "net/parser.c.o") && !strstr(obj, "net\\parser.c.o")) {
+        FAIL(obj);
+        free(obj);
+        return;
+    }
+    free(obj);
+    PASS();
+}
+
+/* ---- Build integration ---- */
+
+static void test_build_hello(void) {
+    TEST("build: compile and link hello project");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hello/now.pasta", NOW_TEST_RESOURCES);
+
+    NowResult res;
+    NowProject *p = now_project_load(path, &res);
+    if (!p) { FAIL(res.message); return; }
+
+    char basedir[512];
+    snprintf(basedir, sizeof(basedir), "%s/hello", NOW_TEST_RESOURCES);
+
+    int rc = now_build(p, basedir, 0, 0, &res);
+    now_project_free(p);
+
+    if (rc != 0) { FAIL(res.message); return; }
+
+    /* Check output exists */
+    char out_path[512];
+#ifdef _WIN32
+    snprintf(out_path, sizeof(out_path), "%s/target/bin/hello.exe", basedir);
+#else
+    snprintf(out_path, sizeof(out_path), "%s/target/bin/hello", basedir);
+#endif
+    if (!now_path_exists(out_path)) {
+        FAIL("output binary not found");
+        return;
+    }
+    PASS();
+}
+
+/* ---- Semantic versioning ---- */
+
+static void test_semver_parse_basic(void) {
+    TEST("semver: parse 1.2.3");
+    NowSemVer v;
+    ASSERT_EQ(now_semver_parse("1.2.3", &v), 0);
+    ASSERT_EQ(v.major, 1);
+    ASSERT_EQ(v.minor, 2);
+    ASSERT_EQ(v.patch, 3);
+    if (v.prerelease) { FAIL("prerelease should be NULL"); now_semver_free(&v); return; }
+    now_semver_free(&v);
+    PASS();
+}
+
+static void test_semver_parse_prerelease(void) {
+    TEST("semver: parse 3.0.0-beta.1");
+    NowSemVer v;
+    ASSERT_EQ(now_semver_parse("3.0.0-beta.1", &v), 0);
+    ASSERT_EQ(v.major, 3);
+    ASSERT_EQ(v.minor, 0);
+    ASSERT_EQ(v.patch, 0);
+    ASSERT_NOT_NULL(v.prerelease);
+    ASSERT_STR(v.prerelease, "beta.1");
+    now_semver_free(&v);
+    PASS();
+}
+
+static void test_semver_parse_build(void) {
+    TEST("semver: parse 1.0.0+build.42");
+    NowSemVer v;
+    ASSERT_EQ(now_semver_parse("1.0.0+build.42", &v), 0);
+    ASSERT_EQ(v.major, 1);
+    ASSERT_NOT_NULL(v.build);
+    ASSERT_STR(v.build, "build.42");
+    now_semver_free(&v);
+    PASS();
+}
+
+static void test_semver_compare(void) {
+    TEST("semver: compare ordering");
+    NowSemVer a, b;
+    now_semver_parse("1.0.0", &a);
+    now_semver_parse("2.0.0", &b);
+    if (now_semver_compare(&a, &b) >= 0) { FAIL("1.0.0 should < 2.0.0"); now_semver_free(&a); now_semver_free(&b); return; }
+    now_semver_free(&a); now_semver_free(&b);
+
+    now_semver_parse("1.2.3", &a);
+    now_semver_parse("1.2.3", &b);
+    ASSERT_EQ(now_semver_compare(&a, &b), 0);
+    now_semver_free(&a); now_semver_free(&b);
+
+    /* pre-release < release */
+    now_semver_parse("1.0.0-rc.1", &a);
+    now_semver_parse("1.0.0", &b);
+    if (now_semver_compare(&a, &b) >= 0) { FAIL("1.0.0-rc.1 should < 1.0.0"); now_semver_free(&a); now_semver_free(&b); return; }
+    now_semver_free(&a); now_semver_free(&b);
+    PASS();
+}
+
+static void test_semver_to_string(void) {
+    TEST("semver: to_string roundtrip");
+    NowSemVer v;
+    now_semver_parse("1.2.3-beta.1", &v);
+    char *s = now_semver_to_string(&v);
+    ASSERT_NOT_NULL(s);
+    ASSERT_STR(s, "1.2.3-beta.1");
+    free(s);
+    now_semver_free(&v);
+    PASS();
+}
+
+/* ---- Version ranges ---- */
+
+static void test_range_exact(void) {
+    TEST("range: exact 1.2.3");
+    NowVersionRange r;
+    ASSERT_EQ(now_range_parse("1.2.3", &r), 0);
+    ASSERT_EQ(r.kind, NOW_RANGE_EXACT);
+
+    NowSemVer v;
+    now_semver_parse("1.2.3", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("1.2.4", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 0);
+    now_semver_free(&v);
+
+    now_range_free(&r);
+    PASS();
+}
+
+static void test_range_caret(void) {
+    TEST("range: caret ^1.2.3 → [1.2.3, 2.0.0)");
+    NowVersionRange r;
+    ASSERT_EQ(now_range_parse("^1.2.3", &r), 0);
+    ASSERT_EQ(r.kind, NOW_RANGE_CARET);
+
+    NowSemVer v;
+    now_semver_parse("1.2.3", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("1.9.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("2.0.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 0);
+    now_semver_free(&v);
+
+    now_semver_parse("1.2.2", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 0);
+    now_semver_free(&v);
+
+    now_range_free(&r);
+    PASS();
+}
+
+static void test_range_caret_pre1(void) {
+    TEST("range: caret ^0.9.3 → [0.9.3, 0.10.0)");
+    NowVersionRange r;
+    ASSERT_EQ(now_range_parse("^0.9.3", &r), 0);
+
+    NowSemVer v;
+    now_semver_parse("0.9.5", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("0.10.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 0);
+    now_semver_free(&v);
+
+    now_range_free(&r);
+    PASS();
+}
+
+static void test_range_tilde(void) {
+    TEST("range: tilde ~1.2.3 → [1.2.3, 1.3.0)");
+    NowVersionRange r;
+    ASSERT_EQ(now_range_parse("~1.2.3", &r), 0);
+    ASSERT_EQ(r.kind, NOW_RANGE_TILDE);
+
+    NowSemVer v;
+    now_semver_parse("1.2.9", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("1.3.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 0);
+    now_semver_free(&v);
+
+    now_range_free(&r);
+    PASS();
+}
+
+static void test_range_gte(void) {
+    TEST("range: >=2.0.0");
+    NowVersionRange r;
+    ASSERT_EQ(now_range_parse(">=2.0.0", &r), 0);
+    ASSERT_EQ(r.kind, NOW_RANGE_GTE);
+
+    NowSemVer v;
+    now_semver_parse("2.0.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("3.5.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("1.9.9", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 0);
+    now_semver_free(&v);
+
+    now_range_free(&r);
+    PASS();
+}
+
+static void test_range_compound(void) {
+    TEST("range: >=1.2.0 <2.0.0");
+    NowVersionRange r;
+    ASSERT_EQ(now_range_parse(">=1.2.0 <2.0.0", &r), 0);
+    ASSERT_EQ(r.kind, NOW_RANGE_COMPOUND);
+
+    NowSemVer v;
+    now_semver_parse("1.5.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_semver_parse("2.0.0", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 0);
+    now_semver_free(&v);
+
+    now_range_free(&r);
+    PASS();
+}
+
+static void test_range_wildcard(void) {
+    TEST("range: * matches anything");
+    NowVersionRange r;
+    ASSERT_EQ(now_range_parse("*", &r), 0);
+    ASSERT_EQ(r.kind, NOW_RANGE_ANY);
+
+    NowSemVer v;
+    now_semver_parse("99.99.99", &v);
+    ASSERT_EQ(now_range_satisfies(&r, &v), 1);
+    now_semver_free(&v);
+
+    now_range_free(&r);
+    PASS();
+}
+
+static void test_range_intersect(void) {
+    TEST("range: intersect ^1.3.0 ∩ ^1.2.0 → [1.3.0, 2.0.0)");
+    NowVersionRange a, b, out;
+    now_range_parse("^1.3.0", &a);
+    now_range_parse("^1.2.0", &b);
+    ASSERT_EQ(now_range_intersect(&a, &b, &out), 0);
+
+    /* Floor should be 1.3.0 */
+    ASSERT_EQ(out.floor.major, 1);
+    ASSERT_EQ(out.floor.minor, 3);
+    ASSERT_EQ(out.floor.patch, 0);
+
+    /* Ceiling should be 2.0.0 */
+    ASSERT_EQ(out.ceiling.major, 2);
+    ASSERT_EQ(out.ceiling.minor, 0);
+
+    now_range_free(&a);
+    now_range_free(&b);
+    now_range_free(&out);
+    PASS();
+}
+
+/* ---- Coordinate parsing ---- */
+
+static void test_coord_parse(void) {
+    TEST("coord: parse org.acme:core:^1.5.0");
+    NowCoordinate c;
+    ASSERT_EQ(now_coord_parse("org.acme:core:^1.5.0", &c), 0);
+    ASSERT_STR(c.group, "org.acme");
+    ASSERT_STR(c.artifact, "core");
+    ASSERT_STR(c.version, "^1.5.0");
+    now_coord_free(&c);
+    PASS();
+}
+
+/* ---- Manifest ---- */
+
+static void test_manifest_set_find(void) {
+    TEST("manifest: set and find entry");
+    NowManifest m;
+    now_manifest_init(&m);
+    ASSERT_EQ(now_manifest_set(&m, "src/main.c", "target/obj/main.c.o",
+                                "abc123", "def456", 1000), 0);
+    const NowManifestEntry *e = now_manifest_find(&m, "src/main.c");
+    ASSERT_NOT_NULL(e);
+    ASSERT_STR(e->source, "src/main.c");
+    ASSERT_STR(e->object, "target/obj/main.c.o");
+    ASSERT_STR(e->source_hash, "abc123");
+    now_manifest_free(&m);
+    PASS();
+}
+
+static void test_manifest_update(void) {
+    TEST("manifest: update existing entry");
+    NowManifest m;
+    now_manifest_init(&m);
+    now_manifest_set(&m, "src/main.c", "obj1", "hash1", "fh1", 100);
+    now_manifest_set(&m, "src/main.c", "obj2", "hash2", "fh2", 200);
+    ASSERT_EQ(m.count, (size_t)1);
+    const NowManifestEntry *e = now_manifest_find(&m, "src/main.c");
+    ASSERT_NOT_NULL(e);
+    ASSERT_STR(e->object, "obj2");
+    ASSERT_STR(e->source_hash, "hash2");
+    now_manifest_free(&m);
+    PASS();
+}
+
+static void test_sha256_string(void) {
+    TEST("manifest: sha256 of known string");
+    char *hash = now_sha256_string("hello", 5);
+    ASSERT_NOT_NULL(hash);
+    /* SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824 */
+    ASSERT_STR(hash, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+    free(hash);
+    PASS();
+}
+
+/* ---- Resolver ---- */
+
+static void test_resolver_single_dep(void) {
+    TEST("resolver: single dependency resolves");
+    NowResolver r;
+    now_resolver_init(&r, "lowest");
+    ASSERT_EQ(now_resolver_add(&r, "zlib:zlib:^1.3.0", "compile", "root", 0), 0);
+
+    NowLockFile lf;
+    now_lock_init(&lf);
+    NowResult res;
+    ASSERT_EQ(now_resolver_resolve(&r, &lf, &res), 0);
+    ASSERT_EQ(lf.count, (size_t)1);
+
+    const NowLockEntry *e = now_lock_find(&lf, "zlib", "zlib");
+    ASSERT_NOT_NULL(e);
+    ASSERT_STR(e->group, "zlib");
+    ASSERT_STR(e->artifact, "zlib");
+    ASSERT_STR(e->version, "1.3.0");  /* lowest = floor */
+    ASSERT_STR(e->scope, "compile");
+
+    now_lock_free(&lf);
+    now_resolver_free(&r);
+    PASS();
+}
+
+static void test_resolver_convergence_lowest(void) {
+    TEST("resolver: lowest convergence picks floor of intersection");
+    NowResolver r;
+    now_resolver_init(&r, "lowest");
+    now_resolver_add(&r, "zlib:zlib:^1.3.0", "compile", "A", 0);
+    now_resolver_add(&r, "zlib:zlib:^1.2.0", "compile", "B", 0);
+
+    NowLockFile lf;
+    now_lock_init(&lf);
+    NowResult res;
+    ASSERT_EQ(now_resolver_resolve(&r, &lf, &res), 0);
+
+    const NowLockEntry *e = now_lock_find(&lf, "zlib", "zlib");
+    ASSERT_NOT_NULL(e);
+    /* Intersection of ^1.3.0 and ^1.2.0 = [1.3.0, 2.0.0), lowest = 1.3.0 */
+    ASSERT_STR(e->version, "1.3.0");
+
+    now_lock_free(&lf);
+    now_resolver_free(&r);
+    PASS();
+}
+
+static void test_resolver_conflict(void) {
+    TEST("resolver: disjoint ranges produce conflict");
+    NowResolver r;
+    now_resolver_init(&r, "lowest");
+    now_resolver_add(&r, "zlib:zlib:^1.0.0", "compile", "A", 0);
+    now_resolver_add(&r, "zlib:zlib:^2.0.0", "compile", "B", 0);
+
+    NowLockFile lf;
+    now_lock_init(&lf);
+    NowResult res;
+    int rc = now_resolver_resolve(&r, &lf, &res);
+    if (rc == 0) { FAIL("should have conflicted"); now_lock_free(&lf); now_resolver_free(&r); return; }
+    ASSERT_EQ(res.code, NOW_ERR_SCHEMA);
+
+    now_lock_free(&lf);
+    now_resolver_free(&r);
+    PASS();
+}
+
+static void test_resolver_multiple_deps(void) {
+    TEST("resolver: multiple different deps resolve independently");
+    NowResolver r;
+    now_resolver_init(&r, "lowest");
+    now_resolver_add(&r, "zlib:zlib:^1.3.0", "compile", "root", 0);
+    now_resolver_add(&r, "org.acme:core:~4.2.0", "compile", "root", 0);
+
+    NowLockFile lf;
+    now_lock_init(&lf);
+    NowResult res;
+    ASSERT_EQ(now_resolver_resolve(&r, &lf, &res), 0);
+    ASSERT_EQ(lf.count, (size_t)2);
+
+    ASSERT_NOT_NULL(now_lock_find(&lf, "zlib", "zlib"));
+    ASSERT_NOT_NULL(now_lock_find(&lf, "org.acme", "core"));
+    ASSERT_STR(now_lock_find(&lf, "org.acme", "core")->version, "4.2.0");
+
+    now_lock_free(&lf);
+    now_resolver_free(&r);
+    PASS();
+}
+
+static void test_resolver_override(void) {
+    TEST("resolver: override forces version despite range conflict");
+    NowResolver r;
+    now_resolver_init(&r, "lowest");
+    now_resolver_add(&r, "zlib:zlib:^1.0.0", "compile", "A", 0);
+    now_resolver_add(&r, "zlib:zlib:2.0.0", "compile", "override", 1);
+
+    NowLockFile lf;
+    now_lock_init(&lf);
+    NowResult res;
+    ASSERT_EQ(now_resolver_resolve(&r, &lf, &res), 0);
+
+    const NowLockEntry *e = now_lock_find(&lf, "zlib", "zlib");
+    ASSERT_NOT_NULL(e);
+    ASSERT_STR(e->version, "2.0.0");
+    ASSERT_EQ(e->overridden, 1);
+
+    now_lock_free(&lf);
+    now_resolver_free(&r);
+    PASS();
+}
+
+static void test_lock_save_load(void) {
+    TEST("lock: save and reload");
+    NowLockFile lf;
+    now_lock_init(&lf);
+
+    NowLockEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.group = "zlib";
+    entry.artifact = "zlib";
+    entry.version = "1.3.0";
+    entry.scope = "compile";
+    entry.triple = "noarch";
+    now_lock_set(&lf, &entry);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/test_lock.pasta", NOW_TEST_RESOURCES);
+    ASSERT_EQ(now_lock_save(&lf, path), 0);
+    now_lock_free(&lf);
+
+    /* Reload */
+    NowLockFile lf2;
+    ASSERT_EQ(now_lock_load(&lf2, path), 0);
+    ASSERT_EQ(lf2.count, (size_t)1);
+    const NowLockEntry *e = now_lock_find(&lf2, "zlib", "zlib");
+    ASSERT_NOT_NULL(e);
+    ASSERT_STR(e->version, "1.3.0");
+    ASSERT_STR(e->scope, "compile");
+
+    now_lock_free(&lf2);
+    /* Clean up test file */
+    remove(path);
+    PASS();
+}
+
+static void test_test_phase(void) {
+    TEST("test: compile and run test sources");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/testable/now.pasta", NOW_TEST_RESOURCES);
+
+    NowResult res;
+    NowProject *p = now_project_load(path, &res);
+    if (!p) { FAIL(res.message); return; }
+
+    char basedir[512];
+    snprintf(basedir, sizeof(basedir), "%s/testable", NOW_TEST_RESOURCES);
+
+    int rc = now_test(p, basedir, 0, 0, &res);
+    now_project_free(p);
+
+    if (rc != 0) { FAIL(res.message); return; }
+    PASS();
+}
+
+/* ---- Main ---- */
+
+/* ---- HTTP client ---- */
+
+static void test_pico_http_version(void) {
+    TEST("pico_http: version string");
+    const char *v = pico_http_version();
+    ASSERT_NOT_NULL(v);
+    ASSERT_STR(v, "0.3.0");
+    PASS();
+}
+
+static void test_pico_http_parse_url(void) {
+    TEST("pico_http: parse URL");
+    char *host = NULL, *path = NULL;
+    int port = 0;
+    int rc = pico_http_parse_url("http://localhost:8080/resolve/org/acme",
+                                 &host, &port, &path);
+    ASSERT_EQ(rc, 0);
+    ASSERT_STR(host, "localhost");
+    ASSERT_EQ(port, 8080);
+    ASSERT_STR(path, "/resolve/org/acme");
+    free(host);
+    free(path);
+    PASS();
+}
+
+static void test_pico_http_parse_url_no_port(void) {
+    TEST("pico_http: parse URL without port");
+    char *host = NULL, *path = NULL;
+    int port = 0;
+    int rc = pico_http_parse_url("http://example.com/api",
+                                 &host, &port, &path);
+    ASSERT_EQ(rc, 0);
+    ASSERT_STR(host, "example.com");
+    ASSERT_EQ(port, 80);
+    ASSERT_STR(path, "/api");
+    free(host);
+    free(path);
+    PASS();
+}
+
+static void test_pico_http_parse_url_no_path(void) {
+    TEST("pico_http: parse URL without path");
+    char *host = NULL, *path = NULL;
+    int port = 0;
+    int rc = pico_http_parse_url("http://example.com",
+                                 &host, &port, &path);
+    ASSERT_EQ(rc, 0);
+    ASSERT_STR(host, "example.com");
+    ASSERT_EQ(port, 80);
+    ASSERT_STR(path, "/");
+    free(host);
+    free(path);
+    PASS();
+}
+
+static void test_pico_http_parse_url_https(void) {
+    TEST("pico_http: parse https URL");
+    char *host = NULL, *path = NULL;
+    int port = 0, tls = 0;
+    int rc = pico_http_parse_url_ex("https://example.com/api",
+                                     &host, &port, &path, &tls);
+    ASSERT_EQ(rc, 0);
+    ASSERT_STR(host, "example.com");
+    ASSERT_EQ(port, 443);
+    ASSERT_STR(path, "/api");
+    ASSERT_EQ(tls, 1);
+    free(host);
+    free(path);
+    PASS();
+}
+
+static void test_pico_http_parse_url_reject_ftp(void) {
+    TEST("pico_http: reject ftp URL");
+    char *host = NULL, *path = NULL;
+    int port = 0;
+    int rc = pico_http_parse_url("ftp://example.com/file",
+                                 &host, &port, &path);
+    ASSERT_EQ(rc, -1);
+    PASS();
+}
+
+static void test_pico_http_error_codes(void) {
+    TEST("pico_http: error code strings");
+    ASSERT_STR(pico_http_strerror(PICO_OK), "success");
+    ASSERT_STR(pico_http_strerror(PICO_ERR_DNS), "DNS resolution failed");
+    ASSERT_STR(pico_http_strerror(PICO_ERR_CONNECT), "connection failed");
+    ASSERT_STR(pico_http_strerror(PICO_ERR_TOO_MANY_REDIRECTS), "too many redirects");
+    ASSERT_STR(pico_http_strerror(PICO_ERR_TLS), "TLS error");
+    /* Unknown code */
+    ASSERT_STR(pico_http_strerror(-99), "unknown error");
+    PASS();
+}
+
+static void test_pico_http_invalid_args(void) {
+    TEST("pico_http: invalid arguments return PICO_ERR_INVALID");
+    PicoHttpResponse res;
+    ASSERT_EQ(pico_http_get(NULL, 80, "/", NULL, &res), PICO_ERR_INVALID);
+    ASSERT_EQ(pico_http_get("host", 80, NULL, NULL, &res), PICO_ERR_INVALID);
+    ASSERT_EQ(pico_http_get("host", 80, "/", NULL, NULL), PICO_ERR_INVALID);
+    PASS();
+}
+
+static void test_pico_http_dns_failure(void) {
+    TEST("pico_http: DNS failure returns PICO_ERR_DNS");
+    PicoHttpResponse res;
+    PicoHttpOptions opts = {0};
+    opts.connect_timeout_ms = 1000;
+    int rc = pico_http_get("this-host-does-not-exist-7f3a.invalid",
+                           80, "/", &opts, &res);
+    ASSERT_EQ(rc, PICO_ERR_DNS);
+    PASS();
+}
+
+static void test_pico_http_connect_failure(void) {
+    TEST("pico_http: connect failure returns PICO_ERR_CONNECT");
+    PicoHttpResponse res;
+    PicoHttpOptions opts = {0};
+    opts.connect_timeout_ms = 1000;
+    /* Port 1 is almost certainly not listening */
+    int rc = pico_http_get("127.0.0.1", 1, "/", &opts, &res);
+    ASSERT_EQ(rc, PICO_ERR_CONNECT);
+    PASS();
+}
+
+static void test_pico_http_find_header(void) {
+    TEST("pico_http: find_header on empty response");
+    PicoHttpResponse res;
+    memset(&res, 0, sizeof(res));
+    if (pico_http_find_header(&res, "Content-Type") != NULL) {
+        FAIL("expected NULL for empty response");
+        return;
+    }
+    PASS();
+}
+
+static void test_pico_http_request_url(void) {
+    TEST("pico_http: request with invalid URL");
+    PicoHttpResponse res;
+    int rc = pico_http_request("GET", "not-a-url", NULL, NULL, 0, NULL, &res);
+    ASSERT_EQ(rc, PICO_ERR_INVALID);
+    PASS();
+}
+
+static void test_pico_http_response_free_zeroed(void) {
+    TEST("pico_http: response_free on zeroed struct");
+    PicoHttpResponse res;
+    memset(&res, 0, sizeof(res));
+    pico_http_response_free(&res); /* should not crash */
+    pico_http_response_free(NULL); /* should not crash */
+    PASS();
+}
+
+static void test_pico_http_stream_invalid_args(void) {
+    TEST("pico_http: get_stream rejects NULL args");
+    PicoHttpResponse res;
+    int rc = pico_http_get_stream(NULL, 80, "/", NULL, &res, NULL, NULL);
+    ASSERT_EQ(rc, PICO_ERR_INVALID);
+    rc = pico_http_get_stream("localhost", 80, "/", NULL, &res, NULL, NULL);
+    ASSERT_EQ(rc, PICO_ERR_INVALID);
+    PASS();
+}
+
+static int stream_counter_fn(const void *data, size_t len, void *userdata) {
+    (void)data;
+    size_t *total = (size_t *)userdata;
+    *total += len;
+    return 0;
+}
+
+static void test_pico_http_stream_connect_failure(void) {
+    TEST("pico_http: get_stream connect failure");
+    PicoHttpResponse res;
+    size_t total = 0;
+    int rc = pico_http_get_stream("127.0.0.1", 1, "/", NULL, &res,
+                                   stream_counter_fn, &total);
+    ASSERT_EQ(rc != PICO_OK, 1);
+    ASSERT_EQ(total, 0);
+    PASS();
+}
+
+static int stream_abort_fn(const void *data, size_t len, void *userdata) {
+    (void)data; (void)len; (void)userdata;
+    return -1; /* abort immediately */
+}
+
+static void test_pico_http_stream_callback_type(void) {
+    TEST("pico_http: stream callback type exists");
+    /* Verify the typedef compiles and can be assigned */
+    PicoHttpWriteFn fn = stream_counter_fn;
+    ASSERT_NOT_NULL((void *)(size_t)fn);
+    fn = stream_abort_fn;
+    ASSERT_NOT_NULL((void *)(size_t)fn);
+    PASS();
+}
+
+/* ---- WebSocket client ---- */
+
+static void test_pico_ws_version(void) {
+    TEST("pico_ws: version string");
+    const char *v = pico_ws_version();
+    ASSERT_NOT_NULL(v);
+    ASSERT_STR(v, "0.1.0");
+    PASS();
+}
+
+static void test_pico_ws_error_codes(void) {
+    TEST("pico_ws: error code strings");
+    ASSERT_STR(pico_ws_strerror(PICO_WS_OK), "success");
+    ASSERT_STR(pico_ws_strerror(PICO_WS_ERR_CONNECT), "connection failed");
+    ASSERT_STR(pico_ws_strerror(PICO_WS_ERR_HANDSHAKE), "WebSocket handshake failed");
+    ASSERT_STR(pico_ws_strerror(PICO_WS_ERR_CLOSED), "connection closed");
+    ASSERT_STR(pico_ws_strerror(-99), "unknown error");
+    PASS();
+}
+
+static void test_pico_ws_invalid_args(void) {
+    TEST("pico_ws: invalid arguments");
+    int err = 0;
+    PicoWs *ws = pico_ws_connect(NULL, NULL, &err);
+    if (ws != NULL) { FAIL("expected NULL"); pico_ws_close(ws); return; }
+    ASSERT_EQ(err, PICO_WS_ERR_INVALID);
+    ASSERT_EQ(pico_ws_send(NULL, "hi", 2, 0), PICO_WS_ERR_INVALID);
+    char buf[16];
+    int r = pico_ws_recv(NULL, buf, sizeof(buf), 0, NULL);
+    ASSERT_EQ(r, PICO_WS_ERR_INVALID);
+    PASS();
+}
+
+static void test_pico_ws_bad_url(void) {
+    TEST("pico_ws: bad URL scheme");
+    int err = 0;
+    PicoWs *ws = pico_ws_connect("http://localhost/path", NULL, &err);
+    if (ws != NULL) { FAIL("expected NULL"); pico_ws_close(ws); return; }
+    ASSERT_EQ(err, PICO_WS_ERR_URL);
+    PASS();
+}
+
+static void test_pico_ws_connect_failure(void) {
+    TEST("pico_ws: connect failure");
+    int err = 0;
+    PicoWsOptions opts = {0};
+    opts.connect_timeout_ms = 1000;
+    PicoWs *ws = pico_ws_connect("ws://127.0.0.1:1/ws", &opts, &err);
+    if (ws != NULL) { FAIL("expected NULL"); pico_ws_close(ws); return; }
+    ASSERT_EQ(err, PICO_WS_ERR_CONNECT);
+    PASS();
+}
+
+static void test_pico_ws_close_null(void) {
+    TEST("pico_ws: close NULL safe");
+    pico_ws_close(NULL); /* should not crash */
+    PASS();
+}
+
+/* ---- Procure ---- */
+
+static void test_repo_dep_path(void) {
+    TEST("procure: repo dep path");
+    char *p = now_repo_dep_path("/tmp/repo", "org.acme", "core", "1.5.0");
+    ASSERT_NOT_NULL(p);
+    /* Check it contains the expected components */
+    if (!strstr(p, "org") || !strstr(p, "acme") ||
+        !strstr(p, "core") || !strstr(p, "1.5.0")) {
+        FAIL("path missing expected components");
+        free(p);
+        return;
+    }
+    free(p);
+    PASS();
+}
+
+static void test_procure_no_deps(void) {
+    TEST("procure: no deps returns success");
+    /* A project with no dependencies should succeed immediately */
+    NowResult res;
+    const char *pasta =
+        "{ group: \"io.test\", artifact: \"nodeps\", version: \"1.0.0\","
+        "  lang: \"c\" }";
+    NowProject *proj = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!proj) { FAIL(res.message); return; }
+
+    NowProcureOpts opts = {0};
+    opts.repo_root = "/tmp/now-test-repo";
+    int rc = now_procure(proj, &opts, &res);
+    now_project_free(proj);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+static void test_cpu_count(void) {
+    TEST("cpu count >= 1");
+    int n = now_cpu_count();
+    if (n < 1) { FAIL("cpu count < 1"); return; }
+    PASS();
+}
+
+static void test_obj_path_ex_obj(void) {
+    TEST("fs: obj_path_ex with .obj extension");
+    char *p = now_obj_path_ex("/project", "src/main/c/foo.c",
+                               "src/main/c", "target", ".obj");
+    if (!p) { FAIL("returned NULL"); return; }
+    /* Should end with foo.c.obj, not foo.c.o */
+    const char *end = strstr(p, "foo.c.obj");
+    if (!end) { FAIL(p); free(p); return; }
+    free(p);
+    PASS();
+}
+
+static void test_toolchain_gcc_default(void) {
+    TEST("toolchain: defaults to gcc (no CC env)");
+    /* Save and clear CC */
+    const char *saved_cc = getenv("CC");
+    char *saved_copy = saved_cc ? strdup(saved_cc) : NULL;
+#ifdef _WIN32
+    _putenv("CC=");
+#else
+    unsetenv("CC");
+#endif
+    NowToolchain tc;
+    memset(&tc, 0, sizeof(tc));
+    NowProject proj;
+    memset(&proj, 0, sizeof(proj));
+    now_toolchain_resolve(&tc, &proj);
+
+    int ok = (tc.is_msvc == 0);
+    now_toolchain_free(&tc);
+
+    /* Restore CC */
+    if (saved_copy) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "CC=%s", saved_copy);
+#ifdef _WIN32
+        _putenv(buf);
+#else
+        setenv("CC", saved_copy, 1);
+#endif
+        free(saved_copy);
+    }
+
+    if (!ok) { FAIL("is_msvc should be 0"); return; }
+    PASS();
+}
+
+static void test_publish_missing_identity(void) {
+    TEST("publish: rejects project without group/artifact/version");
+    NowProject proj;
+    memset(&proj, 0, sizeof(proj));
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_publish(&proj, ".", "http://localhost:9999", 0, &res);
+    if (rc == 0) { FAIL("should fail without identity"); return; }
+    ASSERT_EQ(res.code, NOW_ERR_SCHEMA);
+    PASS();
+}
+
+static void test_publish_no_package(void) {
+    TEST("publish: fails when tarball not found");
+    NowProject proj;
+    memset(&proj, 0, sizeof(proj));
+    proj.group = "org.test";
+    proj.artifact = "nope";
+    proj.version = "1.0.0";
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_publish(&proj, ".", "http://localhost:9999", 0, &res);
+    if (rc == 0) { FAIL("should fail without package"); return; }
+    ASSERT_EQ(res.code, NOW_ERR_NOT_FOUND);
+    PASS();
+}
+
+static void test_toolchain_msvc_detect(void) {
+    TEST("toolchain: detects MSVC from CC=cl.exe");
+#ifdef _WIN32
+    const char *saved_cc = getenv("CC");
+    char *saved_copy = saved_cc ? strdup(saved_cc) : NULL;
+    _putenv("CC=cl.exe");
+
+    NowToolchain tc;
+    memset(&tc, 0, sizeof(tc));
+    NowProject proj;
+    memset(&proj, 0, sizeof(proj));
+    now_toolchain_resolve(&tc, &proj);
+
+    int ok = (tc.is_msvc == 1);
+    int ar_ok = tc.ar && strstr(tc.ar, "lib") != NULL;
+    now_toolchain_free(&tc);
+
+    /* Restore CC */
+    if (saved_copy) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "CC=%s", saved_copy);
+        _putenv(buf);
+        free(saved_copy);
+    } else {
+        _putenv("CC=");
+    }
+
+    if (!ok) { FAIL("is_msvc should be 1"); return; }
+    if (!ar_ok) { FAIL("ar should be lib.exe"); return; }
+    PASS();
+#else
+    /* MSVC detection only applies on Windows */
+    PASS();
+#endif
+}
+
+/* ---- Workspace ---- */
+
+static void test_is_workspace_true(void) {
+    TEST("workspace: detect workspace root");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/workspace/now.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    NowProject *p = now_project_load(path, &res);
+    if (!p) { FAIL(res.message); return; }
+    if (!now_is_workspace(p)) { FAIL("expected workspace"); now_project_free(p); return; }
+    now_project_free(p);
+    PASS();
+}
+
+static void test_is_workspace_false(void) {
+    TEST("workspace: single project is not workspace");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\", lang: \"c\" }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+    if (now_is_workspace(p)) { FAIL("expected non-workspace"); now_project_free(p); return; }
+    now_project_free(p);
+    PASS();
+}
+
+static void test_workspace_init(void) {
+    TEST("workspace: init loads modules and builds graph");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/workspace/now.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    NowProject *p = now_project_load(path, &res);
+    if (!p) { FAIL(res.message); return; }
+
+    char basedir[512];
+    snprintf(basedir, sizeof(basedir), "%s/workspace", NOW_TEST_RESOURCES);
+
+    NowWorkspace ws;
+    int rc = now_workspace_init(&ws, p, basedir, &res);
+    if (rc != 0) { FAIL(res.message); now_project_free(p); return; }
+
+    /* Should have 2 modules */
+    if (ws.module_count != 2) { FAIL("expected 2 modules"); now_workspace_free(&ws); now_project_free(p); return; }
+
+    now_workspace_free(&ws);
+    now_project_free(p);
+    PASS();
+}
+
+static void test_workspace_topo_sort(void) {
+    TEST("workspace: topo sort orders core before app");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/workspace/now.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    NowProject *p = now_project_load(path, &res);
+    if (!p) { FAIL(res.message); return; }
+
+    char basedir[512];
+    snprintf(basedir, sizeof(basedir), "%s/workspace", NOW_TEST_RESOURCES);
+
+    NowWorkspace ws;
+    int rc = now_workspace_init(&ws, p, basedir, &res);
+    if (rc != 0) { FAIL(res.message); now_project_free(p); return; }
+
+    int **waves = NULL;
+    int *wave_sizes = NULL;
+    int nwaves = now_workspace_topo_sort(&ws, &waves, &wave_sizes, &res);
+    if (nwaves < 1) { FAIL("expected at least 1 wave"); now_workspace_free(&ws); now_project_free(p); return; }
+
+    /* core has no deps so it should appear in wave 0.
+     * app depends on core so it must appear in a later wave. */
+    int core_wave = -1, app_wave = -1;
+    for (int w = 0; w < nwaves; w++) {
+        for (int m = 0; m < wave_sizes[w]; m++) {
+            int idx = waves[w][m];
+            if (strcmp(ws.modules[idx].name, "core") == 0) core_wave = w;
+            if (strcmp(ws.modules[idx].name, "app") == 0) app_wave = w;
+        }
+    }
+
+    /* Free waves */
+    for (size_t i = 0; i < ws.module_count; i++) free(waves[i]);
+    free(waves); free(wave_sizes);
+    now_workspace_free(&ws);
+    now_project_free(p);
+
+    if (core_wave < 0 || app_wave < 0) { FAIL("missing module in waves"); return; }
+    if (core_wave >= app_wave) { FAIL("core must be in earlier wave than app"); return; }
+    PASS();
+}
+
+static void test_workspace_is_null(void) {
+    TEST("workspace: is_workspace(NULL) returns 0");
+    if (now_is_workspace(NULL) != 0) { FAIL("expected 0"); return; }
+    PASS();
+}
+
+/* ---- Plugin system ---- */
+
+static void test_plugin_is_builtin(void) {
+    TEST("plugin: detect built-in ids");
+    if (!now_plugin_is_builtin("now:version")) { FAIL("now:version should be builtin"); return; }
+    if (!now_plugin_is_builtin("now:embed")) { FAIL("now:embed should be builtin"); return; }
+    if (now_plugin_is_builtin("org.acme:foo:1.0.0")) { FAIL("should not be builtin"); return; }
+    if (now_plugin_is_builtin(NULL)) { FAIL("NULL should not be builtin"); return; }
+    PASS();
+}
+
+static void test_plugin_pom_load(void) {
+    TEST("plugin: load plugins from now.pasta");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  lang: \"c\","
+        "  plugins: ["
+        "    { id: \"now:version\", phase: \"generate\" },"
+        "    { id: \"now:embed\", phase: \"generate\","
+        "      config: { src: \"assets\", prefix: \"res_\" } }"
+        "  ] }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+    if (p->plugins.count != 2) { FAIL("expected 2 plugins"); now_project_free(p); return; }
+    ASSERT_STR(p->plugins.items[0].id, "now:version");
+    ASSERT_STR(p->plugins.items[0].phase, "generate");
+    ASSERT_STR(p->plugins.items[1].id, "now:embed");
+    /* config should be non-NULL (raw PastaValue*) */
+    if (!p->plugins.items[1].config) { FAIL("config should be set"); now_project_free(p); return; }
+    now_project_free(p);
+    PASS();
+}
+
+static void test_plugin_run_hook_no_plugins(void) {
+    TEST("plugin: run_hook with no plugins is no-op");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\", lang: \"c\" }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+    NowPluginResult out;
+    int rc = now_plugin_run_hook(p, ".", NOW_HOOK_GENERATE, 0, &out, &res);
+    now_project_free(p);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+static void test_plugin_version_generate(void) {
+    TEST("plugin: now:version generates _now_version.c");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"hello\", version: \"2.3.4\","
+        "  lang: \"c\","
+        "  plugins: ["
+        "    { id: \"now:version\", phase: \"generate\" }"
+        "  ] }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+
+    char basedir[512];
+    snprintf(basedir, sizeof(basedir), "%s/plugin_test", NOW_TEST_RESOURCES);
+    /* Create the basedir if needed */
+    now_mkdir_p(basedir);
+
+    NowPluginResult out;
+    now_plugin_result_init(&out);
+    int rc = now_plugin_run_hook(p, basedir, NOW_HOOK_GENERATE, 0, &out, &res);
+    now_project_free(p);
+    if (rc != 0) { FAIL(res.message); now_plugin_result_free(&out); return; }
+
+    /* Should have produced 1 source file */
+    if (out.sources.count != 1) { FAIL("expected 1 generated source"); now_plugin_result_free(&out); return; }
+
+    /* Verify the generated file exists and contains expected content */
+    FILE *fp = fopen(out.sources.items[0], "r");
+    if (!fp) { FAIL("generated file not found"); now_plugin_result_free(&out); return; }
+
+    char buf[2048];
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[nread] = '\0';
+    fclose(fp);
+
+    if (!strstr(buf, "NOW_VERSION")) { FAIL("missing NOW_VERSION"); now_plugin_result_free(&out); return; }
+    if (!strstr(buf, "\"2.3.4\"")) { FAIL("missing version string"); now_plugin_result_free(&out); return; }
+    if (!strstr(buf, "\"org.test\"")) { FAIL("missing group"); now_plugin_result_free(&out); return; }
+    if (!strstr(buf, "NOW_VERSION_MAJOR = 2")) { FAIL("wrong major"); now_plugin_result_free(&out); return; }
+
+    now_plugin_result_free(&out);
+    PASS();
+}
+
+static void test_plugin_result_init_free(void) {
+    TEST("plugin: result init and free");
+    NowPluginResult r;
+    now_plugin_result_init(&r);
+    if (!r.ok) { FAIL("should be ok"); return; }
+    now_plugin_result_free(&r);
+    /* Should not crash */
+    PASS();
+}
+
+static void test_plugin_unknown_builtin(void) {
+    TEST("plugin: unknown built-in returns error");
+    NowPlugin pl;
+    memset(&pl, 0, sizeof(pl));
+    pl.id = "now:nonexistent";
+    pl.phase = "generate";
+
+    NowPluginResult out;
+    now_plugin_result_init(&out);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    int rc = now_plugin_invoke(&pl, NULL, ".", "generate", 0, &out, &res);
+    now_plugin_result_free(&out);
+    if (rc == 0) { FAIL("should have failed"); return; }
+    ASSERT_EQ(res.code, NOW_ERR_NOT_FOUND);
+    PASS();
+}
+
+/* ---- Dep confusion protection ---- */
+
+static void test_private_group_exact_match(void) {
+    TEST("private_groups: exact prefix match");
+    NowStrArray pg;
+    now_strarray_init(&pg);
+    now_strarray_push(&pg, "org.acme");
+    ASSERT_EQ(now_group_is_private(&pg, "org.acme"), 1);
+    now_strarray_free(&pg);
+    PASS();
+}
+
+static void test_private_group_dotted_child(void) {
+    TEST("private_groups: dotted child match");
+    NowStrArray pg;
+    now_strarray_init(&pg);
+    now_strarray_push(&pg, "org.acme");
+    ASSERT_EQ(now_group_is_private(&pg, "org.acme.internal"), 1);
+    ASSERT_EQ(now_group_is_private(&pg, "org.acme.core.util"), 1);
+    now_strarray_free(&pg);
+    PASS();
+}
+
+static void test_private_group_no_false_positive(void) {
+    TEST("private_groups: no false positive on similar prefix");
+    NowStrArray pg;
+    now_strarray_init(&pg);
+    now_strarray_push(&pg, "org.acme");
+    ASSERT_EQ(now_group_is_private(&pg, "org.acmecorp"), 0);
+    ASSERT_EQ(now_group_is_private(&pg, "org.acm"), 0);
+    ASSERT_EQ(now_group_is_private(&pg, "com.example"), 0);
+    now_strarray_free(&pg);
+    PASS();
+}
+
+static void test_private_group_multiple_prefixes(void) {
+    TEST("private_groups: multiple prefixes");
+    NowStrArray pg;
+    now_strarray_init(&pg);
+    now_strarray_push(&pg, "org.acme");
+    now_strarray_push(&pg, "com.internal");
+    ASSERT_EQ(now_group_is_private(&pg, "org.acme.libs"), 1);
+    ASSERT_EQ(now_group_is_private(&pg, "com.internal"), 1);
+    ASSERT_EQ(now_group_is_private(&pg, "com.example"), 0);
+    now_strarray_free(&pg);
+    PASS();
+}
+
+static void test_private_group_null_safe(void) {
+    TEST("private_groups: NULL-safe");
+    ASSERT_EQ(now_group_is_private(NULL, "org.acme"), 0);
+    NowStrArray pg;
+    now_strarray_init(&pg);
+    ASSERT_EQ(now_group_is_private(&pg, NULL), 0);
+    ASSERT_EQ(now_group_is_private(&pg, "anything"), 0);
+    now_strarray_free(&pg);
+    PASS();
+}
+
+static void test_private_group_pom_load(void) {
+    TEST("private_groups: loaded from now.pasta");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"org.acme\", artifact: \"app\", version: \"1.0.0\","
+        "  lang: \"c\","
+        "  private_groups: [\"org.acme\", \"com.secret\"] }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+    ASSERT_EQ(p->private_groups.count, (size_t)2);
+    ASSERT_STR(p->private_groups.items[0], "org.acme");
+    ASSERT_STR(p->private_groups.items[1], "com.secret");
+    now_project_free(p);
+    PASS();
+}
+
+static void test_private_group_procure_fail(void) {
+    TEST("private_groups: procure fails without repos");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"org.acme\", artifact: \"app\", version: \"1.0.0\","
+        "  lang: \"c\","
+        "  private_groups: [\"org.internal\"],"
+        "  deps: [{ id: \"org.internal:secret:^1.0.0\" }] }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+
+    NowProcureOpts opts = {0};
+    opts.repo_root = "/tmp/now-test-repo-confuse";
+    memset(&res, 0, sizeof(res));
+    int rc = now_procure(p, &opts, &res);
+    now_project_free(p);
+
+    /* Should fail because private group has no declared repos */
+    if (rc == 0) { FAIL("should fail for private group without repos"); return; }
+    if (!strstr(res.message, "private group")) { FAIL(res.message); return; }
+    PASS();
+}
+
+/* ---- Layer system ---- */
+
+static void test_layer_stack_init(void) {
+    TEST("layers: stack init with baseline");
+    NowLayerStack stack;
+    now_layer_stack_init(&stack);
+    ASSERT_EQ(stack.count, (size_t)1);
+    ASSERT_STR(stack.layers[0].id, "now-baseline");
+    ASSERT_EQ(stack.layers[0].source, NOW_LAYER_BUILTIN);
+    now_layer_stack_free(&stack);
+    PASS();
+}
+
+static void test_layer_baseline_sections(void) {
+    TEST("layers: baseline has compile, repos, toolchain");
+    NowLayerStack stack;
+    now_layer_stack_init(&stack);
+    const NowLayerSection *compile = now_layer_find_section(&stack.layers[0], "compile");
+    ASSERT_NOT_NULL(compile);
+    ASSERT_EQ(compile->policy, NOW_POLICY_OPEN);
+
+    const NowLayerSection *repos = now_layer_find_section(&stack.layers[0], "repos");
+    ASSERT_NOT_NULL(repos);
+
+    const NowLayerSection *tc = now_layer_find_section(&stack.layers[0], "toolchain");
+    ASSERT_NOT_NULL(tc);
+
+    const NowLayerSection *adv = now_layer_find_section(&stack.layers[0], "advisory");
+    ASSERT_NOT_NULL(adv);
+    ASSERT_EQ(adv->policy, NOW_POLICY_LOCKED);
+
+    now_layer_stack_free(&stack);
+    PASS();
+}
+
+static void test_layer_load_file(void) {
+    TEST("layers: load enterprise layer from file");
+    NowLayerStack stack;
+    now_layer_stack_init(&stack);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/layers/enterprise.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    int rc = now_layer_load_file(&stack, "enterprise", path, &res);
+    if (rc != 0) { FAIL(res.message); now_layer_stack_free(&stack); return; }
+
+    ASSERT_EQ(stack.count, (size_t)2);
+    ASSERT_STR(stack.layers[1].id, "enterprise");
+
+    const NowLayerSection *compile = now_layer_find_section(&stack.layers[1], "compile");
+    ASSERT_NOT_NULL(compile);
+    ASSERT_EQ(compile->policy, NOW_POLICY_LOCKED);
+
+    const NowLayerSection *pg = now_layer_find_section(&stack.layers[1], "private_groups");
+    ASSERT_NOT_NULL(pg);
+    ASSERT_EQ(pg->policy, NOW_POLICY_LOCKED);
+
+    now_layer_stack_free(&stack);
+    PASS();
+}
+
+static void test_layer_merge_open(void) {
+    TEST("layers: merge open section (overlay wins)");
+    NowLayerStack stack;
+    now_layer_stack_init(&stack);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/layers/enterprise.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    now_layer_load_file(&stack, "enterprise", path, &res);
+
+    NowAuditReport audit;
+    now_audit_init(&audit);
+
+    /* toolchain is open in both layers — enterprise overrides baseline */
+    PastaValue *effective = (PastaValue *)now_layer_merge_section(&stack, "toolchain", &audit);
+    ASSERT_NOT_NULL(effective);
+
+    const PastaValue *preset = pasta_map_get(effective, "preset");
+    ASSERT_NOT_NULL(preset);
+    ASSERT_STR(pasta_get_string(preset), "llvm");
+
+    /* No violations for open section */
+    ASSERT_EQ(audit.count, (size_t)0);
+
+    pasta_free(effective);
+    now_audit_free(&audit);
+    now_layer_stack_free(&stack);
+    PASS();
+}
+
+static void test_layer_merge_locked_audit(void) {
+    TEST("layers: merge locked section produces audit violation");
+    NowLayerStack stack;
+    now_layer_stack_init(&stack);
+
+    /* Load enterprise layer (locks compile) */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/layers/enterprise.pasta", NOW_TEST_RESOURCES);
+    NowResult res;
+    now_layer_load_file(&stack, "enterprise", path, &res);
+
+    /* Push a project layer that overrides compile */
+    NowProject proj;
+    memset(&proj, 0, sizeof(proj));
+    now_strarray_init(&proj.compile.warnings);
+    now_strarray_init(&proj.compile.defines);
+    now_strarray_init(&proj.compile.flags);
+    now_strarray_init(&proj.compile.includes);
+    now_strarray_push(&proj.compile.defines, "MY_DEFINE");
+    proj.compile.opt = "speed";
+    now_strarray_init(&proj.private_groups);
+    now_strarray_init(&proj.langs);
+    now_layer_push_project(&stack, &proj);
+
+    NowAuditReport audit;
+    now_audit_init(&audit);
+
+    PastaValue *effective = (PastaValue *)now_layer_merge_section(&stack, "compile", &audit);
+    ASSERT_NOT_NULL(effective);
+
+    /* Should have audit violations (project overriding enterprise's locked compile) */
+    if (audit.count == 0) { FAIL("expected audit violations"); pasta_free(effective); now_audit_free(&audit); now_layer_stack_free(&stack); now_strarray_free(&proj.compile.warnings); now_strarray_free(&proj.compile.defines); now_strarray_free(&proj.compile.flags); now_strarray_free(&proj.compile.includes); now_strarray_free(&proj.private_groups); now_strarray_free(&proj.langs); return; }
+
+    ASSERT_STR(audit.items[0].code, "NOW-W0401");
+
+    pasta_free(effective);
+    now_audit_free(&audit);
+    now_layer_stack_free(&stack);
+    now_strarray_free(&proj.compile.warnings);
+    now_strarray_free(&proj.compile.defines);
+    now_strarray_free(&proj.compile.flags);
+    now_strarray_free(&proj.compile.includes);
+    now_strarray_free(&proj.private_groups);
+    now_strarray_free(&proj.langs);
+    PASS();
+}
+
+static void test_layer_merge_strarray_exclude(void) {
+    TEST("layers: !exclude: removes entries in open mode");
+    NowStrArray dst;
+    now_strarray_init(&dst);
+    now_strarray_push(&dst, "Wall");
+    now_strarray_push(&dst, "Wextra");
+    now_strarray_push(&dst, "Wpedantic");
+
+    NowStrArray src;
+    now_strarray_init(&src);
+    now_strarray_push(&src, "!exclude:Wpedantic");
+    now_strarray_push(&src, "Wformat");
+
+    now_layer_merge_strarray(&dst, &src, NOW_POLICY_OPEN);
+
+    /* Wpedantic should be removed, Wformat added */
+    ASSERT_EQ(dst.count, (size_t)3);  /* Wall, Wextra, Wformat */
+    /* Check Wpedantic is gone */
+    int found_pedantic = 0;
+    int found_format = 0;
+    for (size_t i = 0; i < dst.count; i++) {
+        if (strcmp(dst.items[i], "Wpedantic") == 0) found_pedantic = 1;
+        if (strcmp(dst.items[i], "Wformat") == 0) found_format = 1;
+    }
+    if (found_pedantic) { FAIL("Wpedantic should be excluded"); now_strarray_free(&dst); now_strarray_free(&src); return; }
+    if (!found_format) { FAIL("Wformat should be added"); now_strarray_free(&dst); now_strarray_free(&src); return; }
+
+    now_strarray_free(&dst);
+    now_strarray_free(&src);
+    PASS();
+}
+
+static void test_layer_audit_format(void) {
+    TEST("layers: audit format output");
+    NowAuditReport audit;
+    now_audit_init(&audit);
+
+    /* Empty report */
+    char *out = now_audit_format(&audit);
+    ASSERT_NOT_NULL(out);
+    if (!strstr(out, "No advisory")) { FAIL("expected no-violations message"); free(out); return; }
+    free(out);
+
+    now_audit_free(&audit);
+    PASS();
+}
+
+static void test_layer_push_project(void) {
+    TEST("layers: push project as top layer");
+    NowLayerStack stack;
+    now_layer_stack_init(&stack);
+
+    NowProject proj;
+    memset(&proj, 0, sizeof(proj));
+    now_strarray_init(&proj.compile.warnings);
+    now_strarray_init(&proj.compile.defines);
+    now_strarray_init(&proj.compile.flags);
+    now_strarray_init(&proj.compile.includes);
+    now_strarray_init(&proj.private_groups);
+    now_strarray_init(&proj.langs);
+    now_strarray_push(&proj.private_groups, "org.secret");
+    now_layer_push_project(&stack, &proj);
+
+    ASSERT_EQ(stack.count, (size_t)2);
+    ASSERT_STR(stack.layers[1].id, "project");
+
+    const NowLayerSection *pg = now_layer_find_section(&stack.layers[1], "private_groups");
+    ASSERT_NOT_NULL(pg);
+
+    now_layer_stack_free(&stack);
+    now_strarray_free(&proj.compile.warnings);
+    now_strarray_free(&proj.compile.defines);
+    now_strarray_free(&proj.compile.flags);
+    now_strarray_free(&proj.compile.includes);
+    now_strarray_free(&proj.private_groups);
+    now_strarray_free(&proj.langs);
+    PASS();
+}
+
+/* ---- Multi-architecture / triples ---- */
+
+static void test_triple_parse_full(void) {
+    TEST("triple: parse full os:arch:variant");
+    NowTriple t;
+    now_triple_parse(&t, "linux:amd64:gnu");
+    ASSERT_STR(t.os, "linux");
+    ASSERT_STR(t.arch, "amd64");
+    ASSERT_STR(t.variant, "gnu");
+    PASS();
+}
+
+static void test_triple_parse_shorthand(void) {
+    TEST("triple: parse shorthand fills from host");
+    NowTriple t;
+    now_triple_parse(&t, ":amd64:musl");
+    /* os should be empty before fill */
+    ASSERT_STR(t.os, "");
+    now_triple_fill_from_host(&t);
+    /* os should now be filled from host */
+    const NowTriple *host = now_host_triple_parsed();
+    if (strcmp(t.os, host->os) != 0) { FAIL("os not filled from host"); return; }
+    ASSERT_STR(t.arch, "amd64");
+    ASSERT_STR(t.variant, "musl");
+    PASS();
+}
+
+static void test_triple_format(void) {
+    TEST("triple: format as colon-separated string");
+    NowTriple t;
+    now_triple_parse(&t, "windows:amd64:msvc");
+    char buf[256];
+    now_triple_format(&t, buf, sizeof(buf));
+    ASSERT_STR(buf, "windows:amd64:msvc");
+    PASS();
+}
+
+static void test_triple_dir(void) {
+    TEST("triple: format as directory name (dashes)");
+    NowTriple t;
+    now_triple_parse(&t, "linux:arm64:musl");
+    char buf[256];
+    now_triple_dir(&t, buf, sizeof(buf));
+    ASSERT_STR(buf, "linux-arm64-musl");
+    PASS();
+}
+
+static void test_triple_cmp(void) {
+    TEST("triple: compare equal and unequal");
+    NowTriple a, b;
+    now_triple_parse(&a, "linux:amd64:gnu");
+    now_triple_parse(&b, "linux:amd64:gnu");
+    ASSERT_EQ(now_triple_cmp(&a, &b), 0);
+    now_triple_parse(&b, "linux:arm64:gnu");
+    if (now_triple_cmp(&a, &b) == 0) { FAIL("expected unequal"); return; }
+    PASS();
+}
+
+static void test_triple_match_exact(void) {
+    TEST("triple: wildcard match exact");
+    NowTriple pat, concrete;
+    now_triple_parse(&pat, "linux:amd64:gnu");
+    now_triple_parse(&concrete, "linux:amd64:gnu");
+    ASSERT_EQ(now_triple_match(&pat, &concrete), 1);
+    now_triple_parse(&concrete, "linux:arm64:gnu");
+    ASSERT_EQ(now_triple_match(&pat, &concrete), 0);
+    PASS();
+}
+
+static void test_triple_match_wildcard(void) {
+    TEST("triple: wildcard * matches any value");
+    NowTriple pat, c1, c2;
+    now_triple_parse(&pat, "linux:*:musl");
+    now_triple_parse(&c1, "linux:amd64:musl");
+    now_triple_parse(&c2, "linux:arm64:musl");
+    ASSERT_EQ(now_triple_match(&pat, &c1), 1);
+    ASSERT_EQ(now_triple_match(&pat, &c2), 1);
+    /* Different OS should not match */
+    NowTriple c3;
+    now_triple_parse(&c3, "macos:arm64:musl");
+    ASSERT_EQ(now_triple_match(&pat, &c3), 0);
+    PASS();
+}
+
+static void test_triple_host_detect(void) {
+    TEST("triple: host detection returns valid triple");
+    const NowTriple *host = now_host_triple_parsed();
+    ASSERT_NOT_NULL(host);
+    if (host->os[0] == '\0') { FAIL("empty os"); return; }
+    if (host->arch[0] == '\0') { FAIL("empty arch"); return; }
+    if (host->variant[0] == '\0') { FAIL("empty variant"); return; }
+    PASS();
+}
+
+static void test_triple_is_native(void) {
+    TEST("triple: native detection");
+    const NowTriple *host = now_host_triple_parsed();
+    ASSERT_EQ(now_triple_is_native(host), 1);
+    NowTriple cross;
+    now_triple_parse(&cross, "freestanding:riscv64:none");
+    ASSERT_EQ(now_triple_is_native(&cross), 0);
+    PASS();
+}
+
+/* ---- Export ---- */
+
+static void test_export_cmake_basic(void) {
+    TEST("export:cmake: generates valid CMakeLists.txt");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"mylib\", version: \"2.0.0\","
+        "  langs: [\"c\"], std: \"c11\","
+        "  output: { type: \"shared\", name: \"mylib\" },"
+        "  compile: { warnings: [\"Wall\", \"Wextra\"], defines: [\"MYLIB_INTERNAL\"] } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_cmake_output.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_cmake(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    /* Read back and verify key content */
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "project(mylib VERSION 2.0.0")) { FAIL("missing project()"); now_project_free(p); return; }
+    if (!strstr(buf, "add_library(mylib SHARED")) { FAIL("missing add_library"); now_project_free(p); return; }
+    if (!strstr(buf, "-Wall")) { FAIL("missing -Wall"); now_project_free(p); return; }
+    if (!strstr(buf, "-Wextra")) { FAIL("missing -Wextra"); now_project_free(p); return; }
+    if (!strstr(buf, "MYLIB_INTERNAL")) { FAIL("missing define"); now_project_free(p); return; }
+    if (!strstr(buf, "CMAKE_C_STANDARD 11")) { FAIL("missing C standard"); now_project_free(p); return; }
+    if (!strstr(buf, "Generated by now")) { FAIL("missing header"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_export_cmake_executable(void) {
+    TEST("export:cmake: executable output type");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"], output: { type: \"executable\", name: \"app\" } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_cmake_exec.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_cmake(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "add_executable(app")) { FAIL("missing add_executable"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_export_cmake_deps_comment(void) {
+    TEST("export:cmake: deps listed as comments");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"svc\", version: \"1.0.0\","
+        "  langs: [\"c\"], output: { type: \"executable\", name: \"svc\" },"
+        "  deps: [{ id: \"org.acme:core:^1.0.0\" }] }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_cmake_deps.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_cmake(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "org.acme:core:^1.0.0")) { FAIL("missing dep comment"); now_project_free(p); return; }
+    if (!strstr(buf, "FetchContent")) { FAIL("missing FetchContent hint"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_export_cmake_cxx(void) {
+    TEST("export:cmake: C++ project includes CXX language");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"cxxlib\", version: \"1.0.0\","
+        "  langs: [\"c\", \"c++\"], std: \"c++17\","
+        "  output: { type: \"static\", name: \"cxxlib\" } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_cmake_cxx.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_cmake(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "LANGUAGES CXX C")) { FAIL("missing CXX language"); now_project_free(p); return; }
+    if (!strstr(buf, "CMAKE_CXX_STANDARD 17")) { FAIL("missing CXX standard"); now_project_free(p); return; }
+    if (!strstr(buf, "*.cpp")) { FAIL("missing cpp glob"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+/* ---- Export: Makefile ---- */
+
+static void test_export_make_basic(void) {
+    TEST("export:make: generates valid Makefile");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"mylib\", version: \"2.0.0\","
+        "  langs: [\"c\"], std: \"c11\","
+        "  output: { type: \"shared\", name: \"mylib\" },"
+        "  compile: { warnings: [\"Wall\", \"Wextra\"], defines: [\"MYLIB_INTERNAL\"] } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_make_output.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_make(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "PROJECT  := mylib")) { FAIL("missing PROJECT"); now_project_free(p); return; }
+    if (!strstr(buf, "VERSION  := 2.0.0")) { FAIL("missing VERSION"); now_project_free(p); return; }
+    if (!strstr(buf, "-fPIC")) { FAIL("missing -fPIC for shared"); now_project_free(p); return; }
+    if (!strstr(buf, "lib$(TARGET).so")) { FAIL("missing .so output"); now_project_free(p); return; }
+    if (!strstr(buf, "-shared")) { FAIL("missing -shared flag"); now_project_free(p); return; }
+    if (!strstr(buf, "-Wall")) { FAIL("missing -Wall"); now_project_free(p); return; }
+    if (!strstr(buf, "-Wextra")) { FAIL("missing -Wextra"); now_project_free(p); return; }
+    if (!strstr(buf, "-DMYLIB_INTERNAL")) { FAIL("missing -D define"); now_project_free(p); return; }
+    if (!strstr(buf, "-std=c11")) { FAIL("missing -std=c11"); now_project_free(p); return; }
+    if (!strstr(buf, "Generated by now")) { FAIL("missing header"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_export_make_executable(void) {
+    TEST("export:make: executable output type");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"], output: { type: \"executable\", name: \"app\" } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_make_exec.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_make(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "$(BUILD_DIR)/$(TARGET)")) { FAIL("missing executable output"); now_project_free(p); return; }
+    if (strstr(buf, "-fPIC")) { FAIL("executable should not have -fPIC"); now_project_free(p); return; }
+    if (strstr(buf, "-shared")) { FAIL("executable should not have -shared"); now_project_free(p); return; }
+    if (!strstr(buf, "install -m 755")) { FAIL("missing install for executable"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_export_make_static(void) {
+    TEST("export:make: static library uses ar");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"core\", version: \"1.0.0\","
+        "  langs: [\"c\"], output: { type: \"static\", name: \"core\" } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_make_static.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_make(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "lib$(TARGET).a")) { FAIL("missing .a output"); now_project_free(p); return; }
+    if (!strstr(buf, "$(AR) rcs")) { FAIL("missing ar rcs"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_export_make_deps(void) {
+    TEST("export:make: deps listed as comments");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"svc\", version: \"1.0.0\","
+        "  langs: [\"c\"], output: { type: \"executable\", name: \"svc\" },"
+        "  deps: [{ id: \"org.acme:core:^1.0.0\" }] }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_make_deps.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_make(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "org.acme:core:^1.0.0")) { FAIL("missing dep comment"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_export_make_cxx(void) {
+    TEST("export:make: C++ project uses CXX");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"cxxlib\", version: \"1.0.0\","
+        "  langs: [\"c\", \"c++\"], std: \"c++17\","
+        "  output: { type: \"static\", name: \"cxxlib\" } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/test_make_cxx.txt",
+             NOW_TEST_RESOURCES);
+    int rc = now_export_make(p, ".", outpath, &res);
+    ASSERT_EQ(rc, 0);
+
+    FILE *fp = fopen(outpath, "r");
+    ASSERT_NOT_NULL(fp);
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    remove(outpath);
+
+    if (!strstr(buf, "CXX       ?= g++")) { FAIL("missing CXX variable"); now_project_free(p); return; }
+    if (!strstr(buf, "-std=c++17")) { FAIL("missing C++17 std flag"); now_project_free(p); return; }
+    if (!strstr(buf, "*.cpp")) { FAIL("missing cpp wildcard"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+/* ---- Reproducible builds ---- */
+
+static void test_repro_init(void) {
+    TEST("repro: init defaults to disabled");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    ASSERT_EQ(cfg.enabled, 0);
+    ASSERT_EQ(cfg.path_prefix_map, 0);
+    ASSERT_EQ(cfg.sort_inputs, 0);
+    ASSERT_EQ(cfg.no_date_macros, 0);
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_from_project_bool(void) {
+    TEST("repro: parse reproducible: true enables all");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"], reproducible: true }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    NowReproConfig cfg;
+    now_repro_from_project(&cfg, p);
+    ASSERT_EQ(cfg.enabled, 1);
+    ASSERT_EQ(cfg.path_prefix_map, 1);
+    ASSERT_EQ(cfg.sort_inputs, 1);
+    ASSERT_EQ(cfg.no_date_macros, 1);
+    ASSERT_EQ(cfg.strip_metadata, 1);
+    ASSERT_EQ(cfg.verify, 1);
+    ASSERT_STR(cfg.timebase, "git-commit");
+
+    now_repro_free(&cfg);
+    now_project_free(p);
+    PASS();
+}
+
+static void test_repro_from_project_map(void) {
+    TEST("repro: parse reproducible: map with selective options");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  reproducible: { timebase: \"zero\", path_prefix_map: true,"
+        "                   sort_inputs: true, no_date_macros: false,"
+        "                   strip_metadata: false, verify: false } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    NowReproConfig cfg;
+    now_repro_from_project(&cfg, p);
+    ASSERT_EQ(cfg.enabled, 1);
+    ASSERT_STR(cfg.timebase, "zero");
+    ASSERT_EQ(cfg.path_prefix_map, 1);
+    ASSERT_EQ(cfg.sort_inputs, 1);
+    ASSERT_EQ(cfg.no_date_macros, 0);
+    ASSERT_EQ(cfg.strip_metadata, 0);
+    ASSERT_EQ(cfg.verify, 0);
+
+    now_repro_free(&cfg);
+    now_project_free(p);
+    PASS();
+}
+
+static void test_repro_from_project_none(void) {
+    TEST("repro: no reproducible field stays disabled");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"] }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    NowReproConfig cfg;
+    now_repro_from_project(&cfg, p);
+    ASSERT_EQ(cfg.enabled, 0);
+
+    now_repro_free(&cfg);
+    now_project_free(p);
+    PASS();
+}
+
+static void test_repro_timebase_zero(void) {
+    TEST("repro: timebase 'zero' resolves to epoch");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    cfg.enabled = 1;
+    cfg.timebase = strdup("zero");
+
+    NowResult res;
+    char *ts = now_repro_resolve_timebase(&cfg, ".", &res);
+    ASSERT_NOT_NULL(ts);
+    ASSERT_STR(ts, "1970-01-01T00:00:00Z");
+    free(ts);
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_timebase_now(void) {
+    TEST("repro: timebase 'now' resolves to current time");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    cfg.enabled = 1;
+    cfg.timebase = strdup("now");
+
+    NowResult res;
+    char *ts = now_repro_resolve_timebase(&cfg, ".", &res);
+    ASSERT_NOT_NULL(ts);
+    /* Should be a valid ISO 8601 string ending in Z */
+    size_t len = strlen(ts);
+    if (len < 20 || ts[len-1] != 'Z') { FAIL("bad format"); free(ts); now_repro_free(&cfg); return; }
+    free(ts);
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_timebase_literal(void) {
+    TEST("repro: timebase literal ISO 8601 passthrough");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    cfg.enabled = 1;
+    cfg.timebase = strdup("2026-01-15T12:00:00Z");
+
+    NowResult res;
+    char *ts = now_repro_resolve_timebase(&cfg, ".", &res);
+    ASSERT_NOT_NULL(ts);
+    ASSERT_STR(ts, "2026-01-15T12:00:00Z");
+    free(ts);
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_compile_flags_gcc(void) {
+    TEST("repro: compile flags for GCC (prefix map + date)");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    cfg.enabled = 1;
+    cfg.path_prefix_map = 1;
+    cfg.no_date_macros = 1;
+
+    char **flags = NULL;
+    size_t count = 0;
+    int n = now_repro_compile_flags(&cfg, "/home/user/proj",
+                                     "2026-03-05T14:30:00Z", 0,
+                                     &flags, &count);
+    if (n < 0) { FAIL("returned error"); now_repro_free(&cfg); return; }
+    if (count < 3) { FAIL("expected >= 3 flags"); now_repro_free_flags(flags, count); now_repro_free(&cfg); return; }
+
+    /* Check for debug prefix map */
+    int has_debug_prefix = 0, has_macro_prefix = 0, has_date = 0, has_time = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (strstr(flags[i], "-fdebug-prefix-map=")) has_debug_prefix = 1;
+        if (strstr(flags[i], "-fmacro-prefix-map=")) has_macro_prefix = 1;
+        if (strstr(flags[i], "__DATE__")) has_date = 1;
+        if (strstr(flags[i], "__TIME__")) has_time = 1;
+    }
+    if (!has_debug_prefix) { FAIL("missing -fdebug-prefix-map"); }
+    else if (!has_macro_prefix) { FAIL("missing -fmacro-prefix-map"); }
+    else if (!has_date) { FAIL("missing __DATE__ define"); }
+    else if (!has_time) { FAIL("missing __TIME__ define"); }
+
+    now_repro_free_flags(flags, count);
+    now_repro_free(&cfg);
+    if (has_debug_prefix && has_macro_prefix && has_date && has_time) PASS();
+}
+
+static void test_repro_compile_flags_msvc(void) {
+    TEST("repro: compile flags for MSVC (/pathmap + /D)");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    cfg.enabled = 1;
+    cfg.path_prefix_map = 1;
+    cfg.no_date_macros = 1;
+
+    char **flags = NULL;
+    size_t count = 0;
+    now_repro_compile_flags(&cfg, "C:\\Users\\dev\\proj",
+                             "2026-03-05T14:30:00Z", 1,
+                             &flags, &count);
+    if (count < 1) { FAIL("expected flags"); now_repro_free(&cfg); return; }
+
+    int has_pathmap = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (strstr(flags[i], "/pathmap:")) has_pathmap = 1;
+    }
+    if (!has_pathmap) { FAIL("missing /pathmap"); now_repro_free_flags(flags, count); now_repro_free(&cfg); return; }
+
+    now_repro_free_flags(flags, count);
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_link_flags(void) {
+    TEST("repro: link flags include --build-id=sha1");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    cfg.enabled = 1;
+    cfg.strip_metadata = 1;
+
+    char **flags = NULL;
+    size_t count = 0;
+    now_repro_link_flags(&cfg, 0, &flags, &count);
+    if (count < 1) { FAIL("expected link flags"); now_repro_free(&cfg); return; }
+    if (!strstr(flags[0], "--build-id=sha1")) {
+        FAIL("missing --build-id=sha1");
+        now_repro_free_flags(flags, count);
+        now_repro_free(&cfg);
+        return;
+    }
+
+    now_repro_free_flags(flags, count);
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_link_flags_msvc_empty(void) {
+    TEST("repro: no link flags for MSVC");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+    cfg.enabled = 1;
+    cfg.strip_metadata = 1;
+
+    char **flags = NULL;
+    size_t count = 0;
+    now_repro_link_flags(&cfg, 1, &flags, &count);
+    ASSERT_EQ(count, (size_t)0);
+
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_sort_filelist(void) {
+    TEST("repro: sort file list lexicographically");
+    NowFileList fl;
+    now_filelist_init(&fl);
+    now_filelist_push(&fl, "src/main/c/z_last.c");
+    now_filelist_push(&fl, "src/main/c/a_first.c");
+    now_filelist_push(&fl, "src/main/c/m_middle.c");
+
+    now_repro_sort_filelist(&fl);
+
+    ASSERT_STR(fl.paths[0], "src/main/c/a_first.c");
+    ASSERT_STR(fl.paths[1], "src/main/c/m_middle.c");
+    ASSERT_STR(fl.paths[2], "src/main/c/z_last.c");
+
+    now_filelist_free(&fl);
+    PASS();
+}
+
+static void test_repro_disabled_no_flags(void) {
+    TEST("repro: disabled config produces no flags");
+    NowReproConfig cfg;
+    now_repro_init(&cfg);
+
+    char **flags = NULL;
+    size_t count = 0;
+    now_repro_compile_flags(&cfg, "/some/path", "2026-01-01T00:00:00Z", 0,
+                             &flags, &count);
+    ASSERT_EQ(count, (size_t)0);
+
+    now_repro_free(&cfg);
+    PASS();
+}
+
+static void test_repro_null_safety(void) {
+    TEST("repro: null safety");
+    NowReproConfig cfg;
+    now_repro_from_project(&cfg, NULL);
+    ASSERT_EQ(cfg.enabled, 0);
+
+    now_repro_sort_filelist(NULL);  /* should not crash */
+
+    now_repro_free(&cfg);
+    PASS();
+}
+
+/* ---- Trust ---- */
+
+static void test_trust_init_free(void) {
+    TEST("trust: init and free empty store");
+    NowTrustStore store;
+    now_trust_init(&store);
+    ASSERT_EQ(store.count, (size_t)0);
+    ASSERT_EQ(store.capacity, (size_t)0);
+    now_trust_free(&store);
+    PASS();
+}
+
+static void test_trust_add(void) {
+    TEST("trust: add keys to store");
+    NowTrustStore store;
+    now_trust_init(&store);
+
+    int rc = now_trust_add(&store, "*", "RWAAAA==", "global key");
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(store.count, (size_t)1);
+    ASSERT_STR(store.keys[0].scope, "*");
+    ASSERT_STR(store.keys[0].key, "RWAAAA==");
+    ASSERT_STR(store.keys[0].comment, "global key");
+
+    rc = now_trust_add(&store, "org.acme", "RWBBBB==", NULL);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(store.count, (size_t)2);
+
+    now_trust_free(&store);
+    PASS();
+}
+
+static void test_trust_scope_wildcard(void) {
+    TEST("trust: scope '*' matches everything");
+    ASSERT_EQ(now_trust_scope_matches("*", "org.acme", "core"), 1);
+    ASSERT_EQ(now_trust_scope_matches("*", "io.test", NULL), 1);
+    PASS();
+}
+
+static void test_trust_scope_group_prefix(void) {
+    TEST("trust: scope group prefix with dot-boundary");
+    ASSERT_EQ(now_trust_scope_matches("org.acme", "org.acme", NULL), 1);
+    ASSERT_EQ(now_trust_scope_matches("org.acme", "org.acme.core", NULL), 1);
+    ASSERT_EQ(now_trust_scope_matches("org.acme", "org.acmetools", NULL), 0);
+    ASSERT_EQ(now_trust_scope_matches("org.acme", "io.other", NULL), 0);
+    PASS();
+}
+
+static void test_trust_scope_exact(void) {
+    TEST("trust: scope group:artifact exact match");
+    ASSERT_EQ(now_trust_scope_matches("org.acme:core", "org.acme", "core"), 1);
+    ASSERT_EQ(now_trust_scope_matches("org.acme:core", "org.acme", "other"), 0);
+    ASSERT_EQ(now_trust_scope_matches("org.acme:core", "org.acme", NULL), 0);
+    ASSERT_EQ(now_trust_scope_matches("org.acme:core", "io.test", "core"), 0);
+    PASS();
+}
+
+static void test_trust_find(void) {
+    TEST("trust: find key by coordinate");
+    NowTrustStore store;
+    now_trust_init(&store);
+    now_trust_add(&store, "org.acme", "KEY_ACME", "acme org");
+    now_trust_add(&store, "io.test:specific", "KEY_EXACT", "exact match");
+    now_trust_add(&store, "*", "KEY_GLOBAL", "fallback");
+
+    const NowTrustKey *k;
+    k = now_trust_find(&store, "org.acme", "core");
+    ASSERT_NOT_NULL(k);
+    ASSERT_STR(k->key, "KEY_ACME");
+
+    k = now_trust_find(&store, "org.acme.sub", "lib");
+    ASSERT_NOT_NULL(k);
+    ASSERT_STR(k->key, "KEY_ACME");
+
+    k = now_trust_find(&store, "io.test", "specific");
+    ASSERT_NOT_NULL(k);
+    ASSERT_STR(k->key, "KEY_EXACT");
+
+    k = now_trust_find(&store, "io.test", "other");
+    ASSERT_NOT_NULL(k);
+    ASSERT_STR(k->key, "KEY_GLOBAL");
+
+    now_trust_free(&store);
+    PASS();
+}
+
+static void test_trust_find_no_match(void) {
+    TEST("trust: find returns NULL when no match");
+    NowTrustStore store;
+    now_trust_init(&store);
+    now_trust_add(&store, "org.acme:core", "KEY1", NULL);
+
+    const NowTrustKey *k = now_trust_find(&store, "io.other", "lib");
+    if (k != NULL) { FAIL("expected NULL"); now_trust_free(&store); return; }
+
+    now_trust_free(&store);
+    PASS();
+}
+
+static void test_trust_policy_none(void) {
+    TEST("trust: policy defaults to NONE");
+    NowTrustPolicy policy = {0, 0};
+    ASSERT_EQ(now_trust_level(&policy), NOW_TRUST_NONE);
+    PASS();
+}
+
+static void test_trust_policy_signed(void) {
+    TEST("trust: policy SIGNED when require_signatures");
+    NowTrustPolicy policy = {1, 0};
+    ASSERT_EQ(now_trust_level(&policy), NOW_TRUST_SIGNED);
+    PASS();
+}
+
+static void test_trust_policy_trusted(void) {
+    TEST("trust: policy TRUSTED when require_known_keys");
+    NowTrustPolicy policy = {1, 1};
+    ASSERT_EQ(now_trust_level(&policy), NOW_TRUST_TRUSTED);
+    PASS();
+}
+
+static void test_trust_policy_from_project(void) {
+    TEST("trust: parse policy from project pasta");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  trust: { require_signatures: true, require_known_keys: false } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    NowTrustPolicy pol = now_trust_policy_from_project(p);
+    ASSERT_EQ(pol.require_signatures, 1);
+    ASSERT_EQ(pol.require_known_keys, 0);
+    ASSERT_EQ(now_trust_level(&pol), NOW_TRUST_SIGNED);
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_trust_null_safety(void) {
+    TEST("trust: null safety");
+    ASSERT_EQ(now_trust_scope_matches(NULL, "org", NULL), 0);
+    ASSERT_EQ(now_trust_scope_matches("*", NULL, NULL), 0);
+    if (now_trust_find(NULL, "org", NULL) != NULL) { FAIL("expected NULL"); return; }
+
+    NowTrustPolicy pol = now_trust_policy_from_project(NULL);
+    ASSERT_EQ(pol.require_signatures, 0);
+    ASSERT_EQ(now_trust_level(NULL), NOW_TRUST_NONE);
+    PASS();
+}
+
+/* ---- Advisory guards ---- */
+
+static void test_advisory_db_init_free(void) {
+    TEST("advisory: db init/free");
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    ASSERT_EQ(db.count, (size_t)0);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_severity_parse(void) {
+    TEST("advisory: severity parsing");
+    ASSERT_EQ(now_severity_parse("critical"), NOW_SEV_CRITICAL);
+    ASSERT_EQ(now_severity_parse("high"), NOW_SEV_HIGH);
+    ASSERT_EQ(now_severity_parse("medium"), NOW_SEV_MEDIUM);
+    ASSERT_EQ(now_severity_parse("low"), NOW_SEV_LOW);
+    ASSERT_EQ(now_severity_parse("info"), NOW_SEV_INFO);
+    ASSERT_EQ(now_severity_parse("blacklisted"), NOW_SEV_BLACKLISTED);
+    ASSERT_EQ(now_severity_parse("unknown"), NOW_SEV_INFO);
+    ASSERT_EQ(now_severity_parse(NULL), NOW_SEV_INFO);
+    PASS();
+}
+
+static void test_advisory_severity_name(void) {
+    TEST("advisory: severity name roundtrip");
+    ASSERT_STR(now_severity_name(NOW_SEV_CRITICAL), "critical");
+    ASSERT_STR(now_severity_name(NOW_SEV_HIGH), "high");
+    ASSERT_STR(now_severity_name(NOW_SEV_MEDIUM), "medium");
+    ASSERT_STR(now_severity_name(NOW_SEV_LOW), "low");
+    ASSERT_STR(now_severity_name(NOW_SEV_INFO), "info");
+    ASSERT_STR(now_severity_name(NOW_SEV_BLACKLISTED), "blacklisted");
+    PASS();
+}
+
+static void test_advisory_severity_blocks(void) {
+    TEST("advisory: severity blocking");
+    ASSERT_EQ(now_severity_blocks(NOW_SEV_BLACKLISTED), 1);
+    ASSERT_EQ(now_severity_blocks(NOW_SEV_CRITICAL), 1);
+    ASSERT_EQ(now_severity_blocks(NOW_SEV_HIGH), 1);
+    ASSERT_EQ(now_severity_blocks(NOW_SEV_MEDIUM), 0);
+    ASSERT_EQ(now_severity_blocks(NOW_SEV_LOW), 0);
+    ASSERT_EQ(now_severity_blocks(NOW_SEV_INFO), 0);
+    PASS();
+}
+
+static void test_advisory_db_load_string(void) {
+    TEST("advisory: load db from string");
+    const char *input =
+        "{ version: \"1.0.0\", updated: \"2026-03-05T00:00:00Z\","
+        "  advisories: ["
+        "    { id: \"NOW-SA-2026-0042\", severity: \"critical\","
+        "      title: \"Buffer overflow in inflate()\","
+        "      cve: [\"CVE-2026-1234\"],"
+        "      affects: [ { id: \"zlib:zlib\", versions: [\">=1.2.0 <1.3.1\"] } ],"
+        "      fixed_in: [ { id: \"zlib:zlib\", version: \"1.3.1\" } ],"
+        "      affects_build_time: false, affects_runtime: true"
+        "    }"
+        "  ]"
+        "}";
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_advisory_db_load_string(&db, input, strlen(input), &res);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(db.count, (size_t)1);
+    ASSERT_STR(db.entries[0].id, "NOW-SA-2026-0042");
+    ASSERT_EQ(db.entries[0].severity, NOW_SEV_CRITICAL);
+    ASSERT_STR(db.entries[0].title, "Buffer overflow in inflate()");
+    ASSERT_EQ(db.entries[0].cve_count, (size_t)1);
+    ASSERT_STR(db.entries[0].cve[0], "CVE-2026-1234");
+    ASSERT_EQ(db.entries[0].affects_count, (size_t)1);
+    ASSERT_STR(db.entries[0].affects[0].id, "zlib:zlib");
+    ASSERT_EQ(db.entries[0].affects_runtime, 1);
+    ASSERT_EQ(db.entries[0].affects_build_time, 0);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_blacklisted(void) {
+    TEST("advisory: blacklisted entry");
+    const char *input =
+        "{ advisories: ["
+        "    { id: \"NOW-SA-2026-0043\", severity: \"high\","
+        "      blacklisted: true,"
+        "      affects: [ { id: \"evil:pkg\", versions: [\"*\"] } ],"
+        "      affects_build_time: true, affects_runtime: false"
+        "    }"
+        "  ]"
+        "}";
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    now_advisory_db_load_string(&db, input, strlen(input), &res);
+    ASSERT_EQ(db.count, (size_t)1);
+    ASSERT_EQ(db.entries[0].blacklisted, 1);
+    ASSERT_EQ(db.entries[0].severity, NOW_SEV_BLACKLISTED);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_override_parse(void) {
+    TEST("advisory: parse overrides from project");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  advisories: { allow: ["
+        "    { advisory: \"NOW-SA-2026-0042\", dep: \"zlib:zlib:1.3.0\","
+        "      reason: \"inflate() not used\", expires: \"2026-06-01\","
+        "      approved_by: \"alice@acme.org\" }"
+        "  ] }"
+        "}";
+    NowResult res;
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    NowOverrideList ovr;
+    now_override_list_init(&ovr);
+    int rc = now_advisory_overrides_from_project(&ovr, p, &res);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(ovr.count, (size_t)1);
+    ASSERT_STR(ovr.items[0].advisory, "NOW-SA-2026-0042");
+    ASSERT_STR(ovr.items[0].dep, "zlib:zlib:1.3.0");
+    ASSERT_STR(ovr.items[0].reason, "inflate() not used");
+    ASSERT_STR(ovr.items[0].expires, "2026-06-01");
+    ASSERT_STR(ovr.items[0].approved_by, "alice@acme.org");
+
+    now_override_list_free(&ovr);
+    now_project_free(p);
+    PASS();
+}
+
+static void test_advisory_override_no_expires(void) {
+    TEST("advisory: override without expires rejected");
+    const char *input =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  advisories: { allow: ["
+        "    { advisory: \"NOW-SA-2026-0042\", reason: \"no expiry\" }"
+        "  ] }"
+        "}";
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    NowProject *p = now_project_load_string(input, strlen(input), &res);
+    ASSERT_NOT_NULL(p);
+
+    NowOverrideList ovr;
+    now_override_list_init(&ovr);
+    int rc = now_advisory_overrides_from_project(&ovr, p, &res);
+    ASSERT_EQ(rc, -1);
+    ASSERT_EQ(res.code, NOW_ERR_SCHEMA);
+
+    now_override_list_free(&ovr);
+    now_project_free(p);
+    PASS();
+}
+
+static void test_advisory_override_expiry(void) {
+    TEST("advisory: override expiry check");
+    NowAdvisoryOverride ovr = {0};
+    ovr.expires = "2026-06-01";
+
+    /* Not expired (today = 2026-03-08) */
+    ASSERT_EQ(now_advisory_override_expired(&ovr, 20260308), 0);
+    /* Expired (today = 2026-07-01) */
+    ASSERT_EQ(now_advisory_override_expired(&ovr, 20260701), 1);
+    /* Exact expiry date — not expired (still within) */
+    ASSERT_EQ(now_advisory_override_expired(&ovr, 20260601), 0);
+    PASS();
+}
+
+static void test_advisory_find_override(void) {
+    TEST("advisory: find override by advisory+dep");
+    NowOverrideList list;
+    now_override_list_init(&list);
+
+    /* Manually add one */
+    NowAdvisoryOverride *tmp = realloc(list.items, sizeof(NowAdvisoryOverride));
+    if (!tmp) { FAIL("alloc"); return; }
+    list.items = tmp;
+    list.capacity = 1;
+    list.count = 1;
+    memset(&list.items[0], 0, sizeof(NowAdvisoryOverride));
+    list.items[0].advisory = strdup("NOW-SA-001");
+    list.items[0].dep = strdup("zlib:zlib:1.3.0");
+    list.items[0].expires = strdup("2026-12-31");
+
+    const NowAdvisoryOverride *found =
+        now_advisory_find_override(&list, "NOW-SA-001", "zlib:zlib:1.3.0");
+    ASSERT_NOT_NULL(found);
+
+    /* Different dep — no match */
+    found = now_advisory_find_override(&list, "NOW-SA-001", "other:lib:1.0.0");
+    if (found) { FAIL("expected NULL for different dep"); now_override_list_free(&list); return; }
+
+    /* Different advisory — no match */
+    found = now_advisory_find_override(&list, "NOW-SA-999", "zlib:zlib:1.3.0");
+    if (found) { FAIL("expected NULL for different advisory"); now_override_list_free(&list); return; }
+
+    now_override_list_free(&list);
+    PASS();
+}
+
+static void test_advisory_check_dep_match(void) {
+    TEST("advisory: check dep finds matching advisory");
+    const char *db_str =
+        "{ advisories: ["
+        "    { id: \"NOW-SA-001\", severity: \"critical\","
+        "      title: \"test vuln\","
+        "      affects: [ { id: \"zlib:zlib\", versions: [\">=1.2.0 <1.3.1\"] } ],"
+        "      affects_runtime: true, affects_build_time: false"
+        "    }"
+        "  ]"
+        "}";
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    now_advisory_db_load_string(&db, db_str, strlen(db_str), &res);
+
+    NowAdvisoryReport report;
+    now_advisory_report_init(&report);
+    int rc = now_advisory_check_dep(&db, NULL, "zlib:zlib:1.3.0",
+                                      "compile", 20260308, &report);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(report.count, (size_t)1);
+    ASSERT_EQ(report.blocked, 1);
+
+    now_advisory_report_free(&report);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_check_dep_no_match(void) {
+    TEST("advisory: check dep no match for safe version");
+    const char *db_str =
+        "{ advisories: ["
+        "    { id: \"NOW-SA-001\", severity: \"critical\","
+        "      affects: [ { id: \"zlib:zlib\", versions: [\">=1.2.0 <1.3.1\"] } ],"
+        "      affects_runtime: true"
+        "    }"
+        "  ]"
+        "}";
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    now_advisory_db_load_string(&db, db_str, strlen(db_str), &res);
+
+    NowAdvisoryReport report;
+    now_advisory_report_init(&report);
+    now_advisory_check_dep(&db, NULL, "zlib:zlib:1.3.1",
+                            "compile", 20260308, &report);
+    ASSERT_EQ(report.count, (size_t)0);
+    ASSERT_EQ(report.blocked, 0);
+
+    now_advisory_report_free(&report);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_check_dep_overridden(void) {
+    TEST("advisory: check dep with active override");
+    const char *db_str =
+        "{ advisories: ["
+        "    { id: \"NOW-SA-001\", severity: \"critical\","
+        "      affects: [ { id: \"zlib:zlib\", versions: [\">=1.2.0 <1.3.1\"] } ],"
+        "      affects_runtime: true"
+        "    }"
+        "  ]"
+        "}";
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    now_advisory_db_load_string(&db, db_str, strlen(db_str), &res);
+
+    NowOverrideList overrides;
+    now_override_list_init(&overrides);
+    NowAdvisoryOverride *o = realloc(overrides.items, sizeof(NowAdvisoryOverride));
+    overrides.items = o;
+    overrides.capacity = 1;
+    overrides.count = 1;
+    memset(o, 0, sizeof(*o));
+    o->advisory = strdup("NOW-SA-001");
+    o->dep = strdup("zlib:zlib:1.3.0");
+    o->expires = strdup("2027-01-01");
+
+    NowAdvisoryReport report;
+    now_advisory_report_init(&report);
+    now_advisory_check_dep(&db, &overrides, "zlib:zlib:1.3.0",
+                            "compile", 20260308, &report);
+    ASSERT_EQ(report.count, (size_t)1);
+    ASSERT_EQ(report.hits[0].overridden, 1);
+    ASSERT_EQ(report.blocked, 0); /* override prevents blocking */
+
+    now_advisory_report_free(&report);
+    now_override_list_free(&overrides);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_blacklisted_no_override(void) {
+    TEST("advisory: blacklisted cannot be overridden");
+    const char *db_str =
+        "{ advisories: ["
+        "    { id: \"NOW-SA-002\", severity: \"high\", blacklisted: true,"
+        "      affects: [ { id: \"evil:pkg\", versions: [\"*\"] } ],"
+        "      affects_build_time: true"
+        "    }"
+        "  ]"
+        "}";
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    now_advisory_db_load_string(&db, db_str, strlen(db_str), &res);
+
+    NowOverrideList overrides;
+    now_override_list_init(&overrides);
+    NowAdvisoryOverride *o = realloc(overrides.items, sizeof(NowAdvisoryOverride));
+    overrides.items = o;
+    overrides.capacity = 1;
+    overrides.count = 1;
+    memset(o, 0, sizeof(*o));
+    o->advisory = strdup("NOW-SA-002");
+    o->expires = strdup("2027-01-01");
+
+    NowAdvisoryReport report;
+    now_advisory_report_init(&report);
+    now_advisory_check_dep(&db, &overrides, "evil:pkg:1.0.0",
+                            "compile", 20260308, &report);
+    ASSERT_EQ(report.count, (size_t)1);
+    ASSERT_EQ(report.blocked, 1); /* blacklisted always blocks */
+
+    now_advisory_report_free(&report);
+    now_override_list_free(&overrides);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_medium_warning(void) {
+    TEST("advisory: medium severity = warning, not blocking");
+    const char *db_str =
+        "{ advisories: ["
+        "    { id: \"NOW-SA-003\", severity: \"medium\","
+        "      affects: [ { id: \"foo:bar\", versions: [\"*\"] } ],"
+        "      affects_runtime: true"
+        "    }"
+        "  ]"
+        "}";
+    NowAdvisoryDB db;
+    now_advisory_db_init(&db);
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    now_advisory_db_load_string(&db, db_str, strlen(db_str), &res);
+
+    NowAdvisoryReport report;
+    now_advisory_report_init(&report);
+    now_advisory_check_dep(&db, NULL, "foo:bar:2.0.0",
+                            "compile", 20260308, &report);
+    ASSERT_EQ(report.count, (size_t)1);
+    ASSERT_EQ(report.blocked, 0); /* medium does not block */
+
+    now_advisory_report_free(&report);
+    now_advisory_db_free(&db);
+    PASS();
+}
+
+static void test_advisory_report_format(void) {
+    TEST("advisory: report formatting");
+    NowAdvisoryReport report;
+    now_advisory_report_init(&report);
+    char *text = now_advisory_report_format(&report);
+    ASSERT_NOT_NULL(text);
+    free(text);
+
+    now_advisory_report_free(&report);
+    PASS();
+}
+
+static void test_advisory_null_safety(void) {
+    TEST("advisory: null safety");
+    ASSERT_EQ(now_severity_parse(NULL), NOW_SEV_INFO);
+    ASSERT_EQ(now_severity_blocks(NOW_SEV_INFO), 0);
+    ASSERT_EQ(now_advisory_override_expired(NULL, 20260308), -1);
+    if (now_advisory_find_override(NULL, "x", "y") != NULL) {
+        FAIL("expected NULL"); return;
+    }
+    ASSERT_EQ(now_advisory_check_dep(NULL, NULL, "x:y:1.0", "compile", 20260308, NULL), -1);
+    PASS();
+}
+
+/* ---- CI integration ---- */
+
+static void test_ci_exit_codes(void) {
+    TEST("ci: exit code mapping");
+    ASSERT_EQ(now_exit_code(NOW_OK), NOW_EXIT_OK);
+    ASSERT_EQ(now_exit_code(NOW_ERR_TOOL), NOW_EXIT_BUILD);
+    ASSERT_EQ(now_exit_code(NOW_ERR_TEST), NOW_EXIT_TEST);
+    ASSERT_EQ(now_exit_code(NOW_ERR_SCHEMA), NOW_EXIT_CONFIG);
+    ASSERT_EQ(now_exit_code(NOW_ERR_SYNTAX), NOW_EXIT_CONFIG);
+    ASSERT_EQ(now_exit_code(NOW_ERR_IO), NOW_EXIT_IO);
+    ASSERT_EQ(now_exit_code(NOW_ERR_NOT_FOUND), NOW_EXIT_RESOLVE);
+    ASSERT_EQ(now_exit_code(NOW_ERR_AUTH), NOW_EXIT_AUTH);
+    PASS();
+}
+
+static void test_ci_detect_defaults(void) {
+    TEST("ci: detect defaults (non-CI environment)");
+    NowCIEnv env;
+    now_ci_detect(&env);
+    /* In test runner context, we're not in CI (unless running in actual CI) */
+    /* Just verify the struct is populated without crashing */
+    if (env.format != NOW_OUTPUT_TEXT && env.format != NOW_OUTPUT_JSON
+        && env.format != NOW_OUTPUT_PASTA) {
+        FAIL("invalid format"); return;
+    }
+    PASS();
+}
+
+static void test_ci_format_build_json(void) {
+    TEST("ci: format build result as JSON");
+    char *out = now_ci_format_build("build", 0, 1234, 10, 8, 2, 0,
+                                     NOW_OUTPUT_JSON);
+    ASSERT_NOT_NULL(out);
+    if (!strstr(out, "\"phase\": \"build\"")) { FAIL("missing phase"); free(out); return; }
+    if (!strstr(out, "\"status\": \"ok\"")) { FAIL("missing status"); free(out); return; }
+    if (!strstr(out, "\"compiled\": 8")) { FAIL("missing compiled"); free(out); return; }
+    if (!strstr(out, "\"cached\": 2")) { FAIL("missing cached"); free(out); return; }
+    free(out);
+    PASS();
+}
+
+static void test_ci_format_build_pasta(void) {
+    TEST("ci: format build result as Pasta");
+    char *out = now_ci_format_build("compile", 1, 500, 5, 3, 1, 1,
+                                     NOW_OUTPUT_PASTA);
+    ASSERT_NOT_NULL(out);
+    if (!strstr(out, "phase: \"compile\"")) { FAIL("missing phase"); free(out); return; }
+    if (!strstr(out, "status: \"error\"")) { FAIL("missing status"); free(out); return; }
+    free(out);
+    PASS();
+}
+
+static void test_ci_format_test_json(void) {
+    TEST("ci: format test result as JSON");
+    char *out = now_ci_format_test(0, 42, 40, 2, 0, 3456, NOW_OUTPUT_JSON);
+    ASSERT_NOT_NULL(out);
+    if (!strstr(out, "\"phase\": \"test\"")) { FAIL("missing phase"); free(out); return; }
+    if (!strstr(out, "\"passed\": 40")) { FAIL("missing passed"); free(out); return; }
+    if (!strstr(out, "\"failed\": 2")) { FAIL("missing failed"); free(out); return; }
+    free(out);
+    PASS();
+}
+
+static void test_ci_format_text(void) {
+    TEST("ci: format build result as text");
+    char *out = now_ci_format_build("link", 0, 100, 1, 1, 0, 0,
+                                     NOW_OUTPUT_TEXT);
+    ASSERT_NOT_NULL(out);
+    if (!strstr(out, "link:")) { FAIL("missing phase"); free(out); return; }
+    if (!strstr(out, "ok")) { FAIL("missing status"); free(out); return; }
+    free(out);
+    PASS();
+}
+
+int main(void) {
+    printf("now test suite\n");
+    printf("==============\n\n");
+
+    printf("  Version:\n");
+    test_version();
+
+    printf("\n  POM (string):\n");
+    test_pom_minimal_string();
+    test_pom_lang_scalar();
+    test_pom_lang_mixed();
+    test_pom_compile();
+    test_pom_deps();
+    test_pom_convergence();
+
+    printf("\n  POM (file):\n");
+    test_pom_load_file();
+    test_pom_load_rich();
+
+    printf("\n  POM (errors):\n");
+    test_pom_syntax_error();
+    test_pom_not_a_map();
+    test_pom_file_not_found();
+
+    printf("\n  Language type system:\n");
+    test_lang_find_c();
+    test_lang_find_cxx();
+    test_lang_classify_c();
+    test_lang_classify_h();
+    test_lang_classify_cpp();
+    test_lang_classify_unknown();
+    test_lang_source_exts();
+
+    printf("\n  Filesystem:\n");
+    test_fs_path_join();
+    test_fs_path_join_trailing_sep();
+    test_fs_path_ext();
+    test_fs_obj_path();
+
+    printf("\n  Semantic versioning:\n");
+    test_semver_parse_basic();
+    test_semver_parse_prerelease();
+    test_semver_parse_build();
+    test_semver_compare();
+    test_semver_to_string();
+
+    printf("\n  Version ranges:\n");
+    test_range_exact();
+    test_range_caret();
+    test_range_caret_pre1();
+    test_range_tilde();
+    test_range_gte();
+    test_range_compound();
+    test_range_wildcard();
+    test_range_intersect();
+
+    printf("\n  Coordinates:\n");
+    test_coord_parse();
+
+    printf("\n  Manifest:\n");
+    test_manifest_set_find();
+    test_manifest_update();
+    test_sha256_string();
+
+    printf("\n  Resolver:\n");
+    test_resolver_single_dep();
+    test_resolver_convergence_lowest();
+    test_resolver_conflict();
+    test_resolver_multiple_deps();
+    test_resolver_override();
+    test_lock_save_load();
+
+    printf("\n  HTTP client:\n");
+    test_pico_http_version();
+    test_pico_http_parse_url();
+    test_pico_http_parse_url_no_port();
+    test_pico_http_parse_url_no_path();
+    test_pico_http_parse_url_https();
+    test_pico_http_parse_url_reject_ftp();
+    test_pico_http_error_codes();
+    test_pico_http_invalid_args();
+    test_pico_http_dns_failure();
+    test_pico_http_connect_failure();
+    test_pico_http_find_header();
+    test_pico_http_request_url();
+    test_pico_http_response_free_zeroed();
+    test_pico_http_stream_invalid_args();
+    test_pico_http_stream_connect_failure();
+    test_pico_http_stream_callback_type();
+
+    printf("\n  WebSocket client:\n");
+    test_pico_ws_version();
+    test_pico_ws_error_codes();
+    test_pico_ws_invalid_args();
+    test_pico_ws_bad_url();
+    test_pico_ws_connect_failure();
+    test_pico_ws_close_null();
+
+    printf("\n  Procure:\n");
+    test_repo_dep_path();
+    test_procure_no_deps();
+
+    printf("\n  Parallel build:\n");
+    test_cpu_count();
+
+    printf("\n  Toolchain:\n");
+    test_obj_path_ex_obj();
+    test_toolchain_gcc_default();
+    test_toolchain_msvc_detect();
+
+    printf("\n  Publish:\n");
+    test_publish_missing_identity();
+    test_publish_no_package();
+
+    printf("\n  Workspace:\n");
+    test_is_workspace_true();
+    test_is_workspace_false();
+    test_workspace_is_null();
+    test_workspace_init();
+    test_workspace_topo_sort();
+
+    printf("\n  Plugins:\n");
+    test_plugin_is_builtin();
+    test_plugin_pom_load();
+    test_plugin_run_hook_no_plugins();
+    test_plugin_result_init_free();
+    test_plugin_unknown_builtin();
+    test_plugin_version_generate();
+
+    printf("\n  Dep confusion protection:\n");
+    test_private_group_exact_match();
+    test_private_group_dotted_child();
+    test_private_group_no_false_positive();
+    test_private_group_multiple_prefixes();
+    test_private_group_null_safe();
+    test_private_group_pom_load();
+    test_private_group_procure_fail();
+
+    printf("\n  Reproducible builds:\n");
+    test_repro_init();
+    test_repro_from_project_bool();
+    test_repro_from_project_map();
+    test_repro_from_project_none();
+    test_repro_timebase_zero();
+    test_repro_timebase_now();
+    test_repro_timebase_literal();
+    test_repro_compile_flags_gcc();
+    test_repro_compile_flags_msvc();
+    test_repro_link_flags();
+    test_repro_link_flags_msvc_empty();
+    test_repro_sort_filelist();
+    test_repro_disabled_no_flags();
+    test_repro_null_safety();
+
+    printf("\n  Trust:\n");
+    test_trust_init_free();
+    test_trust_add();
+    test_trust_scope_wildcard();
+    test_trust_scope_group_prefix();
+    test_trust_scope_exact();
+    test_trust_find();
+    test_trust_find_no_match();
+    test_trust_policy_none();
+    test_trust_policy_signed();
+    test_trust_policy_trusted();
+    test_trust_policy_from_project();
+    test_trust_null_safety();
+
+    printf("\n  Advisory guards:\n");
+    test_advisory_db_init_free();
+    test_advisory_severity_parse();
+    test_advisory_severity_name();
+    test_advisory_severity_blocks();
+    test_advisory_db_load_string();
+    test_advisory_blacklisted();
+    test_advisory_override_parse();
+    test_advisory_override_no_expires();
+    test_advisory_override_expiry();
+    test_advisory_find_override();
+    test_advisory_check_dep_match();
+    test_advisory_check_dep_no_match();
+    test_advisory_check_dep_overridden();
+    test_advisory_blacklisted_no_override();
+    test_advisory_medium_warning();
+    test_advisory_report_format();
+    test_advisory_null_safety();
+
+    printf("\n  CI integration:\n");
+    test_ci_exit_codes();
+    test_ci_detect_defaults();
+    test_ci_format_build_json();
+    test_ci_format_build_pasta();
+    test_ci_format_test_json();
+    test_ci_format_text();
+
+    printf("\n  Layers:\n");
+    test_layer_stack_init();
+    test_layer_baseline_sections();
+    test_layer_load_file();
+    test_layer_merge_open();
+    test_layer_merge_locked_audit();
+    test_layer_merge_strarray_exclude();
+    test_layer_audit_format();
+    test_layer_push_project();
+
+    printf("\n  Multi-architecture:\n");
+    test_triple_parse_full();
+    test_triple_parse_shorthand();
+    test_triple_format();
+    test_triple_dir();
+    test_triple_cmp();
+    test_triple_match_exact();
+    test_triple_match_wildcard();
+    test_triple_host_detect();
+    test_triple_is_native();
+
+    printf("\n  Export:\n");
+    test_export_cmake_basic();
+    test_export_cmake_executable();
+    test_export_cmake_deps_comment();
+    test_export_cmake_cxx();
+    test_export_make_basic();
+    test_export_make_executable();
+    test_export_make_static();
+    test_export_make_deps();
+    test_export_make_cxx();
+
+    printf("\n  Build integration:\n");
+    test_build_hello();
+    /* test_test_phase requires gcc in PATH at runtime — run manually */
+
+    printf("\n%d/%d tests passed", tests_passed, tests_run);
+    if (tests_failed) printf(", %d FAILED", tests_failed);
+    printf("\n");
+    return tests_failed ? 1 : 0;
+}

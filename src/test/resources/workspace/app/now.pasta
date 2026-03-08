@@ -1,0 +1,10 @@
+{
+  group: "org.test",
+  artifact: "app",
+  version: "1.0.0",
+  lang: "c",
+  output: { type: "executable" },
+  deps: [
+    { id: "org.test:core:*" }
+  ]
+}

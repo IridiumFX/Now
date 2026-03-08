@@ -1,0 +1,24 @@
+/*
+ * now_export.h — Export now.pasta as CMakeLists.txt (or other build systems)
+ *
+ * Generates a build system file from the NowProject descriptor,
+ * providing a zero-lock-in escape hatch.
+ */
+#ifndef NOW_EXPORT_H
+#define NOW_EXPORT_H
+
+#include "now.h"
+
+/* Generate a CMakeLists.txt from a project descriptor.
+ * outpath: destination file path (e.g. "CMakeLists.txt").
+ * Returns 0 on success. */
+NOW_API int now_export_cmake(const NowProject *project, const char *basedir,
+                              const char *outpath, NowResult *result);
+
+/* Generate a Makefile from a project descriptor.
+ * outpath: destination file path (e.g. "Makefile").
+ * Returns 0 on success. */
+NOW_API int now_export_make(const NowProject *project, const char *basedir,
+                              const char *outpath, NowResult *result);
+
+#endif /* NOW_EXPORT_H */

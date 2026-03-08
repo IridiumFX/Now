@@ -1,0 +1,78 @@
+/*
+ * pico_internal.h — Shared transport layer for pico_http and pico_ws
+ *
+ * Internal header — NOT part of the public API. Provides the PicoConn
+ * abstraction (raw socket + optional TLS via mbedTLS) used by both
+ * the HTTP client and WebSocket client.
+ *
+ * License: MIT
+ * Copyright (c) 2026 The now contributors
+ */
+#ifndef PICO_INTERNAL_H
+#define PICO_INTERNAL_H
+
+#include <stddef.h>
+#include <string.h>
+
+#ifdef PICO_HTTP_TLS
+  #include <mbedtls/ssl.h>
+  #include <mbedtls/entropy.h>
+  #include <mbedtls/ctr_drbg.h>
+#endif
+
+/* ---- Platform sockets ---- */
+
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+
+  typedef SOCKET pico_socket_t;
+  #define PICO_INVALID_SOCKET INVALID_SOCKET
+  #define pico_closesocket closesocket
+#else
+  #include <sys/socket.h>
+  #include <sys/types.h>
+  #include <netinet/in.h>
+  #include <netdb.h>
+  #include <unistd.h>
+  #include <errno.h>
+  #include <fcntl.h>
+  #include <poll.h>
+
+  typedef int pico_socket_t;
+  #define PICO_INVALID_SOCKET (-1)
+  #define pico_closesocket close
+#endif
+
+/* ---- Connection abstraction ---- */
+
+typedef struct {
+    pico_socket_t sock;
+    int           use_tls;
+#ifdef PICO_HTTP_TLS
+    mbedtls_ssl_context      ssl;
+    mbedtls_ssl_config       conf;
+    mbedtls_ctr_drbg_context drbg;
+    mbedtls_entropy_context  entropy;
+    int                      tls_init;
+#endif
+} PicoConn;
+
+/* Declared in pico_http.c — shared across pico_*.c files */
+int  pico_wsa_init(void);
+void pico_conn_init(PicoConn *c);
+int  pico_conn_send(PicoConn *c, const char *data, size_t len);
+int  pico_conn_recv(PicoConn *c, char *buf, int buflen);
+void pico_conn_close(PicoConn *c);
+void pico_set_timeout(pico_socket_t sock, int timeout_ms);
+pico_socket_t pico_connect(const char *host, int port,
+                            int connect_timeout_ms, int *err_out);
+#ifdef PICO_HTTP_TLS
+int  pico_tls_handshake(PicoConn *c, const char *hostname);
+#endif
+
+#endif /* PICO_INTERNAL_H */

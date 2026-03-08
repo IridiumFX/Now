@@ -1,0 +1,1751 @@
+/*
+ * now_build.c — Build and link phases
+ *
+ * Compiles source files to objects, then links into final output.
+ */
+#include "now_build.h"
+#include "now_manifest.h"
+#include "now_repro.h"
+#include "now.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <process.h>
+#else
+  #include <sys/wait.h>
+  #include <unistd.h>
+  #ifdef __APPLE__
+    #include <sys/sysctl.h>
+  #endif
+#endif
+
+/* ---- CPU count detection ---- */
+
+int now_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int n = (int)si.dwNumberOfProcessors;
+    return n > 0 ? n : 1;
+#elif defined(__APPLE__)
+    int n = 1;
+    size_t sz = sizeof(n);
+    if (sysctlbyname("hw.logicalcpu", &n, &sz, NULL, 0) == 0 && n > 0)
+        return n;
+    return 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
+}
+
+/* ---- Subprocess execution ---- */
+
+/* Build a Windows command-line string from argv.
+ * Caller must free the returned string. */
+#ifdef _WIN32
+static char *build_cmdline(const char *const *argv) {
+    size_t len = 0;
+    for (const char *const *a = argv; *a; a++)
+        len += strlen(*a) + 3;
+
+    char *cmdline = malloc(len + 1);
+    if (!cmdline) return NULL;
+    cmdline[0] = '\0';
+
+    for (const char *const *a = argv; *a; a++) {
+        if (a != argv) strcat(cmdline, " ");
+        if (strchr(*a, ' ')) {
+            strcat(cmdline, "\"");
+            strcat(cmdline, *a);
+            strcat(cmdline, "\"");
+        } else {
+            strcat(cmdline, *a);
+        }
+    }
+    return cmdline;
+}
+#endif
+
+int now_exec(const char *const *argv, int verbose) {
+    if (!argv || !argv[0]) return -1;
+
+    if (verbose) {
+        fprintf(stderr, " ");
+        for (const char *const *a = argv; *a; a++)
+            fprintf(stderr, " %s", *a);
+        fprintf(stderr, "\n");
+    }
+
+#ifdef _WIN32
+    char *cmdline = build_cmdline(argv);
+    if (!cmdline) return -1;
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    memset(&pi, 0, sizeof(pi));
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                        0, NULL, NULL, &si, &pi)) {
+        free(cmdline);
+        return -1;
+    }
+    free(cmdline);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exit_code;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)exit_code;
+
+#else
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+#endif
+}
+
+/* ---- Parallel process pool ---- */
+
+/* A slot in the parallel compilation pool */
+typedef struct {
+    int            active;      /* 1 if a process is running in this slot */
+    size_t         source_idx;  /* index into the source/work list */
+#ifdef _WIN32
+    HANDLE         hProcess;
+    HANDLE         hPipeRead;   /* read end of captured stderr pipe */
+#else
+    pid_t          pid;
+    int            pipe_fd;     /* read end of captured stderr pipe */
+#endif
+} NowWorkerSlot;
+
+/* Captured output from a completed worker */
+typedef struct {
+    char  *data;
+    size_t len;
+} NowCapturedOutput;
+
+/* Read all available data from a pipe/handle into a buffer.
+ * Returns a malloc'd string (caller frees). */
+static NowCapturedOutput read_pipe_all(
+#ifdef _WIN32
+    HANDLE h
+#else
+    int fd
+#endif
+) {
+    NowCapturedOutput out = {NULL, 0};
+    size_t cap = 1024;
+    out.data = malloc(cap);
+    if (!out.data) return out;
+    out.data[0] = '\0';
+
+    for (;;) {
+        if (out.len + 512 > cap) {
+            cap *= 2;
+            char *tmp = realloc(out.data, cap);
+            if (!tmp) break;
+            out.data = tmp;
+        }
+#ifdef _WIN32
+        DWORD n = 0;
+        if (!ReadFile(h, out.data + out.len, (DWORD)(cap - out.len - 1), &n, NULL) || n == 0)
+            break;
+        out.len += n;
+#else
+        ssize_t n = read(fd, out.data + out.len, cap - out.len - 1);
+        if (n <= 0) break;
+        out.len += (size_t)n;
+#endif
+    }
+    out.data[out.len] = '\0';
+    return out;
+}
+
+/* Spawn a process with stderr+stdout captured to a pipe.
+ * Returns 0 on success; fills slot with process info. */
+static int spawn_captured(const char *const *argv, NowWorkerSlot *slot) {
+#ifdef _WIN32
+    char *cmdline = build_cmdline(argv);
+    if (!cmdline) return -1;
+
+    /* Create pipe for capturing output */
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE hRead, hWrite;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        free(cmdline);
+        return -1;
+    }
+    /* Ensure read handle is not inherited */
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hWrite;
+    si.hStdError  = hWrite;
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    memset(&pi, 0, sizeof(pi));
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                        0, NULL, NULL, &si, &pi)) {
+        free(cmdline);
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        return -1;
+    }
+    free(cmdline);
+    CloseHandle(pi.hThread);
+    CloseHandle(hWrite);  /* close write end in parent */
+
+    slot->hProcess  = pi.hProcess;
+    slot->hPipeRead = hRead;
+    return 0;
+
+#else
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: redirect stdout+stderr to pipe write end */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    /* Parent */
+    close(pipefd[1]);
+    slot->pid     = pid;
+    slot->pipe_fd = pipefd[0];
+    return 0;
+#endif
+}
+
+/* Wait for any one of the active workers to finish.
+ * Returns the slot index, sets *exit_code and *captured. */
+static int wait_any_worker(NowWorkerSlot *slots, int nslots,
+                           int *exit_code, NowCapturedOutput *captured) {
+#ifdef _WIN32
+    /* Collect active process handles */
+    HANDLE handles[64];
+    int    indices[64];
+    int    nactive = 0;
+    for (int i = 0; i < nslots && nactive < 64; i++) {
+        if (slots[i].active) {
+            handles[nactive] = slots[i].hProcess;
+            indices[nactive] = i;
+            nactive++;
+        }
+    }
+    if (nactive == 0) return -1;
+
+    DWORD which = WaitForMultipleObjects((DWORD)nactive, handles, FALSE, INFINITE);
+    if (which < WAIT_OBJECT_0 || which >= WAIT_OBJECT_0 + (DWORD)nactive)
+        return -1;
+
+    int slot_idx = indices[which - WAIT_OBJECT_0];
+    NowWorkerSlot *s = &slots[slot_idx];
+
+    DWORD code;
+    GetExitCodeProcess(s->hProcess, &code);
+    *exit_code = (int)code;
+
+    *captured = read_pipe_all(s->hPipeRead);
+
+    CloseHandle(s->hProcess);
+    CloseHandle(s->hPipeRead);
+    s->active = 0;
+    return slot_idx;
+
+#else
+    int status;
+    pid_t pid = waitpid(-1, &status, 0);
+    if (pid <= 0) return -1;
+
+    /* Find the slot */
+    int slot_idx = -1;
+    for (int i = 0; i < nslots; i++) {
+        if (slots[i].active && slots[i].pid == pid) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx < 0) return -1;
+
+    NowWorkerSlot *s = &slots[slot_idx];
+    *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+    *captured = read_pipe_all(s->pipe_fd);
+
+    close(s->pipe_fd);
+    s->active = 0;
+    return slot_idx;
+#endif
+}
+
+/* ---- Toolchain resolution (§7.1) ---- */
+
+static char *resolve_tool(const char *env_var, const char *fallback) {
+    const char *val = getenv(env_var);
+    if (val && *val) return strdup(val);
+    return strdup(fallback);
+}
+
+void now_toolchain_resolve(NowToolchain *tc, const NowProject *p) {
+    (void)p;  /* future: read toolchain from project */
+#ifdef _WIN32
+    /* On Windows with MSVC, detect cl.exe; otherwise assume gcc/mingw */
+    const char *cc_env = getenv("CC");
+    if (cc_env && strstr(cc_env, "cl")) {
+        tc->cc     = strdup(cc_env);
+        tc->cxx    = resolve_tool("CXX", "cl.exe");
+        tc->ar     = resolve_tool("AR",  "lib.exe");
+        tc->as     = resolve_tool("AS",  "ml64.exe");
+        tc->ld     = NULL;
+        tc->is_msvc = 1;
+    } else {
+        tc->cc     = resolve_tool("CC",  "gcc");
+        tc->cxx    = resolve_tool("CXX", "g++");
+        tc->ar     = resolve_tool("AR",  "ar");
+        tc->as     = resolve_tool("AS",  "as");
+        tc->ld     = NULL;
+        tc->is_msvc = 0;
+    }
+#else
+    tc->cc     = resolve_tool("CC",  "cc");
+    tc->cxx    = resolve_tool("CXX", "c++");
+    tc->ar     = resolve_tool("AR",  "ar");
+    tc->as     = resolve_tool("AS",  "as");
+    tc->ld     = NULL;
+    tc->is_msvc = 0;
+#endif
+}
+
+void now_toolchain_free(NowToolchain *tc) {
+    free(tc->cc);
+    free(tc->cxx);
+    free(tc->ar);
+    free(tc->as);
+    free(tc->ld);
+    memset(tc, 0, sizeof(*tc));
+}
+
+/* ---- Build context ---- */
+
+int now_build_init(NowBuildCtx *ctx, const NowProject *project,
+                   const char *basedir, NowResult *result) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->project    = project;
+    ctx->basedir    = basedir;
+    ctx->target_dir = "target";
+    now_filelist_init(&ctx->sources);
+    now_filelist_init(&ctx->objects);
+    now_filelist_init(&ctx->dep_includes);
+    now_filelist_init(&ctx->dep_libdirs);
+    now_filelist_init(&ctx->dep_libs);
+
+    now_lang_registry_init();
+    now_toolchain_resolve(&ctx->toolchain, project);
+
+    /* Create target directories */
+    char *obj_dir = now_path_join(basedir, "target/obj/main");
+    if (now_mkdir_p(obj_dir) != 0) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "cannot create directory: %s", obj_dir);
+        }
+        free(obj_dir);
+        return -1;
+    }
+    free(obj_dir);
+
+    char *bin_dir = now_path_join(basedir, "target/bin");
+    now_mkdir_p(bin_dir);
+    free(bin_dir);
+
+    /* Discover source files */
+    if (project->langs.count == 0) {
+        if (result) {
+            result->code = NOW_ERR_SCHEMA;
+            snprintf(result->message, sizeof(result->message),
+                     "no languages declared in project");
+        }
+        return -1;
+    }
+
+    const char **exts = now_lang_source_exts(
+        (const char *const *)project->langs.items, project->langs.count);
+    if (!exts) {
+        if (result) {
+            result->code = NOW_ERR_ALLOC;
+            snprintf(result->message, sizeof(result->message), "out of memory");
+        }
+        return -1;
+    }
+
+    const char *src_dir = project->sources.dir;
+    if (!src_dir) src_dir = "src/main/c";
+
+    int rc = now_discover_sources(basedir, src_dir, exts, &ctx->sources);
+    free(exts);
+
+    if (rc != 0) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "cannot scan source directory: %s", src_dir);
+        }
+        return -1;
+    }
+
+    if (ctx->sources.count == 0) {
+        if (result) {
+            result->code = NOW_ERR_NOT_FOUND;
+            snprintf(result->message, sizeof(result->message),
+                     "no source files found in %s", src_dir);
+        }
+        return -1;
+    }
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return 0;
+}
+
+/* ---- Compile phase (§2.3) ---- */
+
+/* A compile job — everything needed to compile one source file */
+typedef struct {
+    char  *src_rel;     /* source path (relative) */
+    char  *obj_path;    /* output object path */
+    char **argv;        /* NULL-terminated argument list (all strings owned) */
+    int    argc;
+} NowCompileJob;
+
+static void compile_job_free(NowCompileJob *job) {
+    free(job->src_rel);
+    free(job->obj_path);
+    if (job->argv) {
+        for (int i = 0; i < job->argc; i++)
+            free(job->argv[i]);
+        free(job->argv);
+    }
+    memset(job, 0, sizeof(*job));
+}
+
+/* Build the argument list for compiling one source file (MSVC cl.exe).
+ * Returns 0 on success, fills job with owned copies of all strings. */
+static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
+                                  const NowLangType *type, const NowLangDef *lang,
+                                  NowCompileJob *job) {
+    const NowProject *p = ctx->project;
+    const char *basedir = ctx->basedir;
+    memset(job, 0, sizeof(*job));
+
+    /* Resolve tool */
+    const char *tool = ctx->toolchain.cc;
+    if (type->tool_var && strcmp(type->tool_var, "${cxx}") == 0)
+        tool = ctx->toolchain.cxx;
+
+    /* Derive object path with .obj extension */
+    char *obj = now_obj_path_ex(basedir, src_rel, p->sources.dir,
+                                ctx->target_dir, ".obj");
+    if (!obj) return -1;
+
+    /* Ensure object directory exists */
+    char *obj_dir = strdup(obj);
+    char *last_sep = strrchr(obj_dir, '/');
+    if (!last_sep) last_sep = strrchr(obj_dir, '\\');
+    if (last_sep) {
+        *last_sep = '\0';
+        now_mkdir_p(obj_dir);
+    }
+    free(obj_dir);
+
+    /* Build argument list */
+    const char *tmp_argv[128];
+    int tmp_argc = 0;
+
+    tmp_argv[tmp_argc++] = tool;
+    tmp_argv[tmp_argc++] = "/nologo";
+
+    /* Standard flag: /std:c11, /std:c17, /std:c++17, etc. */
+    char std_buf[32] = {0};
+    const char *std = p->compile.std ? p->compile.std : p->std;
+    if (std && lang->std_flag) {
+        snprintf(std_buf, sizeof(std_buf), "/std:%s", std);
+        tmp_argv[tmp_argc++] = std_buf;
+    }
+
+    /* Warnings: translate GCC-style to MSVC
+     * Wall → /W4 (MSVC /Wall is too verbose)
+     * Wextra → /W4
+     * Werror → /WX
+     * Wpedantic → /W4
+     * Otherwise: pass through as /Wnnnn if numeric, else skip */
+    for (size_t i = 0; i < p->compile.warnings.count; i++) {
+        const char *w = p->compile.warnings.items[i];
+        if (strcmp(w, "Wall") == 0 || strcmp(w, "Wextra") == 0 ||
+            strcmp(w, "Wpedantic") == 0)
+            tmp_argv[tmp_argc++] = "/W4";
+        else if (strcmp(w, "Werror") == 0)
+            tmp_argv[tmp_argc++] = "/WX";
+    }
+
+    /* Defines: /D */
+    char *def_bufs[64];
+    size_t ndef = 0;
+    for (size_t i = 0; i < p->compile.defines.count && ndef < 64; i++) {
+        size_t dlen = strlen(p->compile.defines.items[i]) + 4;
+        def_bufs[ndef] = malloc(dlen);
+        if (def_bufs[ndef]) {
+            snprintf(def_bufs[ndef], dlen, "/D%s", p->compile.defines.items[i]);
+            tmp_argv[tmp_argc++] = def_bufs[ndef];
+            ndef++;
+        }
+    }
+
+    /* Include paths: /I */
+    char *inc_bufs[32];
+    size_t ninc = 0;
+    if (p->sources.headers) {
+        char *hdr_full = now_path_join(basedir, p->sources.headers);
+        if (hdr_full) {
+            size_t ilen = strlen(hdr_full) + 4;
+            inc_bufs[ninc] = malloc(ilen);
+            if (inc_bufs[ninc]) {
+                snprintf(inc_bufs[ninc], ilen, "/I%s", hdr_full);
+                tmp_argv[tmp_argc++] = inc_bufs[ninc];
+                ninc++;
+            }
+            free(hdr_full);
+        }
+    }
+    for (size_t i = 0; i < p->compile.includes.count && ninc < 32; i++) {
+        char *inc_full = now_path_join(basedir, p->compile.includes.items[i]);
+        if (inc_full) {
+            size_t ilen = strlen(inc_full) + 4;
+            inc_bufs[ninc] = malloc(ilen);
+            if (inc_bufs[ninc]) {
+                snprintf(inc_bufs[ninc], ilen, "/I%s", inc_full);
+                tmp_argv[tmp_argc++] = inc_bufs[ninc];
+                ninc++;
+            }
+            free(inc_full);
+        }
+    }
+
+    /* Dependency include paths (from procure) — already have /I or -I prefix */
+    for (size_t i = 0; i < ctx->dep_includes.count; i++)
+        tmp_argv[tmp_argc++] = ctx->dep_includes.paths[i];
+
+    /* Extra compile flags */
+    for (size_t i = 0; i < p->compile.flags.count; i++)
+        tmp_argv[tmp_argc++] = p->compile.flags.items[i];
+
+    /* Optimization:
+     * none  → /Od
+     * debug → /Od /Zi
+     * size  → /O1
+     * speed → /O2
+     * lto   → /O2 /GL */
+    if (p->compile.opt) {
+        if (strcmp(p->compile.opt, "none") == 0)
+            tmp_argv[tmp_argc++] = "/Od";
+        else if (strcmp(p->compile.opt, "debug") == 0) {
+            tmp_argv[tmp_argc++] = "/Od";
+            tmp_argv[tmp_argc++] = "/Zi";
+        }
+        else if (strcmp(p->compile.opt, "size") == 0)
+            tmp_argv[tmp_argc++] = "/O1";
+        else if (strcmp(p->compile.opt, "speed") == 0)
+            tmp_argv[tmp_argc++] = "/O2";
+        else if (strcmp(p->compile.opt, "lto") == 0) {
+            tmp_argv[tmp_argc++] = "/O2";
+            tmp_argv[tmp_argc++] = "/GL";
+        }
+    }
+
+    /* Compile only */
+    tmp_argv[tmp_argc++] = "/c";
+
+    /* Source file */
+    char *src_full = now_path_join(basedir, src_rel);
+    tmp_argv[tmp_argc++] = src_full;
+
+    /* Output: /Fo"path" */
+    char fo_buf[520];
+    snprintf(fo_buf, sizeof(fo_buf), "/Fo%s", obj);
+    tmp_argv[tmp_argc++] = fo_buf;
+
+    /* Copy everything into owned strings */
+    job->argv = (char **)malloc((tmp_argc + 1) * sizeof(char *));
+    if (!job->argv) {
+        free(src_full);
+        free(obj);
+        for (size_t i = 0; i < ndef; i++) free(def_bufs[i]);
+        for (size_t i = 0; i < ninc; i++) free(inc_bufs[i]);
+        return -1;
+    }
+    for (int i = 0; i < tmp_argc; i++)
+        job->argv[i] = strdup(tmp_argv[i]);
+    job->argv[tmp_argc] = NULL;
+    job->argc = tmp_argc;
+
+    job->src_rel  = strdup(src_rel);
+    job->obj_path = strdup(obj);
+
+    free(src_full);
+    free(obj);
+    for (size_t i = 0; i < ndef; i++) free(def_bufs[i]);
+    for (size_t i = 0; i < ninc; i++) free(inc_bufs[i]);
+
+    return 0;
+}
+
+/* Build the argument list for compiling one source file (GCC/Clang).
+ * Returns 0 on success, fills job with owned copies of all strings. */
+static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
+                             const NowLangType *type, const NowLangDef *lang,
+                             NowCompileJob *job) {
+    const NowProject *p = ctx->project;
+    const char *basedir = ctx->basedir;
+    memset(job, 0, sizeof(*job));
+
+    /* Resolve tool */
+    const char *tool = ctx->toolchain.cc;
+    if (type->tool_var && strcmp(type->tool_var, "${cxx}") == 0)
+        tool = ctx->toolchain.cxx;
+    else if (type->tool_var && strcmp(type->tool_var, "${as}") == 0)
+        tool = ctx->toolchain.as;
+
+    /* Derive object path */
+    char *obj = now_obj_path(basedir, src_rel, p->sources.dir, ctx->target_dir);
+    if (!obj) return -1;
+
+    /* Ensure object directory exists */
+    char *obj_dir = strdup(obj);
+    char *last_sep = strrchr(obj_dir, '/');
+    if (!last_sep) last_sep = strrchr(obj_dir, '\\');
+    if (last_sep) {
+        *last_sep = '\0';
+        now_mkdir_p(obj_dir);
+    }
+    free(obj_dir);
+
+    /* Build argument list into a temporary stack array, then copy */
+    const char *tmp_argv[128];
+    int tmp_argc = 0;
+
+    tmp_argv[tmp_argc++] = tool;
+
+    /* Standard flag */
+    char std_buf[32] = {0};
+    const char *std = p->compile.std ? p->compile.std : p->std;
+    if (std && lang->std_flag) {
+        snprintf(std_buf, sizeof(std_buf), "-std=%s", std);
+        tmp_argv[tmp_argc++] = std_buf;
+    }
+
+    /* Warnings */
+    char *warn_bufs[32];
+    size_t nwarn = 0;
+    for (size_t i = 0; i < p->compile.warnings.count && nwarn < 32; i++) {
+        const char *w = p->compile.warnings.items[i];
+        size_t wlen = strlen(w) + 3;
+        warn_bufs[nwarn] = malloc(wlen);
+        if (warn_bufs[nwarn]) {
+            snprintf(warn_bufs[nwarn], wlen, "-%s", w);
+            tmp_argv[tmp_argc++] = warn_bufs[nwarn];
+            nwarn++;
+        }
+    }
+
+    /* Defines */
+    char *def_bufs[64];
+    size_t ndef = 0;
+    for (size_t i = 0; i < p->compile.defines.count && ndef < 64; i++) {
+        size_t dlen = strlen(p->compile.defines.items[i]) + 3;
+        def_bufs[ndef] = malloc(dlen);
+        if (def_bufs[ndef]) {
+            snprintf(def_bufs[ndef], dlen, "-D%s", p->compile.defines.items[i]);
+            tmp_argv[tmp_argc++] = def_bufs[ndef];
+            ndef++;
+        }
+    }
+
+    /* Include paths */
+    char *inc_bufs[32];
+    size_t ninc = 0;
+    if (p->sources.headers) {
+        char *hdr_full = now_path_join(basedir, p->sources.headers);
+        if (hdr_full) {
+            size_t ilen = strlen(hdr_full) + 3;
+            inc_bufs[ninc] = malloc(ilen);
+            if (inc_bufs[ninc]) {
+                snprintf(inc_bufs[ninc], ilen, "-I%s", hdr_full);
+                tmp_argv[tmp_argc++] = inc_bufs[ninc];
+                ninc++;
+            }
+            free(hdr_full);
+        }
+    }
+    for (size_t i = 0; i < p->compile.includes.count && ninc < 32; i++) {
+        char *inc_full = now_path_join(basedir, p->compile.includes.items[i]);
+        if (inc_full) {
+            size_t ilen = strlen(inc_full) + 3;
+            inc_bufs[ninc] = malloc(ilen);
+            if (inc_bufs[ninc]) {
+                snprintf(inc_bufs[ninc], ilen, "-I%s", inc_full);
+                tmp_argv[tmp_argc++] = inc_bufs[ninc];
+                ninc++;
+            }
+            free(inc_full);
+        }
+    }
+
+    /* Dependency include paths (from procure) */
+    for (size_t i = 0; i < ctx->dep_includes.count; i++)
+        tmp_argv[tmp_argc++] = ctx->dep_includes.paths[i];
+
+    /* Extra compile flags */
+    for (size_t i = 0; i < p->compile.flags.count; i++)
+        tmp_argv[tmp_argc++] = p->compile.flags.items[i];
+
+    /* Optimization */
+    const char *opt_flag = NULL;
+    if (p->compile.opt) {
+        if (strcmp(p->compile.opt, "none") == 0)       opt_flag = "-O0";
+        else if (strcmp(p->compile.opt, "debug") == 0) opt_flag = "-Og";
+        else if (strcmp(p->compile.opt, "size") == 0)  opt_flag = "-Os";
+        else if (strcmp(p->compile.opt, "speed") == 0) opt_flag = "-O2";
+        else if (strcmp(p->compile.opt, "lto") == 0)   opt_flag = "-O2";
+        if (opt_flag) tmp_argv[tmp_argc++] = opt_flag;
+        if (strcmp(p->compile.opt, "lto") == 0)
+            tmp_argv[tmp_argc++] = "-flto";
+    }
+
+    tmp_argv[tmp_argc++] = "-c";
+
+    char *src_full = now_path_join(basedir, src_rel);
+    tmp_argv[tmp_argc++] = src_full;
+
+    tmp_argv[tmp_argc++] = "-o";
+    tmp_argv[tmp_argc++] = obj;
+
+    /* Now copy everything into owned strings */
+    job->argv = (char **)malloc((tmp_argc + 1) * sizeof(char *));
+    if (!job->argv) {
+        free(src_full);
+        free(obj);
+        for (size_t i = 0; i < nwarn; i++) free(warn_bufs[i]);
+        for (size_t i = 0; i < ndef; i++)  free(def_bufs[i]);
+        for (size_t i = 0; i < ninc; i++)  free(inc_bufs[i]);
+        return -1;
+    }
+    for (int i = 0; i < tmp_argc; i++)
+        job->argv[i] = strdup(tmp_argv[i]);
+    job->argv[tmp_argc] = NULL;
+    job->argc = tmp_argc;
+
+    job->src_rel  = strdup(src_rel);
+    job->obj_path = strdup(obj);
+
+    /* Free temporaries (the copies are in job->argv now) */
+    free(src_full);
+    free(obj);
+    for (size_t i = 0; i < nwarn; i++) free(warn_bufs[i]);
+    for (size_t i = 0; i < ndef; i++)  free(def_bufs[i]);
+    for (size_t i = 0; i < ninc; i++)  free(inc_bufs[i]);
+
+    return 0;
+}
+
+/* Build a hash of the compile flags for a given source file.
+ * Used for incremental rebuild detection. */
+static char *compile_flags_hash(const NowProject *p) {
+    /* Concatenate all flags that affect compilation */
+    size_t cap = 256;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+    size_t len = 0;
+
+    /* Helper to append */
+    #define APPEND(s) do { \
+        size_t sl = strlen(s); \
+        while (len + sl + 2 > cap) { cap *= 2; buf = realloc(buf, cap); if (!buf) return NULL; } \
+        memcpy(buf + len, s, sl); len += sl; buf[len++] = '\n'; buf[len] = '\0'; \
+    } while(0)
+
+    if (p->std) APPEND(p->std);
+    if (p->compile.std) APPEND(p->compile.std);
+    if (p->compile.opt) APPEND(p->compile.opt);
+    for (size_t i = 0; i < p->compile.warnings.count; i++)
+        APPEND(p->compile.warnings.items[i]);
+    for (size_t i = 0; i < p->compile.defines.count; i++)
+        APPEND(p->compile.defines.items[i]);
+    for (size_t i = 0; i < p->compile.includes.count; i++)
+        APPEND(p->compile.includes.items[i]);
+    for (size_t i = 0; i < p->compile.flags.count; i++)
+        APPEND(p->compile.flags.items[i]);
+    #undef APPEND
+
+    char *hash = now_sha256_string(buf, len);
+    free(buf);
+    return hash;
+}
+
+int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
+    const NowProject *p = ctx->project;
+    int errors = 0;
+
+    /* Reproducibility: parse config and resolve timebase */
+    NowReproConfig repro;
+    now_repro_from_project(&repro, p);
+
+    char *repro_timestamp = NULL;
+    char **repro_flags = NULL;
+    size_t repro_flag_count = 0;
+
+    if (repro.enabled) {
+        repro_timestamp = now_repro_resolve_timebase(&repro, ctx->basedir, result);
+        if (repro.path_prefix_map || repro.no_date_macros) {
+            now_repro_compile_flags(&repro, ctx->basedir, repro_timestamp,
+                                    ctx->toolchain.is_msvc,
+                                    &repro_flags, &repro_flag_count);
+        }
+        /* Sort source list for deterministic ordering */
+        if (repro.sort_inputs)
+            now_repro_sort_filelist(&ctx->sources);
+    }
+
+    /* Load manifest for incremental builds */
+    NowManifest manifest;
+    char *manifest_path = now_path_join(ctx->basedir, "target/.now-manifest");
+    now_manifest_load(&manifest, manifest_path);
+
+    /* Compute flags hash once for all sources */
+    char *fhash = compile_flags_hash(p);
+
+    /* Determine job count */
+    int max_jobs = ctx->jobs > 0 ? ctx->jobs : now_cpu_count();
+    if (max_jobs < 1) max_jobs = 1;
+    if (max_jobs > 64) max_jobs = 64;
+
+    /* Phase 1: Classify sources, check manifest, build job list */
+    size_t njobs = 0;
+    size_t jobs_cap = ctx->sources.count > 0 ? ctx->sources.count : 1;
+    NowCompileJob *jobs = (NowCompileJob *)calloc(jobs_cap, sizeof(NowCompileJob));
+    if (!jobs) {
+        free(fhash);
+        free(manifest_path);
+        now_manifest_free(&manifest);
+        return -1;
+    }
+
+    int skipped = 0;
+
+    for (size_t i = 0; i < ctx->sources.count; i++) {
+        const char *src = ctx->sources.paths[i];
+
+        const NowLangDef *lang = NULL;
+        const NowLangType *type = now_lang_classify(
+            src, (const char *const *)p->langs.items, p->langs.count, &lang);
+
+        if (!type || type->role != NOW_ROLE_SOURCE) continue;
+
+        /* Check manifest for incremental skip */
+        const NowManifestEntry *entry = now_manifest_find(&manifest, src);
+        if (!now_manifest_needs_rebuild(entry, ctx->basedir, src, fhash)) {
+            if (entry->object)
+                now_filelist_push(&ctx->objects, entry->object);
+            skipped++;
+            continue;
+        }
+
+        int jrc;
+        if (ctx->toolchain.is_msvc)
+            jrc = build_compile_job_msvc(ctx, src, type, lang, &jobs[njobs]);
+        else
+            jrc = build_compile_job(ctx, src, type, lang, &jobs[njobs]);
+
+        if (jrc == 0) {
+            /* Inject reproducibility flags into the job argv */
+            if (repro_flag_count > 0 && repro_flags) {
+                NowCompileJob *job = &jobs[njobs];
+                int new_argc = job->argc + (int)repro_flag_count;
+                char **new_argv = realloc(job->argv,
+                                          (new_argc + 1) * sizeof(char *));
+                if (new_argv) {
+                    /* Insert repro flags before the last 3 args
+                     * (which are: -c src -o obj  OR  /c src /Fo...) */
+                    int insert_at = job->argc >= 4 ? job->argc - 4 : 0;
+                    /* Shift tail */
+                    memmove(new_argv + insert_at + repro_flag_count,
+                            new_argv + insert_at,
+                            (job->argc - insert_at + 1) * sizeof(char *));
+                    for (size_t rf = 0; rf < repro_flag_count; rf++)
+                        new_argv[insert_at + rf] = strdup(repro_flags[rf]);
+                    job->argv = new_argv;
+                    job->argc = new_argc;
+                }
+            }
+            njobs++;
+        }
+        else
+            errors++;
+    }
+
+    /* Phase 2: Execute jobs in parallel */
+    int compiled = 0;
+
+    if (njobs > 0 && errors == 0) {
+        int pool_size = (int)njobs < max_jobs ? (int)njobs : max_jobs;
+
+        /* For single job, skip the pool overhead */
+        if (pool_size <= 1) {
+            for (size_t i = 0; i < njobs; i++) {
+                NowCompileJob *job = &jobs[i];
+
+                if (ctx->verbose) {
+                    fprintf(stderr, " ");
+                    for (int a = 0; a < job->argc; a++)
+                        fprintf(stderr, " %s", job->argv[a]);
+                    fprintf(stderr, "\n");
+                }
+
+                int rc = now_exec((const char *const *)job->argv, 0);
+                if (rc != 0) {
+                    if (result) {
+                        result->code = NOW_ERR_TOOL;
+                        snprintf(result->message, sizeof(result->message),
+                                 "compiler failed on %s (exit %d)", job->src_rel, rc);
+                    }
+                    errors++;
+                    continue;
+                }
+
+                /* Update manifest */
+                char *src_full = now_path_join(ctx->basedir, job->src_rel);
+                char *src_hash = src_full ? now_sha256_file(src_full) : NULL;
+                struct stat st;
+                long long mtime = 0;
+                if (src_full && stat(src_full, &st) == 0)
+                    mtime = (long long)st.st_mtime;
+                now_manifest_set(&manifest, job->src_rel, job->obj_path,
+                                 src_hash, fhash, mtime);
+                free(src_full);
+                free(src_hash);
+
+                now_filelist_push(&ctx->objects, job->obj_path);
+                compiled++;
+            }
+        } else {
+            /* Parallel execution with process pool */
+            NowWorkerSlot *slots = (NowWorkerSlot *)calloc(pool_size,
+                                                            sizeof(NowWorkerSlot));
+            if (!slots) {
+                for (size_t j = 0; j < njobs; j++) compile_job_free(&jobs[j]);
+                free(jobs);
+                free(fhash);
+                free(manifest_path);
+                now_manifest_free(&manifest);
+                return -1;
+            }
+
+            size_t next_job = 0;  /* next job to dispatch */
+            int running = 0;
+
+            while (next_job < njobs || running > 0) {
+                /* Fill available slots */
+                while (running < pool_size && next_job < njobs) {
+                    /* Find a free slot */
+                    int slot_idx = -1;
+                    for (int s = 0; s < pool_size; s++) {
+                        if (!slots[s].active) { slot_idx = s; break; }
+                    }
+                    if (slot_idx < 0) break;
+
+                    NowCompileJob *job = &jobs[next_job];
+
+                    if (ctx->verbose) {
+                        fprintf(stderr, "  [%zu/%zu] %s\n",
+                                next_job + 1, njobs, job->src_rel);
+                    }
+
+                    slots[slot_idx].source_idx = next_job;
+                    if (spawn_captured((const char *const *)job->argv,
+                                       &slots[slot_idx]) == 0) {
+                        slots[slot_idx].active = 1;
+                        running++;
+                    } else {
+                        /* Failed to spawn */
+                        if (result) {
+                            result->code = NOW_ERR_TOOL;
+                            snprintf(result->message, sizeof(result->message),
+                                     "failed to spawn compiler for %s",
+                                     job->src_rel);
+                        }
+                        errors++;
+                    }
+                    next_job++;
+                }
+
+                /* Wait for any worker to finish */
+                if (running > 0) {
+                    int exit_code;
+                    NowCapturedOutput captured;
+                    int slot_idx = wait_any_worker(slots, pool_size,
+                                                   &exit_code, &captured);
+                    if (slot_idx < 0) {
+                        errors++;
+                        running--;
+                        continue;
+                    }
+
+                    running--;
+                    size_t job_idx = slots[slot_idx].source_idx;
+                    NowCompileJob *job = &jobs[job_idx];
+
+                    if (exit_code != 0) {
+                        /* Print captured output (compiler errors) */
+                        if (captured.data && captured.len > 0)
+                            fprintf(stderr, "%s", captured.data);
+                        if (result) {
+                            result->code = NOW_ERR_TOOL;
+                            snprintf(result->message, sizeof(result->message),
+                                     "compiler failed on %s (exit %d)",
+                                     job->src_rel, exit_code);
+                        }
+                        errors++;
+                    } else {
+                        /* Print captured output only if verbose */
+                        if (ctx->verbose && captured.data && captured.len > 0)
+                            fprintf(stderr, "%s", captured.data);
+
+                        /* Update manifest */
+                        char *src_full = now_path_join(ctx->basedir, job->src_rel);
+                        char *src_hash = src_full ? now_sha256_file(src_full) : NULL;
+                        struct stat st;
+                        long long mtime = 0;
+                        if (src_full && stat(src_full, &st) == 0)
+                            mtime = (long long)st.st_mtime;
+                        now_manifest_set(&manifest, job->src_rel, job->obj_path,
+                                         src_hash, fhash, mtime);
+                        free(src_full);
+                        free(src_hash);
+
+                        now_filelist_push(&ctx->objects, job->obj_path);
+                        compiled++;
+                    }
+
+                    free(captured.data);
+                }
+            }
+
+            free(slots);
+        }
+    }
+
+    /* Free all jobs */
+    for (size_t j = 0; j < njobs; j++)
+        compile_job_free(&jobs[j]);
+    free(jobs);
+
+    /* Save manifest */
+    if (manifest_path)
+        now_manifest_save(&manifest, manifest_path);
+
+    free(fhash);
+    free(manifest_path);
+    now_manifest_free(&manifest);
+    now_repro_free_flags(repro_flags, repro_flag_count);
+    free(repro_timestamp);
+    now_repro_free(&repro);
+
+    if (ctx->verbose && (compiled > 0 || skipped > 0)) {
+        if (max_jobs > 1 && compiled > 1)
+            fprintf(stderr, "  compiled %d (%d-way parallel), skipped %d (up to date)\n",
+                    compiled, max_jobs, skipped);
+        else
+            fprintf(stderr, "  compiled %d, skipped %d (up to date)\n", compiled, skipped);
+    }
+
+    if (errors) {
+        if (result && result->code == NOW_OK) {
+            result->code = NOW_ERR_TOOL;
+            snprintf(result->message, sizeof(result->message),
+                     "%d source file(s) failed to compile", errors);
+        }
+        return errors;
+    }
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return 0;
+}
+
+/* Build a hash of the link flags */
+static char *link_flags_hash(const NowProject *p) {
+    size_t cap = 256;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+    size_t len = 0;
+
+    #define APPEND(s) do { \
+        size_t sl = strlen(s); \
+        while (len + sl + 2 > cap) { cap *= 2; buf = realloc(buf, cap); if (!buf) return NULL; } \
+        memcpy(buf + len, s, sl); len += sl; buf[len++] = '\n'; buf[len] = '\0'; \
+    } while(0)
+
+    const char *out_type = p->output.type ? p->output.type : "executable";
+    APPEND(out_type);
+    for (size_t i = 0; i < p->link.flags.count; i++)
+        APPEND(p->link.flags.items[i]);
+    for (size_t i = 0; i < p->link.libs.count; i++)
+        APPEND(p->link.libs.items[i]);
+    for (size_t i = 0; i < p->link.libdirs.count; i++)
+        APPEND(p->link.libdirs.items[i]);
+    #undef APPEND
+
+    char *hash = now_sha256_string(buf, len);
+    free(buf);
+    return hash;
+}
+
+/* ---- Link phase (§2.4, §7.6) ---- */
+
+int now_build_link(NowBuildCtx *ctx, NowResult *result) {
+    const NowProject *p = ctx->project;
+    const char *basedir = ctx->basedir;
+
+    if (ctx->objects.count == 0) {
+        if (result) {
+            result->code = NOW_ERR_NOT_FOUND;
+            snprintf(result->message, sizeof(result->message),
+                     "no object files to link");
+        }
+        return -1;
+    }
+
+    /* Determine output type and name */
+    const char *out_type = p->output.type ? p->output.type : "executable";
+    const char *out_name = p->output.name ? p->output.name : p->artifact;
+    if (!out_name) out_name = "a";
+
+    /* Build output path */
+    char *bin_dir = now_path_join(basedir, "target/bin");
+    now_mkdir_p(bin_dir);
+
+    char out_file[512];
+    int is_static  = (strcmp(out_type, "static") == 0);
+    int is_shared  = (strcmp(out_type, "shared") == 0);
+
+    if (is_static) {
+#ifdef _WIN32
+        snprintf(out_file, sizeof(out_file), "%s/%s.lib", bin_dir, out_name);
+#else
+        snprintf(out_file, sizeof(out_file), "%s/lib%s.a", bin_dir, out_name);
+#endif
+    } else if (is_shared) {
+#ifdef _WIN32
+        snprintf(out_file, sizeof(out_file), "%s/%s.dll", bin_dir, out_name);
+#elif defined(__APPLE__)
+        snprintf(out_file, sizeof(out_file), "%s/lib%s.dylib", bin_dir, out_name);
+#else
+        snprintf(out_file, sizeof(out_file), "%s/lib%s.so", bin_dir, out_name);
+#endif
+    } else {
+        /* executable */
+#ifdef _WIN32
+        snprintf(out_file, sizeof(out_file), "%s/%s.exe", bin_dir, out_name);
+#else
+        snprintf(out_file, sizeof(out_file), "%s/%s", bin_dir, out_name);
+#endif
+    }
+    free(bin_dir);
+
+    if (ctx->toolchain.is_msvc) {
+        /* ---- MSVC link path ---- */
+        if (is_static) {
+            /* Static library: lib.exe /OUT:file obj... */
+            const char *argv[256];
+            int argc = 0;
+            argv[argc++] = ctx->toolchain.ar;  /* lib.exe */
+            argv[argc++] = "/nologo";
+            char out_buf[520];
+            snprintf(out_buf, sizeof(out_buf), "/OUT:%s", out_file);
+            argv[argc++] = out_buf;
+            for (size_t i = 0; i < ctx->objects.count; i++)
+                argv[argc++] = ctx->objects.paths[i];
+            argv[argc] = NULL;
+
+            int rc = now_exec(argv, ctx->verbose);
+            if (rc != 0) {
+                if (result) {
+                    result->code = NOW_ERR_TOOL;
+                    snprintf(result->message, sizeof(result->message),
+                             "archiver (lib.exe) failed (exit %d)", rc);
+                }
+                return rc;
+            }
+        } else {
+            /* Executable or DLL: link.exe /OUT:file obj... libs... */
+            const char *argv[512];
+            int argc = 0;
+            argv[argc++] = "link.exe";
+            argv[argc++] = "/nologo";
+
+            if (is_shared) argv[argc++] = "/DLL";
+
+            char out_buf[520];
+            snprintf(out_buf, sizeof(out_buf), "/OUT:%s", out_file);
+            argv[argc++] = out_buf;
+
+            /* Link flags */
+            for (size_t i = 0; i < p->link.flags.count; i++)
+                argv[argc++] = p->link.flags.items[i];
+
+            /* Object files */
+            for (size_t i = 0; i < ctx->objects.count; i++)
+                argv[argc++] = ctx->objects.paths[i];
+
+            /* Library directories: /LIBPATH:dir */
+            char *libdir_bufs[32];
+            size_t nlibdir = 0;
+            for (size_t i = 0; i < p->link.libdirs.count && nlibdir < 32; i++) {
+                char *full = now_path_join(basedir, p->link.libdirs.items[i]);
+                if (full) {
+                    size_t len = strlen(full) + 12;
+                    libdir_bufs[nlibdir] = malloc(len);
+                    if (libdir_bufs[nlibdir]) {
+                        snprintf(libdir_bufs[nlibdir], len, "/LIBPATH:%s", full);
+                        argv[argc++] = libdir_bufs[nlibdir];
+                        nlibdir++;
+                    }
+                    free(full);
+                }
+            }
+
+            /* Dependency library directories (from procure) */
+            for (size_t i = 0; i < ctx->dep_libdirs.count; i++)
+                argv[argc++] = ctx->dep_libdirs.paths[i];
+
+            /* Libraries: name.lib */
+            char *lib_bufs[64];
+            size_t nlib = 0;
+            for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+                size_t len = strlen(p->link.libs.items[i]) + 5;
+                lib_bufs[nlib] = malloc(len);
+                if (lib_bufs[nlib]) {
+                    snprintf(lib_bufs[nlib], len, "%s.lib",
+                             p->link.libs.items[i]);
+                    argv[argc++] = lib_bufs[nlib];
+                    nlib++;
+                }
+            }
+
+            /* Dependency libraries (from procure) */
+            for (size_t i = 0; i < ctx->dep_libs.count; i++)
+                argv[argc++] = ctx->dep_libs.paths[i];
+
+            argv[argc] = NULL;
+
+            int rc = now_exec(argv, ctx->verbose);
+
+            for (size_t i = 0; i < nlibdir; i++) free(libdir_bufs[i]);
+            for (size_t i = 0; i < nlib; i++)    free(lib_bufs[i]);
+
+            if (rc != 0) {
+                if (result) {
+                    result->code = NOW_ERR_TOOL;
+                    snprintf(result->message, sizeof(result->message),
+                             "linker (link.exe) failed (exit %d)", rc);
+                }
+                return rc;
+            }
+        }
+    } else {
+        /* ---- GCC/Clang link path ---- */
+
+        /* Reproducibility: sort objects for deterministic archive/link order */
+        NowReproConfig link_repro;
+        now_repro_from_project(&link_repro, p);
+        char **link_repro_flags = NULL;
+        size_t link_repro_nflags = 0;
+        if (link_repro.enabled) {
+            if (link_repro.sort_inputs)
+                now_repro_sort_filelist(&ctx->objects);
+            now_repro_link_flags(&link_repro, 0, &link_repro_flags, &link_repro_nflags);
+        }
+
+        if (is_static) {
+            /* Static library: ar rcs */
+            const char *argv[256];
+            int argc = 0;
+            argv[argc++] = ctx->toolchain.ar;
+            argv[argc++] = "rcs";
+            argv[argc++] = out_file;
+            for (size_t i = 0; i < ctx->objects.count; i++)
+                argv[argc++] = ctx->objects.paths[i];
+            argv[argc] = NULL;
+
+            int rc = now_exec(argv, ctx->verbose);
+            if (rc != 0) {
+                if (result) {
+                    result->code = NOW_ERR_TOOL;
+                    snprintf(result->message, sizeof(result->message),
+                             "archiver failed (exit %d)", rc);
+                }
+                return rc;
+            }
+        } else {
+            /* Executable or shared: link via compiler driver */
+            int has_cxx = 0;
+            for (size_t i = 0; i < p->langs.count; i++) {
+                if (strcmp(p->langs.items[i], "c++") == 0) { has_cxx = 1; break; }
+            }
+
+            const char *argv[512];
+            int argc = 0;
+            argv[argc++] = has_cxx ? ctx->toolchain.cxx : ctx->toolchain.cc;
+
+            if (is_shared) argv[argc++] = "-shared";
+
+            /* Link flags */
+            for (size_t i = 0; i < p->link.flags.count; i++)
+                argv[argc++] = p->link.flags.items[i];
+
+            /* Object files */
+            for (size_t i = 0; i < ctx->objects.count; i++)
+                argv[argc++] = ctx->objects.paths[i];
+
+            /* Library directories: -L prepended */
+            char *libdir_bufs[32];
+            size_t nlibdir = 0;
+            for (size_t i = 0; i < p->link.libdirs.count && nlibdir < 32; i++) {
+                char *full = now_path_join(basedir, p->link.libdirs.items[i]);
+                if (full) {
+                    size_t len = strlen(full) + 3;
+                    libdir_bufs[nlibdir] = malloc(len);
+                    if (libdir_bufs[nlibdir]) {
+                        snprintf(libdir_bufs[nlibdir], len, "-L%s", full);
+                        argv[argc++] = libdir_bufs[nlibdir];
+                        nlibdir++;
+                    }
+                    free(full);
+                }
+            }
+
+            /* Dependency library directories (from procure) */
+            for (size_t i = 0; i < ctx->dep_libdirs.count; i++)
+                argv[argc++] = ctx->dep_libdirs.paths[i];
+
+            /* Libraries: -l prepended */
+            char *lib_bufs[64];
+            size_t nlib = 0;
+            for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+                size_t len = strlen(p->link.libs.items[i]) + 3;
+                lib_bufs[nlib] = malloc(len);
+                if (lib_bufs[nlib]) {
+                    snprintf(lib_bufs[nlib], len, "-l%s", p->link.libs.items[i]);
+                    argv[argc++] = lib_bufs[nlib];
+                    nlib++;
+                }
+            }
+
+            /* Dependency libraries (from procure) */
+            for (size_t i = 0; i < ctx->dep_libs.count; i++)
+                argv[argc++] = ctx->dep_libs.paths[i];
+
+            /* Reproducibility link flags (e.g. --build-id=sha1) */
+            for (size_t i = 0; i < link_repro_nflags; i++)
+                argv[argc++] = link_repro_flags[i];
+
+            argv[argc++] = "-o";
+            argv[argc++] = out_file;
+            argv[argc] = NULL;
+
+            int rc = now_exec(argv, ctx->verbose);
+
+            for (size_t i = 0; i < nlibdir; i++) free(libdir_bufs[i]);
+            for (size_t i = 0; i < nlib; i++)    free(lib_bufs[i]);
+
+            if (rc != 0) {
+                if (result) {
+                    result->code = NOW_ERR_TOOL;
+                    snprintf(result->message, sizeof(result->message),
+                             "linker failed (exit %d)", rc);
+                }
+                now_repro_free_flags(link_repro_flags, link_repro_nflags);
+                now_repro_free(&link_repro);
+                return rc;
+            }
+        }
+        now_repro_free_flags(link_repro_flags, link_repro_nflags);
+        now_repro_free(&link_repro);
+    }
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return 0;
+}
+
+/* ---- Test phase (§9) ---- */
+
+int now_build_test(NowBuildCtx *ctx, NowResult *result) {
+    const NowProject *p = ctx->project;
+    const char *basedir = ctx->basedir;
+
+    /* Determine test source directory */
+    const char *test_dir = p->tests.dir;
+    if (!test_dir) test_dir = "src/test/c";
+
+    /* Check test dir exists */
+    char *test_full = now_path_join(basedir, test_dir);
+    if (!test_full || !now_is_dir(test_full)) {
+        free(test_full);
+        if (result) {
+            result->code = NOW_OK;
+            snprintf(result->message, sizeof(result->message),
+                     "no test directory found, skipping tests");
+        }
+        return 0; /* no tests = success */
+    }
+    free(test_full);
+
+    /* Discover test source files */
+    const char **exts = now_lang_source_exts(
+        (const char *const *)p->langs.items, p->langs.count);
+    if (!exts) return -1;
+
+    NowFileList test_sources;
+    now_filelist_init(&test_sources);
+    int rc = now_discover_sources(basedir, test_dir, exts, &test_sources);
+    free(exts);
+
+    if (rc != 0 || test_sources.count == 0) {
+        now_filelist_free(&test_sources);
+        if (result) {
+            result->code = NOW_OK;
+            snprintf(result->message, sizeof(result->message),
+                     "no test sources found, skipping tests");
+        }
+        return 0;
+    }
+
+    /* Create test obj dir */
+    char *test_obj_dir = now_path_join(basedir, "target/obj/test");
+    now_mkdir_p(test_obj_dir);
+    free(test_obj_dir);
+
+    /* Compile test sources */
+    NowFileList test_objects;
+    now_filelist_init(&test_objects);
+    int errors = 0;
+
+    for (size_t i = 0; i < test_sources.count; i++) {
+        const char *src = test_sources.paths[i];
+        const NowLangDef *lang = NULL;
+        const NowLangType *type = now_lang_classify(
+            src, (const char *const *)p->langs.items, p->langs.count, &lang);
+        if (!type || type->role != NOW_ROLE_SOURCE) continue;
+
+        /* Resolve tool */
+        const char *tool = ctx->toolchain.cc;
+        if (type->tool_var && strcmp(type->tool_var, "${cxx}") == 0)
+            tool = ctx->toolchain.cxx;
+
+        /* Derive object path under target/obj/test/ */
+        const char *oext = ctx->toolchain.is_msvc ? ".obj" : ".o";
+        char *obj = now_obj_path_ex(basedir, src, test_dir, "target", oext);
+        if (!obj) { errors++; continue; }
+
+        /* Replace obj/main with obj/test in path */
+        char *main_marker = strstr(obj, "obj/main");
+        if (main_marker) memcpy(main_marker, "obj/test", 8);
+
+        /* Ensure directory */
+        char *obj_dir_copy = strdup(obj);
+        char *last = strrchr(obj_dir_copy, '/');
+        if (!last) last = strrchr(obj_dir_copy, '\\');
+        if (last) { *last = '\0'; now_mkdir_p(obj_dir_copy); }
+        free(obj_dir_copy);
+
+        /* Build argv — MSVC vs GCC/Clang */
+        const char *argv[64];
+        int argc = 0;
+        char *inc_src = NULL, *inc_hdr = NULL;
+        char *src_full = now_path_join(basedir, src);
+
+        if (ctx->toolchain.is_msvc) {
+            argv[argc++] = tool;
+            argv[argc++] = "/nologo";
+
+            char std_buf[32] = {0};
+            const char *std_val = p->compile.std ? p->compile.std : p->std;
+            if (std_val && lang->std_flag) {
+                snprintf(std_buf, sizeof(std_buf), "/std:%s", std_val);
+                argv[argc++] = std_buf;
+            }
+
+            const char *src_dir_str = p->sources.dir ? p->sources.dir : "src/main/c";
+            inc_src = now_path_join(basedir, src_dir_str);
+            if (inc_src) {
+                char inc_flag[512];
+                snprintf(inc_flag, sizeof(inc_flag), "/I%s", inc_src);
+                char *inc_arg = strdup(inc_flag);
+                argv[argc++] = inc_arg;
+            }
+            if (p->sources.headers) {
+                inc_hdr = now_path_join(basedir, p->sources.headers);
+                if (inc_hdr) {
+                    char inc_flag[512];
+                    snprintf(inc_flag, sizeof(inc_flag), "/I%s", inc_hdr);
+                    char *inc_arg = strdup(inc_flag);
+                    argv[argc++] = inc_arg;
+                }
+            }
+
+            argv[argc++] = "/c";
+            argv[argc++] = src_full;
+
+            char fo_buf[520];
+            snprintf(fo_buf, sizeof(fo_buf), "/Fo%s", obj);
+            argv[argc++] = fo_buf;
+        } else {
+            argv[argc++] = tool;
+
+            char std_buf[32] = {0};
+            const char *std_val = p->compile.std ? p->compile.std : p->std;
+            if (std_val && lang->std_flag) {
+                snprintf(std_buf, sizeof(std_buf), "-std=%s", std_val);
+                argv[argc++] = std_buf;
+            }
+
+            const char *src_dir_str = p->sources.dir ? p->sources.dir : "src/main/c";
+            inc_src = now_path_join(basedir, src_dir_str);
+            if (inc_src) {
+                char inc_flag[512];
+                snprintf(inc_flag, sizeof(inc_flag), "-I%s", inc_src);
+                char *inc_arg = strdup(inc_flag);
+                argv[argc++] = inc_arg;
+            }
+            if (p->sources.headers) {
+                inc_hdr = now_path_join(basedir, p->sources.headers);
+                if (inc_hdr) {
+                    char inc_flag[512];
+                    snprintf(inc_flag, sizeof(inc_flag), "-I%s", inc_hdr);
+                    char *inc_arg = strdup(inc_flag);
+                    argv[argc++] = inc_arg;
+                }
+            }
+
+            argv[argc++] = "-c";
+            argv[argc++] = src_full;
+            argv[argc++] = "-o";
+            argv[argc++] = obj;
+        }
+        argv[argc] = NULL;
+
+        rc = now_exec(argv, ctx->verbose);
+
+        /* Free include args */
+        for (int a = 1; a < argc; a++) {
+            if (argv[a] == src_full || argv[a] == obj) continue;
+            /* Free the strdup'd -I / /I flags */
+            const char *p_a = argv[a];
+            if ((p_a[0] == '-' || p_a[0] == '/') && p_a[1] == 'I')
+                free((char *)argv[a]);
+        }
+        free(inc_src);
+        free(inc_hdr);
+        free(src_full);
+
+        if (rc != 0) {
+            if (result) {
+                result->code = NOW_ERR_TOOL;
+                snprintf(result->message, sizeof(result->message),
+                         "test compile failed on %s (exit %d)", src, rc);
+            }
+            free(obj);
+            errors++;
+            continue;
+        }
+
+        now_filelist_push(&test_objects, obj);
+        free(obj);
+    }
+
+    now_filelist_free(&test_sources);
+
+    if (errors) {
+        now_filelist_free(&test_objects);
+        return -1;
+    }
+
+    if (test_objects.count == 0) {
+        now_filelist_free(&test_objects);
+        if (result) {
+            result->code = NOW_OK;
+            result->message[0] = '\0';
+        }
+        return 0;
+    }
+
+    /* Link test binary: test objects + production objects */
+    char *test_bin_dir = now_path_join(basedir, "target/bin");
+    now_mkdir_p(test_bin_dir);
+
+    char test_bin[512];
+    const char *proj_name = p->artifact ? p->artifact : "test";
+#ifdef _WIN32
+    snprintf(test_bin, sizeof(test_bin), "%s/%s-test.exe", test_bin_dir, proj_name);
+#else
+    snprintf(test_bin, sizeof(test_bin), "%s/%s-test", test_bin_dir, proj_name);
+#endif
+    free(test_bin_dir);
+
+    const char *argv[512];
+    int argc = 0;
+    char *lib_bufs[64];
+    size_t nlib = 0;
+
+    if (ctx->toolchain.is_msvc) {
+        /* MSVC: link.exe /nologo /OUT:test.exe objs... libs... */
+        argv[argc++] = "link.exe";
+        argv[argc++] = "/nologo";
+
+        char out_buf[520];
+        snprintf(out_buf, sizeof(out_buf), "/OUT:%s", test_bin);
+        argv[argc++] = out_buf;
+
+        for (size_t i = 0; i < test_objects.count; i++)
+            argv[argc++] = test_objects.paths[i];
+        for (size_t i = 0; i < ctx->objects.count; i++)
+            argv[argc++] = ctx->objects.paths[i];
+
+        for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+            size_t len = strlen(p->link.libs.items[i]) + 5;
+            lib_bufs[nlib] = malloc(len);
+            if (lib_bufs[nlib]) {
+                snprintf(lib_bufs[nlib], len, "%s.lib", p->link.libs.items[i]);
+                argv[argc++] = lib_bufs[nlib];
+                nlib++;
+            }
+        }
+        argv[argc] = NULL;
+    } else {
+        /* GCC/Clang: cc objs... -llibs... -o test */
+        int has_cxx = 0;
+        for (size_t i = 0; i < p->langs.count; i++) {
+            if (strcmp(p->langs.items[i], "c++") == 0) { has_cxx = 1; break; }
+        }
+
+        argv[argc++] = has_cxx ? ctx->toolchain.cxx : ctx->toolchain.cc;
+
+        for (size_t i = 0; i < test_objects.count; i++)
+            argv[argc++] = test_objects.paths[i];
+        for (size_t i = 0; i < ctx->objects.count; i++)
+            argv[argc++] = ctx->objects.paths[i];
+
+        for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+            size_t len = strlen(p->link.libs.items[i]) + 3;
+            lib_bufs[nlib] = malloc(len);
+            if (lib_bufs[nlib]) {
+                snprintf(lib_bufs[nlib], len, "-l%s", p->link.libs.items[i]);
+                argv[argc++] = lib_bufs[nlib];
+                nlib++;
+            }
+        }
+
+        argv[argc++] = "-o";
+        argv[argc++] = test_bin;
+        argv[argc] = NULL;
+    }
+
+    rc = now_exec(argv, ctx->verbose);
+
+    for (size_t i = 0; i < nlib; i++) free(lib_bufs[i]);
+    now_filelist_free(&test_objects);
+
+    if (rc != 0) {
+        if (result) {
+            result->code = NOW_ERR_TOOL;
+            snprintf(result->message, sizeof(result->message),
+                     "test link failed (exit %d)", rc);
+        }
+        return -1;
+    }
+
+    /* Execute the test binary */
+    const char *test_argv[] = { test_bin, NULL };
+    rc = now_exec(test_argv, ctx->verbose);
+
+    if (rc != 0) {
+        if (result) {
+            result->code = NOW_ERR_TEST;
+            snprintf(result->message, sizeof(result->message),
+                     "test execution failed (exit %d)", rc);
+        }
+        return rc;
+    }
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return 0;
+}
+
+void now_build_free(NowBuildCtx *ctx) {
+    now_toolchain_free(&ctx->toolchain);
+    now_filelist_free(&ctx->sources);
+    now_filelist_free(&ctx->objects);
+    now_filelist_free(&ctx->dep_includes);
+    now_filelist_free(&ctx->dep_libdirs);
+    now_filelist_free(&ctx->dep_libs);
+}

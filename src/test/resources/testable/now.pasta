@@ -1,0 +1,8 @@
+{
+  group: "io.test",
+  artifact: "testable",
+  version: "1.0.0",
+  lang: "c",
+  std: "c11",
+  output: { type: "static", name: "testable" }
+}

@@ -1,0 +1,105 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ./build/bin/now_test
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: now-linux
+          path: |
+            build/libnow.so
+            build/libnow.so.0
+            build/libnow.so.0.1.0
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ./build/bin/now_test
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: now-macos-arm64
+          path: |
+            build/libnow.dylib
+            build/libnow.0.dylib
+            build/libnow.0.1.0.dylib
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build & test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y cmake
+          run: |
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build
+            ./build/bin/now_test
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: |
+          $env:PATH = "$PWD\build\bin\Release;" + $env:PATH
+          .\build\bin\Release\now_test.exe
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: now-windows
+          path: |
+            build/bin/Release/now.dll
+            build/lib/Release/now.lib

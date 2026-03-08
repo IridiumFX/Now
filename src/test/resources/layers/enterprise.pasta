@@ -1,0 +1,23 @@
+{
+  compile: {
+    _policy: "locked",
+    _description: "Corporate compiler standards.",
+    warnings: ["Wall", "Wextra", "Wpedantic", "Werror"],
+    defines: ["ACME_INTERNAL"]
+  },
+  repos: {
+    _policy: "locked",
+    _description: "Internal registry first.",
+    registries: [
+      { url: "https://now.acme.internal", id: "acme-internal" }
+    ]
+  },
+  toolchain: {
+    _policy: "open",
+    preset: "llvm"
+  },
+  private_groups: {
+    _policy: "locked",
+    groups: ["com.acme"]
+  }
+}

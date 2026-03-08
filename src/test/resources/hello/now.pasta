@@ -1,0 +1,9 @@
+{
+  group:    "io.test",
+  artifact: "hello",
+  version:  "0.1.0",
+  langs:    ["c"],
+  std:      "c11",
+  output:   { type: "executable", name: "hello" },
+  compile:  { warnings: ["Wall"] }
+}

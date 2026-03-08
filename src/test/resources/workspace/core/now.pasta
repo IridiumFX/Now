@@ -1,0 +1,7 @@
+{
+  group: "org.test",
+  artifact: "core",
+  version: "1.0.0",
+  lang: "c",
+  output: { type: "static" }
+}

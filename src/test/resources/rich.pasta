@@ -1,0 +1,38 @@
+{
+  group:       "org.acme",
+  artifact:    "rocketlib",
+  version:     "3.0.0-beta.1",
+  name:        "Rocket Library",
+  license:     "Apache-2.0",
+  langs:       ["c", "c++"],
+  std:         "c17",
+
+  sources: {
+    dir:     "src/main",
+    headers: "include",
+    pattern: "**.c"
+  },
+
+  output:  { type: "shared", name: "rocket" },
+
+  compile: {
+    flags:    ["-fvisibility=hidden"],
+    warnings: ["Wall", "Wextra", "Werror"],
+    defines:  ["ROCKET_BUILDING"],
+    opt:      "speed"
+  },
+
+  link: { flags: ["-pthread"], libs: ["m"] },
+
+  deps: [
+    { id: "org.acme:acme-core:^1.5", scope: "compile" },
+    { id: "unity:unity:2.5.2",       scope: "test"    }
+  ],
+
+  convergence: "lowest",
+
+  repos: [
+    "https://registry.now.build/central",
+    { url: "https://pkg.acme.org/now", id: "acme", release: true, snapshot: false }
+  ]
+}

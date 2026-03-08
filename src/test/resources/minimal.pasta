@@ -1,0 +1,13 @@
+{
+  group:    "io.example",
+  artifact: "hello",
+  version:  "1.0.0",
+  langs:    ["c"],
+  std:      "c11",
+  output:   { type: "executable", name: "hello" },
+  compile:  { warnings: ["Wall", "Wextra"], defines: ["NDEBUG"] },
+  link:     { libs: ["m"] },
+  deps: [
+    { id: "unity:unity:2.5.2", scope: "test" }
+  ]
+}
