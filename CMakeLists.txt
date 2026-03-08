@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 3.20)
 project(Now VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -81,6 +81,8 @@ endif()
 
 if(WIN32)
     set_target_properties(now PROPERTIES
+        PREFIX "lib"
+        IMPORT_PREFIX "lib"
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
         ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
     )

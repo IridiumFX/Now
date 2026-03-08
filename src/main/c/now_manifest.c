@@ -128,7 +128,7 @@ static char *to_hex(const unsigned char *hash, size_t len) {
 
 /* ---- Public SHA-256 API ---- */
 
-char *now_sha256_file(const char *path) {
+NOW_API char *now_sha256_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
 
@@ -146,7 +146,7 @@ char *now_sha256_file(const char *path) {
     return to_hex(hash, 32);
 }
 
-char *now_sha256_string(const char *data, size_t len) {
+NOW_API char *now_sha256_string(const char *data, size_t len) {
     SHA256_CTX ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, (const unsigned char *)data, len);
@@ -157,11 +157,11 @@ char *now_sha256_string(const char *data, size_t len) {
 
 /* ---- Manifest operations ---- */
 
-void now_manifest_init(NowManifest *m) {
+NOW_API void now_manifest_init(NowManifest *m) {
     memset(m, 0, sizeof(*m));
 }
 
-void now_manifest_free(NowManifest *m) {
+NOW_API void now_manifest_free(NowManifest *m) {
     for (size_t i = 0; i < m->count; i++) {
         free(m->entries[i].source);
         free(m->entries[i].object);
@@ -173,7 +173,7 @@ void now_manifest_free(NowManifest *m) {
     now_manifest_init(m);
 }
 
-const NowManifestEntry *now_manifest_find(const NowManifest *m,
+NOW_API const NowManifestEntry *now_manifest_find(const NowManifest *m,
                                             const char *source) {
     if (!m || !source) return NULL;
     for (size_t i = 0; i < m->count; i++) {
@@ -183,7 +183,7 @@ const NowManifestEntry *now_manifest_find(const NowManifest *m,
     return NULL;
 }
 
-int now_manifest_set(NowManifest *m, const char *source,
+NOW_API int now_manifest_set(NowManifest *m, const char *source,
                       const char *object, const char *source_hash,
                       const char *flags_hash, long long mtime) {
     /* Update existing entry if found */
@@ -220,7 +220,7 @@ int now_manifest_set(NowManifest *m, const char *source,
     return 0;
 }
 
-int now_manifest_needs_rebuild(const NowManifestEntry *entry,
+NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
                                 const char *basedir,
                                 const char *source,
                                 const char *flags_hash) {
@@ -262,7 +262,7 @@ int now_manifest_needs_rebuild(const NowManifestEntry *entry,
 
 /* ---- Serialization (Pasta format) ---- */
 
-int now_manifest_load(NowManifest *m, const char *path) {
+NOW_API int now_manifest_load(NowManifest *m, const char *path) {
     now_manifest_init(m);
 
     if (!now_path_exists(path)) return 0;  /* no manifest yet → empty */
@@ -323,7 +323,7 @@ int now_manifest_load(NowManifest *m, const char *path) {
     return 0;
 }
 
-int now_manifest_save(const NowManifest *m, const char *path) {
+NOW_API int now_manifest_save(const NowManifest *m, const char *path) {
     /* Build Pasta tree */
     PastaValue *root = pasta_new_map();
     if (!root) return -1;

@@ -14,11 +14,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install Ninja
+        run: sudo apt-get install -y ninja-build
+
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_HTTP_TLS=OFF
 
       - name: Build
-        run: cmake --build build
+        run: cmake --build build --verbose
 
       - name: Test
         run: ./build/bin/now_test
@@ -28,9 +31,9 @@ jobs:
         with:
           name: now-linux
           path: |
-            build/libnow.so
-            build/libnow.so.0
-            build/libnow.so.0.1.0
+            build/bin/libnow.so*
+            build/bin/now
+            build/bin/now_test
 
   macos:
     runs-on: macos-latest
@@ -41,7 +44,8 @@ jobs:
 
       - name: Configure
         run: >
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DPICO_HTTP_TLS=OFF
           -DCMAKE_OSX_ARCHITECTURES=arm64
 
       - name: Build
@@ -55,9 +59,9 @@ jobs:
         with:
           name: now-macos-arm64
           path: |
-            build/libnow.dylib
-            build/libnow.0.dylib
-            build/libnow.0.1.0.dylib
+            build/bin/libnow*.dylib
+            build/bin/now
+            build/bin/now_test
 
   freebsd:
     runs-on: ubuntu-latest
@@ -71,11 +75,20 @@ jobs:
         with:
           usesh: true
           prepare: |
-            pkg install -y cmake
+            pkg install -y cmake ninja
           run: |
-            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_HTTP_TLS=OFF
             cmake --build build
             ./build/bin/now_test
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: now-freebsd
+          path: |
+            build/bin/libnow.so*
+            build/bin/now
+            build/bin/now_test
 
   windows:
     runs-on: windows-latest
@@ -85,10 +98,10 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_HTTP_TLS=OFF
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --verbose
 
       - name: Test
         run: |
@@ -101,5 +114,7 @@ jobs:
         with:
           name: now-windows
           path: |
-            build/bin/Release/now.dll
-            build/lib/Release/now.lib
+            build/bin/Release/libnow.dll
+            build/bin/Release/now.exe
+            build/bin/Release/now_test.exe
+            build/lib/Release/libnow.lib

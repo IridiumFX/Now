@@ -1,0 +1,86 @@
+# now — Post-v1 Priority Map
+
+Priorities organized by audience tier. Within each tier, items are ordered
+by impact.
+
+---
+
+## Tier 0 — Hygiene
+
+Things that should already be right. Fix before anything else.
+
+| # | Item | Status |
+|---|------|--------|
+| 0.1 | Enforce h/c separation — move internal `.h` files out of `src/main/c/` | DONE |
+
+---
+
+## Tier 1 — Tinkerer Superchargers
+
+Get people hooked. Empower early adopters, give them reasons to spread
+the word.
+
+| # | Item | Rationale |
+|---|------|-----------|
+| 1.1 | `compile_commands.json` | Every clangd/LSP user expects this. Without it, editor experience is broken. Fastest path to "wow this just works" |
+| 1.2 | `now init` scaffolding | `now init` → edit → `now build` in 30 seconds. Removes all friction from first experience |
+| 1.3 | `now fmt` (Pasta formatter) | Tinkerers share projects, consistent formatting matters. Signals maturity |
+| 1.4 | C++20 modules (pre-scan) | The C++ crowd is hungry for a build tool that handles modules without CMake pain |
+| 1.5 | Additional languages | Rust FFI, mixed C/C++ with Go — tinkerers love polyglot projects |
+
+---
+
+## Tier 2 — Now Team Hardening
+
+Prepare for growth. Solidify internals, reduce maintenance burden, be
+ready for surging adoption.
+
+| # | Item | Rationale |
+|---|------|-----------|
+| 2.1 | Native Ed25519 | Remove minisign external dep — one less thing to install, ship, and explain |
+| 2.2 | pico_http TLS hardening | CA cert verification before pico_http spins off. Ship it production-grade |
+| 2.3 | Build caching | CI minutes cost money, rebuild-the-world kills contributor velocity on `now` itself |
+| 2.4 | `export:meson` / `export:bazel` | More escape hatches = lower perceived risk = easier adoption argument |
+| 2.5 | Plugin registry | Lets the community extend `now` without gatekeeping every feature |
+
+---
+
+## Tier 3 — Enterprise
+
+Pays the bills. Features that large organizations require before
+adopting a build tool.
+
+| # | Item | Rationale |
+|---|------|-----------|
+| 3.1 | Maven import/export | Enterprise lives on Maven repos, Artifactory, Nexus — this is the bridge |
+| 3.2 | Distributed/remote build | Large codebases need it, differentiator enterprises pay for |
+| 3.3 | SBOM generation | Compliance requirement, often a checkbox for procurement |
+| 3.4 | LDAP/SSO auth for registries | Enterprise identity, Cookbook integration |
+| 3.5 | Audit logging | Who published what, when, approved by whom — regulated industries need this |
+
+---
+
+## Tier 4 — Nice to Have
+
+No urgency. Build when the moment is right or community asks.
+
+| Item | Notes |
+|------|-------|
+| `export:bazel` | Promote to tier 2 if adoption demands it |
+| WebSocket extensions (permessage-deflate) | pico_ws polish |
+| HTTP/2 in pico_http | Performance gain but HTTP/1.1 works fine for registries |
+| `now watch` (file watcher rebuild) | Cool DX but tinkerers already have `entr`/`watchexec` |
+| GUI/TUI dashboard | Flashy but not essential |
+
+---
+
+## Recommended First Sprint
+
+```
+Tier 0.1  →  Tier 1.1  →  Tier 1.2  →  Tier 2.1
+   h/c         compile       now init     native
+ cleanup      commands                    Ed25519
+```
+
+Fix hygiene first, then unlock the tinkerer experience, then harden
+the foundation before more people depend on it.

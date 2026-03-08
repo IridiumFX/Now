@@ -26,7 +26,7 @@ Contributing to `now`: building from source, running tests, adding features, and
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| CMake | 4.0+ | Build system |
+| CMake | 3.20+ | Build system |
 | C compiler | C11 | GCC 13+, Clang 15+, or MSVC 2022+ |
 | Ninja | Any | Recommended generator |
 | Git | Any | Submodule management |

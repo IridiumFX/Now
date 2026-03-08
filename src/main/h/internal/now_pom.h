@@ -74,9 +74,9 @@ typedef struct {
     size_t  capacity;
 } NowDepArray;
 
-void now_deparray_init(NowDepArray *a);
-int  now_deparray_push(NowDepArray *a);  /* push empty, returns index or -1 */
-void now_deparray_free(NowDepArray *a);
+NOW_API void now_deparray_init(NowDepArray *a);
+NOW_API int  now_deparray_push(NowDepArray *a);  /* push empty, returns index or -1 */
+NOW_API void now_deparray_free(NowDepArray *a);
 
 /* Repository entry (§1.7) */
 typedef struct {
@@ -93,9 +93,9 @@ typedef struct {
     size_t   capacity;
 } NowRepoArray;
 
-void now_repoarray_init(NowRepoArray *a);
-int  now_repoarray_push(NowRepoArray *a);
-void now_repoarray_free(NowRepoArray *a);
+NOW_API void now_repoarray_init(NowRepoArray *a);
+NOW_API int  now_repoarray_push(NowRepoArray *a);
+NOW_API void now_repoarray_free(NowRepoArray *a);
 
 /* Plugin entry (§10) */
 typedef struct {
@@ -113,9 +113,9 @@ typedef struct {
     size_t     capacity;
 } NowPluginArray;
 
-void now_pluginarray_init(NowPluginArray *a);
-int  now_pluginarray_push(NowPluginArray *a);  /* push empty, returns index or -1 */
-void now_pluginarray_free(NowPluginArray *a);
+NOW_API void now_pluginarray_init(NowPluginArray *a);
+NOW_API int  now_pluginarray_push(NowPluginArray *a);  /* push empty, returns index or -1 */
+NOW_API void now_pluginarray_free(NowPluginArray *a);
 
 /* The full Project Object Model (matches forward decl in now.h) */
 struct NowProject {

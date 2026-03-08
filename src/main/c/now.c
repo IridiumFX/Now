@@ -13,85 +13,85 @@
 #include <stdlib.h>
 #include <string.h>
 
-const char *now_version(void) {
+NOW_API const char *now_version(void) {
     return "0.1.0";
 }
 
 /* ---- Project accessors ---- */
 
-const char *now_project_group(const NowProject *p)    { return p ? p->group : NULL; }
-const char *now_project_artifact(const NowProject *p) { return p ? p->artifact : NULL; }
-const char *now_project_version(const NowProject *p)  { return p ? p->version : NULL; }
-const char *now_project_name(const NowProject *p)     { return p ? p->name : NULL; }
-const char *now_project_license(const NowProject *p)  { return p ? p->license : NULL; }
-const char *now_project_std(const NowProject *p)      { return p ? p->std : NULL; }
+NOW_API const char *now_project_group(const NowProject *p)    { return p ? p->group : NULL; }
+NOW_API const char *now_project_artifact(const NowProject *p) { return p ? p->artifact : NULL; }
+NOW_API const char *now_project_version(const NowProject *p)  { return p ? p->version : NULL; }
+NOW_API const char *now_project_name(const NowProject *p)     { return p ? p->name : NULL; }
+NOW_API const char *now_project_license(const NowProject *p)  { return p ? p->license : NULL; }
+NOW_API const char *now_project_std(const NowProject *p)      { return p ? p->std : NULL; }
 
-size_t now_project_lang_count(const NowProject *p) {
+NOW_API size_t now_project_lang_count(const NowProject *p) {
     return p ? p->langs.count : 0;
 }
 
-const char *now_project_lang(const NowProject *p, size_t index) {
+NOW_API const char *now_project_lang(const NowProject *p, size_t index) {
     if (!p || index >= p->langs.count) return NULL;
     return p->langs.items[index];
 }
 
-const char *now_project_output_type(const NowProject *p) {
+NOW_API const char *now_project_output_type(const NowProject *p) {
     return p ? p->output.type : NULL;
 }
 
-const char *now_project_output_name(const NowProject *p) {
+NOW_API const char *now_project_output_name(const NowProject *p) {
     return p ? p->output.name : NULL;
 }
 
-const char *now_project_source_dir(const NowProject *p) {
+NOW_API const char *now_project_source_dir(const NowProject *p) {
     return p ? p->sources.dir : NULL;
 }
 
-const char *now_project_header_dir(const NowProject *p) {
+NOW_API const char *now_project_header_dir(const NowProject *p) {
     return p ? p->sources.headers : NULL;
 }
 
-const char *now_project_test_dir(const NowProject *p) {
+NOW_API const char *now_project_test_dir(const NowProject *p) {
     return p ? p->tests.dir : NULL;
 }
 
-size_t now_project_dep_count(const NowProject *p) {
+NOW_API size_t now_project_dep_count(const NowProject *p) {
     return p ? p->deps.count : 0;
 }
 
-const char *now_project_dep_id(const NowProject *p, size_t index) {
+NOW_API const char *now_project_dep_id(const NowProject *p, size_t index) {
     if (!p || index >= p->deps.count) return NULL;
     return p->deps.items[index].id;
 }
 
-const char *now_project_dep_scope(const NowProject *p, size_t index) {
+NOW_API const char *now_project_dep_scope(const NowProject *p, size_t index) {
     if (!p || index >= p->deps.count) return NULL;
     return p->deps.items[index].scope;
 }
 
-size_t now_project_warning_count(const NowProject *p) {
+NOW_API size_t now_project_warning_count(const NowProject *p) {
     return p ? p->compile.warnings.count : 0;
 }
 
-const char *now_project_warning(const NowProject *p, size_t index) {
+NOW_API const char *now_project_warning(const NowProject *p, size_t index) {
     if (!p || index >= p->compile.warnings.count) return NULL;
     return p->compile.warnings.items[index];
 }
 
-size_t now_project_define_count(const NowProject *p) {
+NOW_API size_t now_project_define_count(const NowProject *p) {
     return p ? p->compile.defines.count : 0;
 }
 
-const char *now_project_define(const NowProject *p, size_t index) {
+NOW_API const char *now_project_define(const NowProject *p, size_t index) {
     if (!p || index >= p->compile.defines.count) return NULL;
     return p->compile.defines.items[index];
 }
 
-const char *now_project_opt(const NowProject *p) {
+NOW_API const char *now_project_opt(const NowProject *p) {
     return p ? p->compile.opt : NULL;
 }
 
-const char *now_project_convergence(const NowProject *p) {
+NOW_API const char *now_project_convergence(const NowProject *p) {
     return p ? p->convergence : NULL;
 }
 
@@ -257,8 +257,8 @@ static int run_generate_phase(const NowProject *project,
 
 /* ---- Build operations ---- */
 
-int now_build(const NowProject *project, const char *basedir,
-              int verbose, int jobs, NowResult *result) {
+NOW_API int now_build(const NowProject *project, const char *basedir,
+                      int verbose, int jobs, NowResult *result) {
     NowBuildCtx ctx;
     int rc = now_build_init(&ctx, project, basedir, result);
     if (rc != 0) return rc;
@@ -281,8 +281,8 @@ int now_build(const NowProject *project, const char *basedir,
     return rc;
 }
 
-int now_compile(const NowProject *project, const char *basedir,
-                int verbose, int jobs, NowResult *result) {
+NOW_API int now_compile(const NowProject *project, const char *basedir,
+                        int verbose, int jobs, NowResult *result) {
     NowBuildCtx ctx;
     int rc = now_build_init(&ctx, project, basedir, result);
     if (rc != 0) return rc;
@@ -300,8 +300,8 @@ int now_compile(const NowProject *project, const char *basedir,
     return rc;
 }
 
-int now_test(const NowProject *project, const char *basedir,
-             int verbose, int jobs, NowResult *result) {
+NOW_API int now_test(const NowProject *project, const char *basedir,
+                     int verbose, int jobs, NowResult *result) {
     NowBuildCtx ctx;
     int rc = now_build_init(&ctx, project, basedir, result);
     if (rc != 0) return rc;

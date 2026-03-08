@@ -11,7 +11,7 @@
 
 /* ---- Lock file operations ---- */
 
-void now_lock_init(NowLockFile *lf) {
+NOW_API void now_lock_init(NowLockFile *lf) {
     memset(lf, 0, sizeof(*lf));
 }
 
@@ -29,14 +29,14 @@ static void lock_entry_free(NowLockEntry *e) {
     free(e->deps);
 }
 
-void now_lock_free(NowLockFile *lf) {
+NOW_API void now_lock_free(NowLockFile *lf) {
     for (size_t i = 0; i < lf->count; i++)
         lock_entry_free(&lf->entries[i]);
     free(lf->entries);
     memset(lf, 0, sizeof(*lf));
 }
 
-const NowLockEntry *now_lock_find(const NowLockFile *lf,
+NOW_API const NowLockEntry *now_lock_find(const NowLockFile *lf,
                                    const char *group,
                                    const char *artifact) {
     if (!lf || !group || !artifact) return NULL;
@@ -48,7 +48,7 @@ const NowLockEntry *now_lock_find(const NowLockFile *lf,
     return NULL;
 }
 
-int now_lock_set(NowLockFile *lf, const NowLockEntry *entry) {
+NOW_API int now_lock_set(NowLockFile *lf, const NowLockEntry *entry) {
     /* Update if exists */
     for (size_t i = 0; i < lf->count; i++) {
         if (strcmp(lf->entries[i].group, entry->group) == 0 &&
@@ -107,7 +107,7 @@ int now_lock_set(NowLockFile *lf, const NowLockEntry *entry) {
 
 /* ---- Lock file serialization (Pasta) ---- */
 
-int now_lock_load(NowLockFile *lf, const char *path) {
+NOW_API int now_lock_load(NowLockFile *lf, const char *path) {
     now_lock_init(lf);
 
     FILE *fp = fopen(path, "rb");
@@ -182,7 +182,7 @@ int now_lock_load(NowLockFile *lf, const char *path) {
     return 0;
 }
 
-int now_lock_save(const NowLockFile *lf, const char *path) {
+NOW_API int now_lock_save(const NowLockFile *lf, const char *path) {
     PastaValue *root = pasta_new_map();
     if (!root) return -1;
 
@@ -228,12 +228,12 @@ int now_lock_save(const NowLockFile *lf, const char *path) {
 
 /* ---- Resolver ---- */
 
-void now_resolver_init(NowResolver *r, const char *convergence) {
+NOW_API void now_resolver_init(NowResolver *r, const char *convergence) {
     memset(r, 0, sizeof(*r));
     r->convergence = convergence ? convergence : "lowest";
 }
 
-void now_resolver_free(NowResolver *r) {
+NOW_API void now_resolver_free(NowResolver *r) {
     for (size_t i = 0; i < r->count; i++) {
         free(r->constraints[i].group);
         free(r->constraints[i].artifact);
@@ -245,7 +245,7 @@ void now_resolver_free(NowResolver *r) {
     memset(r, 0, sizeof(*r));
 }
 
-int now_resolver_add(NowResolver *r, const char *dep_id,
+NOW_API int now_resolver_add(NowResolver *r, const char *dep_id,
                       const char *scope, const char *from,
                       int override) {
     /* Parse coordinate: group:artifact:version_range */
@@ -301,7 +301,7 @@ static size_t find_constraints(const NowResolver *r, const char *group,
     return n;
 }
 
-int now_resolver_resolve(NowResolver *r, NowLockFile *lf, NowResult *result) {
+NOW_API int now_resolver_resolve(NowResolver *r, NowLockFile *lf, NowResult *result) {
     if (!r || !lf) return -1;
 
     /* Collect unique coordinates */

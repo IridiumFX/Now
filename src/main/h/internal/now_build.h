@@ -47,25 +47,25 @@ typedef struct {
 /* Initialize the build context and discover sources.
  * Returns 0 on success, -1 on error (fills result). */
 /* NowResult defined in now.h */
-int now_build_init(NowBuildCtx *ctx, const NowProject *project,
-                   const char *basedir, NowResult *result);
+NOW_API int now_build_init(NowBuildCtx *ctx, const NowProject *project,
+                          const char *basedir, NowResult *result);
 
 /* Run the build phase: compile all source files to objects.
  * Returns 0 on success, non-zero on compiler error. */
-int now_build_compile(NowBuildCtx *ctx, NowResult *result);
+NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result);
 
 /* Run the link phase: link objects into final output.
  * Returns 0 on success, non-zero on linker error. */
-int now_build_link(NowBuildCtx *ctx, NowResult *result);
+NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result);
 
 /* Run the test phase: compile test sources, link into test binary,
  * execute and check exit code. Returns 0 on success. */
-int now_build_test(NowBuildCtx *ctx, NowResult *result);
+NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result);
 
 /* Clean up build context. */
-void now_build_free(NowBuildCtx *ctx);
+NOW_API void now_build_free(NowBuildCtx *ctx);
 
 /* Run a subprocess and capture exit code. Returns exit code. */
-int now_exec(const char *const *argv, int verbose);
+NOW_API int now_exec(const char *const *argv, int verbose);
 
 #endif /* NOW_BUILD_H */

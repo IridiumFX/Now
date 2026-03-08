@@ -32,7 +32,7 @@ static int parse_uint(const char **s, int *out) {
     return 0;
 }
 
-int now_semver_parse(const char *str, NowSemVer *out) {
+NOW_API int now_semver_parse(const char *str, NowSemVer *out) {
     if (!str || !out) return -1;
     memset(out, 0, sizeof(*out));
 
@@ -69,7 +69,7 @@ int now_semver_parse(const char *str, NowSemVer *out) {
     return (*p == '\0') ? 0 : -1;
 }
 
-void now_semver_free(NowSemVer *v) {
+NOW_API void now_semver_free(NowSemVer *v) {
     if (!v) return;
     free(v->prerelease);
     free(v->build);
@@ -125,7 +125,7 @@ static int compare_prerelease(const char *a, const char *b) {
     return 0;
 }
 
-int now_semver_compare(const NowSemVer *a, const NowSemVer *b) {
+NOW_API int now_semver_compare(const NowSemVer *a, const NowSemVer *b) {
     if (a->major != b->major) return a->major < b->major ? -1 : 1;
     if (a->minor != b->minor) return a->minor < b->minor ? -1 : 1;
     if (a->patch != b->patch) return a->patch < b->patch ? -1 : 1;
@@ -134,7 +134,7 @@ int now_semver_compare(const NowSemVer *a, const NowSemVer *b) {
 
 /* ---- Format ---- */
 
-char *now_semver_to_string(const NowSemVer *v) {
+NOW_API char *now_semver_to_string(const NowSemVer *v) {
     if (!v) return NULL;
 
     /* Calculate buffer size */
@@ -173,7 +173,7 @@ static void skip_spaces(const char **p) {
     while (isspace((unsigned char)**p)) (*p)++;
 }
 
-int now_range_parse(const char *str, NowVersionRange *out) {
+NOW_API int now_range_parse(const char *str, NowVersionRange *out) {
     if (!str || !out) return -1;
     memset(out, 0, sizeof(*out));
 
@@ -252,7 +252,7 @@ int now_range_parse(const char *str, NowVersionRange *out) {
     return 0;
 }
 
-void now_range_free(NowVersionRange *r) {
+NOW_API void now_range_free(NowVersionRange *r) {
     if (!r) return;
     now_semver_free(&r->floor);
     now_semver_free(&r->ceiling);
@@ -261,7 +261,7 @@ void now_range_free(NowVersionRange *r) {
 
 /* ---- Range satisfaction ---- */
 
-int now_range_satisfies(const NowVersionRange *range, const NowSemVer *version) {
+NOW_API int now_range_satisfies(const NowVersionRange *range, const NowSemVer *version) {
     if (!range || !version) return 0;
 
     switch (range->kind) {
@@ -315,7 +315,7 @@ static const NowSemVer *effective_ceiling(const NowVersionRange *r) {
     return &r->ceiling;
 }
 
-int now_range_intersect(const NowVersionRange *a, const NowVersionRange *b,
+NOW_API int now_range_intersect(const NowVersionRange *a, const NowVersionRange *b,
                          NowVersionRange *out) {
     if (!a || !b || !out) return -1;
     memset(out, 0, sizeof(*out));
@@ -382,7 +382,7 @@ int now_range_intersect(const NowVersionRange *a, const NowVersionRange *b,
 
 /* ---- Coordinate parsing ---- */
 
-int now_coord_parse(const char *str, NowCoordinate *out) {
+NOW_API int now_coord_parse(const char *str, NowCoordinate *out) {
     if (!str || !out) return -1;
     memset(out, 0, sizeof(*out));
 
@@ -403,7 +403,7 @@ int now_coord_parse(const char *str, NowCoordinate *out) {
     return 0;
 }
 
-void now_coord_free(NowCoordinate *c) {
+NOW_API void now_coord_free(NowCoordinate *c) {
     if (!c) return;
     free(c->group);
     free(c->artifact);

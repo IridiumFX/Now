@@ -14,13 +14,13 @@
 
 /* ---- String array ---- */
 
-void now_strarray_init(NowStrArray *a) {
+NOW_API void now_strarray_init(NowStrArray *a) {
     a->items = NULL;
     a->count = 0;
     a->capacity = 0;
 }
 
-int now_strarray_push(NowStrArray *a, const char *s) {
+NOW_API int now_strarray_push(NowStrArray *a, const char *s) {
     if (a->count >= a->capacity) {
         size_t new_cap = a->capacity ? a->capacity * 2 : 4;
         char **tmp = realloc(a->items, new_cap * sizeof(char *));
@@ -34,7 +34,7 @@ int now_strarray_push(NowStrArray *a, const char *s) {
     return 0;
 }
 
-void now_strarray_free(NowStrArray *a) {
+NOW_API void now_strarray_free(NowStrArray *a) {
     for (size_t i = 0; i < a->count; i++)
         free(a->items[i]);
     free(a->items);
@@ -43,13 +43,13 @@ void now_strarray_free(NowStrArray *a) {
 
 /* ---- Dep array ---- */
 
-void now_deparray_init(NowDepArray *a) {
+NOW_API void now_deparray_init(NowDepArray *a) {
     a->items = NULL;
     a->count = 0;
     a->capacity = 0;
 }
 
-int now_deparray_push(NowDepArray *a) {
+NOW_API int now_deparray_push(NowDepArray *a) {
     if (a->count >= a->capacity) {
         size_t new_cap = a->capacity ? a->capacity * 2 : 4;
         NowDep *tmp = realloc(a->items, new_cap * sizeof(NowDep));
@@ -68,7 +68,7 @@ static void now_dep_free(NowDep *d) {
     now_strarray_free(&d->exclude);
 }
 
-void now_deparray_free(NowDepArray *a) {
+NOW_API void now_deparray_free(NowDepArray *a) {
     for (size_t i = 0; i < a->count; i++)
         now_dep_free(&a->items[i]);
     free(a->items);
@@ -77,13 +77,13 @@ void now_deparray_free(NowDepArray *a) {
 
 /* ---- Repo array ---- */
 
-void now_repoarray_init(NowRepoArray *a) {
+NOW_API void now_repoarray_init(NowRepoArray *a) {
     a->items = NULL;
     a->count = 0;
     a->capacity = 0;
 }
 
-int now_repoarray_push(NowRepoArray *a) {
+NOW_API int now_repoarray_push(NowRepoArray *a) {
     if (a->count >= a->capacity) {
         size_t new_cap = a->capacity ? a->capacity * 2 : 4;
         NowRepo *tmp = realloc(a->items, new_cap * sizeof(NowRepo));
@@ -96,7 +96,7 @@ int now_repoarray_push(NowRepoArray *a) {
     return (int)a->count++;
 }
 
-void now_repoarray_free(NowRepoArray *a) {
+NOW_API void now_repoarray_free(NowRepoArray *a) {
     for (size_t i = 0; i < a->count; i++) {
         free(a->items[i].url);
         free(a->items[i].id);
@@ -108,13 +108,13 @@ void now_repoarray_free(NowRepoArray *a) {
 
 /* ---- Plugin array ---- */
 
-void now_pluginarray_init(NowPluginArray *a) {
+NOW_API void now_pluginarray_init(NowPluginArray *a) {
     a->items = NULL;
     a->count = 0;
     a->capacity = 0;
 }
 
-int now_pluginarray_push(NowPluginArray *a) {
+NOW_API int now_pluginarray_push(NowPluginArray *a) {
     if (a->count >= a->capacity) {
         size_t new_cap = a->capacity ? a->capacity * 2 : 4;
         NowPlugin *tmp = realloc(a->items, new_cap * sizeof(NowPlugin));
@@ -126,7 +126,7 @@ int now_pluginarray_push(NowPluginArray *a) {
     return (int)a->count++;
 }
 
-void now_pluginarray_free(NowPluginArray *a) {
+NOW_API void now_pluginarray_free(NowPluginArray *a) {
     for (size_t i = 0; i < a->count; i++) {
         free(a->items[i].id);
         free(a->items[i].type);
@@ -339,7 +339,7 @@ static void now_link_free(NowLink *l) {
     free(l->script_body);
 }
 
-NowProject *now_project_new(void) {
+NOW_API NowProject *now_project_new(void) {
     NowProject *p = calloc(1, sizeof(NowProject));
     if (!p) return NULL;
     now_strarray_init(&p->langs);
@@ -355,7 +355,7 @@ NowProject *now_project_new(void) {
     return p;
 }
 
-void now_project_free(NowProject *p) {
+NOW_API void now_project_free(NowProject *p) {
     if (!p) return;
     free(p->group);
     free(p->artifact);
@@ -384,7 +384,7 @@ void now_project_free(NowProject *p) {
     free(p);
 }
 
-NowProject *now_project_load(const char *path, NowResult *result) {
+NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
     /* Read file */
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -519,7 +519,7 @@ NowProject *now_project_load(const char *path, NowResult *result) {
     return p;
 }
 
-NowProject *now_project_load_string(const char *input, size_t len,
+NOW_API NowProject *now_project_load_string(const char *input, size_t len,
                                      NowResult *result) {
     PastaResult pr;
     PastaValue *root = pasta_parse(input, len, &pr);

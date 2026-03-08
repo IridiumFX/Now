@@ -162,12 +162,12 @@ static const NowLangDef *registry[] = {
     NULL
 };
 
-void now_lang_registry_init(void) {
+NOW_API void now_lang_registry_init(void) {
     /* Currently all built-in, nothing to initialize dynamically.
      * Future: load custom language definitions from now.pasta. */
 }
 
-const NowLangDef *now_lang_find(const char *lang_id) {
+NOW_API const NowLangDef *now_lang_find(const char *lang_id) {
     if (!lang_id) return NULL;
     for (const NowLangDef **def = registry; *def; def++) {
         if (strcmp((*def)->id, lang_id) == 0)
@@ -185,7 +185,7 @@ static int type_matches_ext(const NowLangType *t, const char *ext) {
     return 0;
 }
 
-const NowLangType *now_lang_classify(const char *path,
+NOW_API const NowLangType *now_lang_classify(const char *path,
                                       const char *const *active_langs,
                                       size_t lang_count,
                                       const NowLangDef **out_lang) {
@@ -217,8 +217,8 @@ const NowLangType *now_lang_classify(const char *path,
     return NULL;
 }
 
-const char **now_lang_source_exts(const char *const *active_langs,
-                                   size_t lang_count) {
+NOW_API const char **now_lang_source_exts(const char *const *active_langs,
+                                          size_t lang_count) {
     /* Collect all source-role extensions */
     size_t cap = 16;
     size_t count = 0;
@@ -256,8 +256,8 @@ const char **now_lang_source_exts(const char *const *active_langs,
     return result;
 }
 
-const char **now_lang_all_exts(const char *const *active_langs,
-                                size_t lang_count) {
+NOW_API const char **now_lang_all_exts(const char *const *active_langs,
+                                       size_t lang_count) {
     size_t cap = 32;
     size_t count = 0;
     const char **result = malloc(cap * sizeof(const char *));

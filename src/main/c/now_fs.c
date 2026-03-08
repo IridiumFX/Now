@@ -12,6 +12,9 @@
   #include <windows.h>
   #include <direct.h>
   #define mkdir_one(p) _mkdir(p)
+  #ifndef S_ISDIR
+    #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+  #endif
 #else
   #include <dirent.h>
   #include <unistd.h>
@@ -20,7 +23,7 @@
 
 /* ---- Path utilities ---- */
 
-char *now_path_join(const char *a, const char *b) {
+NOW_API char *now_path_join(const char *a, const char *b) {
     if (!a || !*a) return b ? strdup(b) : NULL;
     if (!b || !*b) return strdup(a);
 
@@ -42,7 +45,7 @@ char *now_path_join(const char *a, const char *b) {
     return out;
 }
 
-const char *now_path_ext(const char *path) {
+NOW_API const char *now_path_ext(const char *path) {
     if (!path) return "";
     const char *dot = NULL;
     for (const char *p = path; *p; p++) {
@@ -52,7 +55,7 @@ const char *now_path_ext(const char *path) {
     return dot ? dot : "";
 }
 
-const char *now_path_basename(const char *path) {
+NOW_API const char *now_path_basename(const char *path) {
     if (!path) return "";
     const char *last = path;
     for (const char *p = path; *p; p++) {
@@ -61,18 +64,18 @@ const char *now_path_basename(const char *path) {
     return last;
 }
 
-int now_path_exists(const char *path) {
+NOW_API int now_path_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
 }
 
-int now_is_dir(const char *path) {
+NOW_API int now_is_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode);
 }
 
-int now_mkdir_p(const char *path) {
+NOW_API int now_mkdir_p(const char *path) {
     if (!path || !*path) return -1;
 
     char *tmp = strdup(path);
@@ -113,7 +116,7 @@ int now_mkdir_p(const char *path) {
 
 /* ---- Object path derivation (§3.2) ---- */
 
-char *now_obj_path_ex(const char *basedir, const char *src_path,
+NOW_API char *now_obj_path_ex(const char *basedir, const char *src_path,
                       const char *src_root, const char *target,
                       const char *obj_ext) {
     /*
@@ -155,20 +158,20 @@ char *now_obj_path_ex(const char *basedir, const char *src_path,
     return result;
 }
 
-char *now_obj_path(const char *basedir, const char *src_path,
+NOW_API char *now_obj_path(const char *basedir, const char *src_path,
                    const char *src_root, const char *target) {
     return now_obj_path_ex(basedir, src_path, src_root, target, ".o");
 }
 
 /* ---- File list ---- */
 
-void now_filelist_init(NowFileList *fl) {
+NOW_API void now_filelist_init(NowFileList *fl) {
     fl->paths = NULL;
     fl->count = 0;
     fl->capacity = 0;
 }
 
-int now_filelist_push(NowFileList *fl, const char *path) {
+NOW_API int now_filelist_push(NowFileList *fl, const char *path) {
     if (fl->count >= fl->capacity) {
         size_t new_cap = fl->capacity ? fl->capacity * 2 : 16;
         char **tmp = realloc(fl->paths, new_cap * sizeof(char *));
@@ -182,7 +185,7 @@ int now_filelist_push(NowFileList *fl, const char *path) {
     return 0;
 }
 
-void now_filelist_free(NowFileList *fl) {
+NOW_API void now_filelist_free(NowFileList *fl) {
     for (size_t i = 0; i < fl->count; i++)
         free(fl->paths[i]);
     free(fl->paths);
@@ -280,7 +283,7 @@ static int discover_recursive(const char *basedir, const char *rel_dir,
 
 #endif
 
-int now_discover_sources(const char *basedir, const char *dir,
+NOW_API int now_discover_sources(const char *basedir, const char *dir,
                          const char **exts, NowFileList *out) {
     /* dir is relative to basedir */
     char *full = now_path_join(basedir, dir);

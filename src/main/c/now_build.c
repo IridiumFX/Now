@@ -26,7 +26,7 @@
 
 /* ---- CPU count detection ---- */
 
-int now_cpu_count(void) {
+NOW_API int now_cpu_count(void) {
 #ifdef _WIN32
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -72,7 +72,7 @@ static char *build_cmdline(const char *const *argv) {
 }
 #endif
 
-int now_exec(const char *const *argv, int verbose) {
+NOW_API int now_exec(const char *const *argv, int verbose) {
     if (!argv || !argv[0]) return -1;
 
     if (verbose) {
@@ -325,7 +325,7 @@ static char *resolve_tool(const char *env_var, const char *fallback) {
     return strdup(fallback);
 }
 
-void now_toolchain_resolve(NowToolchain *tc, const NowProject *p) {
+NOW_API void now_toolchain_resolve(NowToolchain *tc, const NowProject *p) {
     (void)p;  /* future: read toolchain from project */
 #ifdef _WIN32
     /* On Windows with MSVC, detect cl.exe; otherwise assume gcc/mingw */
@@ -355,7 +355,7 @@ void now_toolchain_resolve(NowToolchain *tc, const NowProject *p) {
 #endif
 }
 
-void now_toolchain_free(NowToolchain *tc) {
+NOW_API void now_toolchain_free(NowToolchain *tc) {
     free(tc->cc);
     free(tc->cxx);
     free(tc->ar);
@@ -366,7 +366,7 @@ void now_toolchain_free(NowToolchain *tc) {
 
 /* ---- Build context ---- */
 
-int now_build_init(NowBuildCtx *ctx, const NowProject *project,
+NOW_API int now_build_init(NowBuildCtx *ctx, const NowProject *project,
                    const char *basedir, NowResult *result) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->project    = project;
@@ -833,7 +833,7 @@ static char *compile_flags_hash(const NowProject *p) {
     return hash;
 }
 
-int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
+NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
     const NowProject *p = ctx->project;
     int errors = 0;
 
@@ -1156,7 +1156,7 @@ static char *link_flags_hash(const NowProject *p) {
 
 /* ---- Link phase (§2.4, §7.6) ---- */
 
-int now_build_link(NowBuildCtx *ctx, NowResult *result) {
+NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
     const NowProject *p = ctx->project;
     const char *basedir = ctx->basedir;
 
@@ -1436,7 +1436,7 @@ int now_build_link(NowBuildCtx *ctx, NowResult *result) {
 
 /* ---- Test phase (§9) ---- */
 
-int now_build_test(NowBuildCtx *ctx, NowResult *result) {
+NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
     const NowProject *p = ctx->project;
     const char *basedir = ctx->basedir;
 
@@ -1741,7 +1741,7 @@ int now_build_test(NowBuildCtx *ctx, NowResult *result) {
     return 0;
 }
 
-void now_build_free(NowBuildCtx *ctx) {
+NOW_API void now_build_free(NowBuildCtx *ctx) {
     now_toolchain_free(&ctx->toolchain);
     now_filelist_free(&ctx->sources);
     now_filelist_free(&ctx->objects);
