@@ -9,6 +9,7 @@
 #include "now_pom.h"
 #include "now_fs.h"
 #include "now_version.h"
+#include "now_resolve.h"
 #include "now_manifest.h"
 #include "now_auth.h"
 #include "now_trust.h"
@@ -761,4 +762,387 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
     free(lock_path);
     free(jwt);
     return 0;
+}
+
+/* ---- dep:updates ---- */
+
+NOW_API int now_dep_updates(const NowProject *project, const char *registry_url,
+                             int verbose, NowResult *result) {
+    if (!project) {
+        if (result) snprintf(result->message, sizeof(result->message),
+                             "NULL project");
+        return -1;
+    }
+
+    if (project->deps.count == 0) {
+        if (verbose)
+            fprintf(stderr, "  no dependencies declared\n");
+        return 0;
+    }
+
+    /* Determine registry URL */
+    const char *url = registry_url;
+    if (!url && project->repos.count > 0 && project->repos.items[0].url)
+        url = project->repos.items[0].url;
+    if (!url) url = "http://localhost:8080";
+
+    /* Load lock file for current versions */
+    NowLockFile lockfile;
+    now_lock_init(&lockfile);
+    now_lock_load(&lockfile, "now.lock.pasta");
+
+    int updates_found = 0;
+
+    for (size_t i = 0; i < project->deps.count; i++) {
+        const NowDep *dep = &project->deps.items[i];
+
+        NowCoordinate coord;
+        if (now_coord_parse(dep->id, &coord) != 0)
+            continue;
+
+        /* Find current locked version */
+        const NowLockEntry *locked = now_lock_find(&lockfile,
+                                                    coord.group, coord.artifact);
+        const char *current_ver = locked ? locked->version : coord.version;
+
+        /* Query registry for all versions */
+        NowRegistryVersion *versions = NULL;
+        int vcount = now_registry_resolve(url, coord.group, coord.artifact,
+                                          "*", &versions, result);
+
+        if (vcount <= 0) {
+            if (verbose)
+                fprintf(stderr, "  %s:%s — no versions found on registry\n",
+                        coord.group, coord.artifact);
+            now_coord_free(&coord);
+            continue;
+        }
+
+        /* versions come sorted descending from registry — first is latest */
+        const char *latest = versions[0].version;
+
+        /* Compare current vs latest */
+        NowSemVer sv_current, sv_latest;
+        int have_current = (current_ver && now_semver_parse(current_ver, &sv_current) == 0);
+        int have_latest = (latest && now_semver_parse(latest, &sv_latest) == 0);
+
+        if (have_current && have_latest) {
+            int cmp = now_semver_compare(&sv_current, &sv_latest);
+            if (cmp < 0) {
+                printf("  %s:%s  %s -> %s\n",
+                       coord.group, coord.artifact, current_ver, latest);
+                updates_found++;
+            } else if (verbose) {
+                printf("  %s:%s  %s (up to date)\n",
+                       coord.group, coord.artifact, current_ver);
+            }
+            now_semver_free(&sv_current);
+            now_semver_free(&sv_latest);
+        } else if (have_current) {
+            now_semver_free(&sv_current);
+        } else if (have_latest) {
+            /* No current version, show latest available */
+            printf("  %s:%s  (unresolved) -> %s\n",
+                   coord.group, coord.artifact, latest);
+            updates_found++;
+            now_semver_free(&sv_latest);
+        }
+
+        now_registry_versions_free(versions, vcount);
+        now_coord_free(&coord);
+    }
+
+    now_lock_free(&lockfile);
+
+    if (updates_found == 0 && verbose)
+        printf("  all dependencies up to date\n");
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return updates_found;
+}
+
+/* ---- cache:mirror ---- */
+
+/* Parse JSON manifest: {"artifacts":[{"group":"...","artifact":"...","version":"..."},...]} */
+typedef struct {
+    char *group;
+    char *artifact;
+    char *version;
+} MirrorEntry;
+
+static int parse_mirror_manifest(const char *json, size_t len,
+                                  MirrorEntry **out, int *count) {
+    *out = NULL;
+    *count = 0;
+
+    const char *arr = strstr(json, "\"artifacts\":[");
+    if (!arr) return -1;
+    arr = strchr(arr, '[');
+    if (!arr) return -1;
+    arr++;
+
+    /* Count entries */
+    int n = 0;
+    int depth = 0;
+    for (const char *p = arr; *p && !(*p == ']' && depth == 0); p++) {
+        if (*p == '{') { if (depth == 0) n++; depth++; }
+        else if (*p == '}') depth--;
+    }
+
+    if (n == 0) return 0;
+
+    MirrorEntry *entries = (MirrorEntry *)calloc((size_t)n, sizeof(MirrorEntry));
+    if (!entries) return -1;
+
+    const char *p = arr;
+    for (int i = 0; i < n; i++) {
+        p = strchr(p, '{');
+        if (!p) break;
+        p++;
+
+        /* Parse "group":"..." */
+        const char *gkey = strstr(p, "\"group\":\"");
+        if (gkey) {
+            gkey += 9;
+            const char *gend = strchr(gkey, '"');
+            if (gend) {
+                size_t glen = (size_t)(gend - gkey);
+                entries[i].group = (char *)malloc(glen + 1);
+                if (entries[i].group) { memcpy(entries[i].group, gkey, glen); entries[i].group[glen] = '\0'; }
+            }
+        }
+
+        /* Parse "artifact":"..." */
+        const char *akey = strstr(p, "\"artifact\":\"");
+        if (akey) {
+            akey += 12;
+            const char *aend = strchr(akey, '"');
+            if (aend) {
+                size_t alen = (size_t)(aend - akey);
+                entries[i].artifact = (char *)malloc(alen + 1);
+                if (entries[i].artifact) { memcpy(entries[i].artifact, akey, alen); entries[i].artifact[alen] = '\0'; }
+            }
+        }
+
+        /* Parse "version":"..." */
+        const char *vkey = strstr(p, "\"version\":\"");
+        if (vkey) {
+            vkey += 11;
+            const char *vend = strchr(vkey, '"');
+            if (vend) {
+                size_t vlen = (size_t)(vend - vkey);
+                entries[i].version = (char *)malloc(vlen + 1);
+                if (entries[i].version) { memcpy(entries[i].version, vkey, vlen); entries[i].version[vlen] = '\0'; }
+            }
+        }
+
+        p = strchr(p, '}');
+        if (p) p++;
+    }
+
+    *out = entries;
+    *count = n;
+    return 0;
+}
+
+static void mirror_entries_free(MirrorEntry *entries, int count) {
+    if (!entries) return;
+    for (int i = 0; i < count; i++) {
+        free(entries[i].group);
+        free(entries[i].artifact);
+        free(entries[i].version);
+    }
+    free(entries);
+}
+
+NOW_API int now_cache_mirror(const char *registry_url, const char *coords,
+                              int verbose, NowResult *result) {
+    if (!registry_url) {
+        if (result) {
+            result->code = NOW_ERR_SCHEMA;
+            snprintf(result->message, sizeof(result->message),
+                     "registry URL required for cache:mirror");
+        }
+        return -1;
+    }
+
+    /* Parse registry URL */
+    char *host = NULL;
+    char *base_path = NULL;
+    int port = 80, tls = 0;
+    if (pico_http_parse_url_ex(registry_url, &host, &port, &base_path, &tls) != 0) {
+        if (result) snprintf(result->message, sizeof(result->message),
+                             "Invalid registry URL: %s", registry_url);
+        return -1;
+    }
+
+    char *prefix = base_path ? base_path : strdup("");
+    size_t plen = strlen(prefix);
+    while (plen > 0 && prefix[plen - 1] == '/') prefix[--plen] = '\0';
+
+    /* Authenticate */
+    NowCredentials creds;
+    char *jwt = NULL;
+    if (now_auth_load(registry_url, &creds) == 0) {
+        if (creds.username)
+            now_auth_login(host, port, prefix, &creds, tls, &jwt, result);
+        if (!jwt && creds.token)
+            jwt = strdup(creds.token);
+        now_auth_creds_free(&creds);
+    }
+
+    /* Build mirror manifest URL */
+    char path[2048];
+    if (coords && *coords)
+        snprintf(path, sizeof(path), "%s/mirror/manifest?coords=%s", prefix, coords);
+    else
+        snprintf(path, sizeof(path), "%s/mirror/manifest", prefix);
+
+    /* Build headers */
+    PicoHttpHeader headers[2];
+    int nhdr = 0;
+    char auth_buf[1024];
+    if (jwt && *jwt) {
+        snprintf(auth_buf, sizeof(auth_buf), "Bearer %s", jwt);
+        headers[nhdr].name  = "Authorization";
+        headers[nhdr].value = auth_buf;
+        nhdr++;
+    }
+
+    PicoHttpOptions opts = {0};
+    opts.headers = headers;
+    opts.header_count = (size_t)nhdr;
+
+    /* Fetch manifest */
+    PicoHttpResponse res;
+    int rc = pico_http_get(host, port, path, &opts, &res);
+    free(host);
+    free(prefix);
+
+    if (rc != PICO_OK) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "mirror manifest fetch failed: %s", pico_http_strerror(rc));
+        }
+        free(jwt);
+        return -1;
+    }
+
+    if (res.status != 200) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "mirror manifest: registry returned HTTP %d", res.status);
+        }
+        pico_http_response_free(&res);
+        free(jwt);
+        return -1;
+    }
+
+    /* Parse manifest */
+    MirrorEntry *entries = NULL;
+    int entry_count = 0;
+    if (parse_mirror_manifest(res.body, res.body_len, &entries, &entry_count) != 0) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "failed to parse mirror manifest");
+        }
+        pico_http_response_free(&res);
+        free(jwt);
+        return -1;
+    }
+    pico_http_response_free(&res);
+
+    /* Determine local repo root */
+    char *repo_root = default_repo_root();
+    if (!repo_root) {
+        if (result) snprintf(result->message, sizeof(result->message),
+                             "Cannot determine repo root");
+        mirror_entries_free(entries, entry_count);
+        free(jwt);
+        return -1;
+    }
+
+    /* Download missing artifacts */
+    int downloaded = 0;
+    int skipped = 0;
+
+    for (int i = 0; i < entry_count; i++) {
+        MirrorEntry *e = &entries[i];
+        if (!e->group || !e->artifact || !e->version) continue;
+
+        if (now_repo_is_installed(repo_root, e->group, e->artifact, e->version)) {
+            skipped++;
+            if (verbose)
+                fprintf(stderr, "  %s:%s:%s — already cached\n",
+                        e->group, e->artifact, e->version);
+            continue;
+        }
+
+        /* Create dep directory */
+        char *dep_dir = now_repo_dep_path(repo_root, e->group,
+                                           e->artifact, e->version);
+        if (!dep_dir) continue;
+        now_mkdir_p(dep_dir);
+
+        /* Download descriptor */
+        char *desc_dest = now_path_join(dep_dir, "now.pasta");
+        if (desc_dest) {
+            now_registry_download(registry_url, e->group, e->artifact,
+                                  e->version, "now.pasta",
+                                  desc_dest, jwt, result);
+            free(desc_dest);
+        }
+
+        /* Download archive */
+        char archive_name[256];
+        snprintf(archive_name, sizeof(archive_name), "%s-%s.tar.gz",
+                 e->artifact, e->version);
+        char *archive_dest = now_path_join(dep_dir, archive_name);
+        if (archive_dest) {
+            rc = now_registry_download(registry_url, e->group, e->artifact,
+                                       e->version, archive_name,
+                                       archive_dest, jwt, result);
+            if (rc == 0) {
+                downloaded++;
+                if (verbose)
+                    fprintf(stderr, "  %s:%s:%s — downloaded\n",
+                            e->group, e->artifact, e->version);
+            }
+            free(archive_dest);
+        }
+
+        /* Download .sha256 sidecar */
+        char sha_name[256];
+        snprintf(sha_name, sizeof(sha_name), "%s-%s.sha256",
+                 e->artifact, e->version);
+        char *sha_dest = now_path_join(dep_dir, sha_name);
+        if (sha_dest) {
+            now_registry_download(registry_url, e->group, e->artifact,
+                                  e->version, sha_name,
+                                  sha_dest, jwt, result);
+            free(sha_dest);
+        }
+
+        free(dep_dir);
+    }
+
+    mirror_entries_free(entries, entry_count);
+    free(repo_root);
+    free(jwt);
+
+    if (verbose)
+        fprintf(stderr, "  mirror complete: %d downloaded, %d already cached\n",
+                downloaded, skipped);
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return downloaded;
 }

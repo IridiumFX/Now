@@ -88,4 +88,20 @@ NOW_API void now_registry_versions_free(NowRegistryVersion *versions, int count)
 NOW_API int now_group_is_private(const NowStrArray *private_groups,
                                   const char *group);
 
+/* ---- dep:updates ---- */
+
+/* Check each project dep against the registry for newer versions.
+ * Returns the number of deps with available updates, or -1 on error.
+ * registry_url may be NULL to use project repos or default. */
+NOW_API int now_dep_updates(const NowProject *project, const char *registry_url,
+                             int verbose, NowResult *result);
+
+/* ---- cache:mirror ---- */
+
+/* Mirror artifacts from a registry to the local cache.
+ * coords: comma-separated "g:a:v,g:a:v,..." or NULL for full manifest.
+ * Returns the number of artifacts downloaded, or -1 on error. */
+NOW_API int now_cache_mirror(const char *registry_url, const char *coords,
+                              int verbose, NowResult *result);
+
 #endif /* NOW_PROCURE_H */

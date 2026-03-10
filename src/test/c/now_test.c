@@ -1289,6 +1289,47 @@ static void test_yank_connect_failure(void) {
     PASS();
 }
 
+static void test_dep_updates_no_deps(void) {
+    TEST("dep:updates: project with no deps returns 0");
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    const char *pasta =
+        "{ group: \"io.test\", artifact: \"app\", version: \"1.0.0\", lang: \"c\" }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+    int rc = now_dep_updates(p, NULL, 0, &res);
+    now_project_free(p);
+    if (rc != 0) { FAIL("expected 0 updates for project with no deps"); return; }
+    PASS();
+}
+
+static void test_dep_updates_null_project(void) {
+    TEST("dep:updates: NULL project returns -1");
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_dep_updates(NULL, NULL, 0, &res);
+    if (rc != -1) { FAIL("should fail with NULL project"); return; }
+    PASS();
+}
+
+static void test_cache_mirror_no_url(void) {
+    TEST("cache:mirror: NULL URL returns -1");
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_cache_mirror(NULL, NULL, 0, &res);
+    if (rc != -1) { FAIL("should fail with NULL URL"); return; }
+    PASS();
+}
+
+static void test_cache_mirror_connect_failure(void) {
+    TEST("cache:mirror: connection refused returns -1");
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_cache_mirror("http://127.0.0.1:19999", NULL, 0, &res);
+    if (rc != -1) { FAIL("should fail on connect"); return; }
+    PASS();
+}
+
 static void test_toolchain_msvc_detect(void) {
     TEST("toolchain: detects MSVC from CC=cl.exe");
 #ifdef _WIN32
@@ -3277,6 +3318,10 @@ int main(void) {
     test_publish_no_package();
     test_yank_no_url();
     test_yank_connect_failure();
+    test_dep_updates_no_deps();
+    test_dep_updates_null_project();
+    test_cache_mirror_no_url();
+    test_cache_mirror_connect_failure();
 
     printf("\n  Workspace:\n");
     test_is_workspace_true();

@@ -18,7 +18,9 @@ jobs:
         run: sudo apt-get install -y ninja-build
 
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_HTTP_TLS=OFF
+        run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SHARED_LIBS=OFF -DPICO_HTTP_TLS=OFF
 
       - name: Build
         run: cmake --build build --verbose
@@ -31,7 +33,6 @@ jobs:
         with:
           name: now-linux
           path: |
-            build/bin/libnow.so*
             build/bin/now
             build/bin/now_test
 
@@ -45,7 +46,7 @@ jobs:
       - name: Configure
         run: >
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          -DPICO_HTTP_TLS=OFF
+          -DBUILD_SHARED_LIBS=OFF -DPICO_HTTP_TLS=OFF
           -DCMAKE_OSX_ARCHITECTURES=arm64
 
       - name: Build
@@ -59,7 +60,6 @@ jobs:
         with:
           name: now-macos-arm64
           path: |
-            build/bin/libnow*.dylib
             build/bin/now
             build/bin/now_test
 
@@ -77,7 +77,7 @@ jobs:
           prepare: |
             pkg install -y cmake ninja
           run: |
-            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_HTTP_TLS=OFF
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DPICO_HTTP_TLS=OFF
             cmake --build build
             ./build/bin/now_test
 
@@ -86,7 +86,6 @@ jobs:
         with:
           name: now-freebsd
           path: |
-            build/bin/libnow.so*
             build/bin/now
             build/bin/now_test
 
@@ -98,15 +97,15 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DPICO_HTTP_TLS=OFF
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SHARED_LIBS=OFF -DPICO_HTTP_TLS=OFF
 
       - name: Build
         run: cmake --build build --config Release --verbose
 
       - name: Test
-        run: |
-          $env:PATH = "$PWD\build\bin\Release;" + $env:PATH
-          .\build\bin\Release\now_test.exe
+        run: .\build\bin\Release\now_test.exe
         shell: pwsh
 
       - name: Upload artifacts
@@ -114,7 +113,5 @@ jobs:
         with:
           name: now-windows
           path: |
-            build/bin/Release/libnow.dll
             build/bin/Release/now.exe
             build/bin/Release/now_test.exe
-            build/lib/Release/libnow.lib

@@ -56,6 +56,8 @@ static void usage(void) {
         "  install    Install to local repo (~/.now/repo/)\n"
         "  publish    Upload package to remote registry\n"
         "  yank       Yank a published version: yank <g:a:v> --repo URL\n"
+        "  dep:updates  Check dependencies for newer versions\n"
+        "  cache:mirror Mirror artifacts from registry to local cache\n"
         "  export:cmake Generate CMakeLists.txt from now.pasta\n"
         "  export:make  Generate Makefile from now.pasta\n"
         "  layers:show  Show layer stack and effective configuration\n"
@@ -265,6 +267,24 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    if (strcmp(phase, "cache:mirror") == 0) {
+        if (!repo_url) {
+            fprintf(stderr, "error: --repo is required for cache:mirror\n");
+            return 1;
+        }
+        /* Optional: remaining args as coords filter */
+        const char *coords = (argc > 2) ? argv[2] : NULL;
+        NowResult result;
+        memset(&result, 0, sizeof(result));
+        int rc = now_cache_mirror(repo_url, coords, verbose, &result);
+        if (rc < 0) {
+            fprintf(stderr, "error: %s\n", result.message);
+            return 1;
+        }
+        printf("mirrored %d artifacts\n", rc);
+        return 0;
+    }
+
     /* All other phases need a project descriptor */
     char cwd[512];
     if (!getcwd_compat(cwd, sizeof(cwd))) {
@@ -299,6 +319,17 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "error: %s\n", result.message);
         else if (verbose)
             fprintf(stderr, "procure: done\n");
+
+    } else if (strcmp(phase, "dep:updates") == 0) {
+        printf("Checking for dependency updates...\n");
+        rc = now_dep_updates(project, repo_url, verbose, &result);
+        if (rc < 0)
+            fprintf(stderr, "error: %s\n", result.message);
+        else if (rc == 0)
+            printf("all dependencies up to date\n");
+        else
+            printf("%d update(s) available\n", rc);
+        rc = (rc < 0) ? 1 : 0;
 
     } else if (strcmp(phase, "generate") == 0) {
         NowPluginResult gen;

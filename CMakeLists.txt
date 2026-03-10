@@ -74,7 +74,7 @@ if(BUILD_SHARED_LIBS)
         VISIBILITY_INLINES_HIDDEN ON
     )
 else()
-    target_compile_definitions(now PUBLIC NOW_STATIC)
+    target_compile_definitions(now PUBLIC NOW_STATIC PICO_HTTP_STATIC)
     set_target_properties(now PROPERTIES
         VERSION   ${PROJECT_VERSION}
     )
