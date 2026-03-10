@@ -56,6 +56,7 @@ static void usage(void) {
         "  install    Install to local repo (~/.now/repo/)\n"
         "  publish    Upload package to remote registry\n"
         "  yank       Yank a published version: yank <g:a:v> --repo URL\n"
+        "  compile-db   Generate compile_commands.json for IDE/LSP\n"
         "  dep:updates  Check dependencies for newer versions\n"
         "  cache:mirror Mirror artifacts from registry to local cache\n"
         "  export:cmake Generate CMakeLists.txt from now.pasta\n"
@@ -329,6 +330,14 @@ int main(int argc, char *argv[]) {
             printf("all dependencies up to date\n");
         else
             printf("%d update(s) available\n", rc);
+        rc = (rc < 0) ? 1 : 0;
+
+    } else if (strcmp(phase, "compile-db") == 0) {
+        rc = now_compile_db(project, cwd, &result);
+        if (rc < 0)
+            fprintf(stderr, "error: %s\n", result.message);
+        else
+            printf("%s\n", result.message);
         rc = (rc < 0) ? 1 : 0;
 
     } else if (strcmp(phase, "generate") == 0) {

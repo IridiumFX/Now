@@ -65,6 +65,11 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result);
 /* Clean up build context. */
 NOW_API void now_build_free(NowBuildCtx *ctx);
 
+/* Generate compile_commands.json at project root.
+ * Returns the number of entries written, or -1 on error. */
+NOW_API int now_compile_db(const NowProject *project, const char *basedir,
+                            NowResult *result);
+
 /* Run a subprocess and capture exit code. Returns exit code. */
 NOW_API int now_exec(const char *const *argv, int verbose);
 

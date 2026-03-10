@@ -1,0 +1,38 @@
+{
+  group:    "dev.iridium",
+  artifact: "now",
+  version:  "0.1.0",
+  langs:    ["c"],
+  std:      "c11",
+  output:   { type: "executable", name: "now" },
+
+  sources: {
+    dir:     "src/main/c",
+    headers: "src/main/h",
+    private: "src/main/h/internal",
+    include: [
+      "lib/pasta/src/main/c/pasta_lexer.c",
+      "lib/pasta/src/main/c/pasta_parser.c",
+      "lib/pasta/src/main/c/pasta_value.c",
+      "lib/pasta/src/main/c/pasta_writer.c"
+    ]
+  },
+
+  compile: {
+    warnings: ["Wall", "Wextra"],
+    includes: [
+      "lib/pasta/src/main/h",
+      "lib/pasta/src/main/c"
+    ],
+    defines:  ["NOW_STATIC", "PICO_HTTP_STATIC", "PASTA_STATIC"]
+  },
+
+  link: {
+    libs: ["ws2_32"]
+  },
+
+  profiles: {
+    debug:   { compile: { flags: ["-g", "-O0"], defines: ["DEBUG"] } },
+    release: { compile: { flags: ["-O2"] }, link: { flags: ["-s"] } }
+  }
+}

@@ -323,3 +323,12 @@ NOW_API int now_test(const NowProject *project, const char *basedir,
     now_build_free(&ctx);
     return rc;
 }
+
+
+
+
+
+
+
+
+

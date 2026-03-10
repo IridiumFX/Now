@@ -319,11 +319,108 @@ static int wait_any_worker(NowWorkerSlot *slots, int nslots,
 
 /* ---- Toolchain resolution (§7.1) ---- */
 
+/* Find the full path to a tool by searching PATH (like `which`).
+ * Returns a malloc'd absolute path, or strdup(name) if not found. */
+static char *find_in_path(const char *name) {
+#ifdef _WIN32
+    /* If already absolute or contains path separator, use as-is */
+    if (strchr(name, '/') || strchr(name, '\\') || (name[0] && name[1] == ':'))
+        return strdup(name);
+
+    const char *path = getenv("PATH");
+    if (!path) return strdup(name);
+
+    /* Try each PATH entry with common Windows extensions.
+     * Handle both ; (native Windows) and : (MSYS2/MinGW) separators.
+     * Heuristic: if PATH contains forward-slash dirs, use ':' */
+    char sep = ';';
+    if (strchr(path, '/') && !strchr(path, ';'))
+        sep = ':';
+
+    const char *exts[] = { "", ".exe", ".cmd", ".bat", NULL };
+    char buf[1024];
+    const char *p = path;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != sep) end++;
+        size_t dir_len = (size_t)(end - p);
+        if (dir_len > 0 && dir_len < sizeof(buf) - 260) {
+            memcpy(buf, p, dir_len);
+            /* Normalize separator */
+            if (buf[dir_len - 1] != '/' && buf[dir_len - 1] != '\\')
+                buf[dir_len++] = '/';
+            for (int e = 0; exts[e]; e++) {
+                snprintf(buf + dir_len, sizeof(buf) - dir_len, "%s%s", name, exts[e]);
+                /* Check if file exists */
+                struct stat st;
+                if (stat(buf, &st) == 0 && !(st.st_mode & S_IFDIR))
+                    return strdup(buf);
+            }
+        }
+        p = *end ? end + 1 : end;
+    }
+#else
+    (void)name;
+#endif
+    return strdup(name);
+}
+
 static char *resolve_tool(const char *env_var, const char *fallback) {
     const char *val = getenv(env_var);
-    if (val && *val) return strdup(val);
-    return strdup(fallback);
+    if (val && *val) return find_in_path(val);
+    return find_in_path(fallback);
 }
+
+/* Ensure the compiler's directory is on the Windows PATH so that
+ * child processes (cc1.exe, as.exe, etc.) can find their DLLs.
+ * This is critical for MinGW gcc when invoked via absolute path. */
+#ifdef _WIN32
+static void ensure_tool_dir_in_path(const char *tool_path) {
+    if (!tool_path) return;
+
+    /* Extract directory from tool path */
+    const char *last_sep = strrchr(tool_path, '/');
+    const char *last_bsep = strrchr(tool_path, '\\');
+    if (last_bsep && (!last_sep || last_bsep > last_sep))
+        last_sep = last_bsep;
+    if (!last_sep) return;
+
+    size_t dir_len = (size_t)(last_sep - tool_path);
+    char *tool_dir = malloc(dir_len + 1);
+    if (!tool_dir) return;
+    memcpy(tool_dir, tool_path, dir_len);
+    tool_dir[dir_len] = '\0';
+
+    /* Check if already in PATH (case-insensitive on Windows) */
+    const char *cur_path = getenv("PATH");
+    if (cur_path) {
+        /* Quick check: is the dir already a substring? */
+        const char *found = cur_path;
+        while ((found = strstr(found, tool_dir)) != NULL) {
+            /* Verify it's a complete path entry (at start or after ;) */
+            if (found == cur_path || *(found - 1) == ';') {
+                char after = found[dir_len];
+                if (after == '\0' || after == ';') {
+                    free(tool_dir);
+                    return;  /* already in PATH */
+                }
+            }
+            found++;
+        }
+    }
+
+    /* Prepend tool_dir to PATH */
+    const char *old_path = cur_path ? cur_path : "";
+    size_t new_len = dir_len + 1 + strlen(old_path) + 6; /* "PATH=" + dir + ";" + old */
+    char *new_path = malloc(new_len);
+    if (new_path) {
+        snprintf(new_path, new_len, "PATH=%s;%s", tool_dir, old_path);
+        _putenv(new_path);
+        free(new_path);
+    }
+    free(tool_dir);
+}
+#endif
 
 NOW_API void now_toolchain_resolve(NowToolchain *tc, const NowProject *p) {
     (void)p;  /* future: read toolchain from project */
@@ -345,6 +442,8 @@ NOW_API void now_toolchain_resolve(NowToolchain *tc, const NowProject *p) {
         tc->ld     = NULL;
         tc->is_msvc = 0;
     }
+    /* Ensure compiler dir is on PATH for cc1.exe/libssp-0.dll */
+    ensure_tool_dir_in_path(tc->cc);
 #else
     tc->cc     = resolve_tool("CC",  "cc");
     tc->cxx    = resolve_tool("CXX", "c++");
@@ -432,6 +531,10 @@ NOW_API int now_build_init(NowBuildCtx *ctx, const NowProject *project,
         }
         return -1;
     }
+
+    /* Append explicit sources.include entries */
+    for (size_t i = 0; i < project->sources.include.count; i++)
+        now_filelist_push(&ctx->sources, project->sources.include.items[i]);
 
     if (ctx->sources.count == 0) {
         if (result) {
@@ -556,6 +659,19 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
                 ninc++;
             }
             free(hdr_full);
+        }
+    }
+    if (p->sources.private_headers && ninc < 32) {
+        char *prv_full = now_path_join(basedir, p->sources.private_headers);
+        if (prv_full) {
+            size_t ilen = strlen(prv_full) + 4;
+            inc_bufs[ninc] = malloc(ilen);
+            if (inc_bufs[ninc]) {
+                snprintf(inc_bufs[ninc], ilen, "/I%s", prv_full);
+                tmp_argv[tmp_argc++] = inc_bufs[ninc];
+                ninc++;
+            }
+            free(prv_full);
         }
     }
     for (size_t i = 0; i < p->compile.includes.count && ninc < 32; i++) {
@@ -725,6 +841,19 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
                 ninc++;
             }
             free(hdr_full);
+        }
+    }
+    if (p->sources.private_headers && ninc < 32) {
+        char *prv_full = now_path_join(basedir, p->sources.private_headers);
+        if (prv_full) {
+            size_t ilen = strlen(prv_full) + 3;
+            inc_bufs[ninc] = malloc(ilen);
+            if (inc_bufs[ninc]) {
+                snprintf(inc_bufs[ninc], ilen, "-I%s", prv_full);
+                tmp_argv[tmp_argc++] = inc_bufs[ninc];
+                ninc++;
+            }
+            free(prv_full);
         }
     }
     for (size_t i = 0; i < p->compile.includes.count && ninc < 32; i++) {
@@ -1739,6 +1868,146 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         result->message[0] = '\0';
     }
     return 0;
+}
+
+/* ---- compile_commands.json generation (§22.1) ---- */
+
+/* Escape a string for JSON output */
+static void json_escape(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        switch (*s) {
+            case '"':  fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;
+            case '\n': fputs("\\n", f);  break;
+            case '\r': fputs("\\r", f);  break;
+            case '\t': fputs("\\t", f);  break;
+            default:   fputc(*s, f);     break;
+        }
+    }
+    fputc('"', f);
+}
+
+NOW_API int now_compile_db(const NowProject *project, const char *basedir,
+                            NowResult *result) {
+    NowBuildCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (now_build_init(&ctx, project, basedir, result) != 0) return -1;
+
+    /* Open compile_commands.json for writing */
+    char *out_path = now_path_join(basedir, "compile_commands.json");
+    if (!out_path) { now_build_free(&ctx); return -1; }
+
+    FILE *f = fopen(out_path, "w");
+    if (!f) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "cannot write %s", out_path);
+        }
+        free(out_path);
+        now_build_free(&ctx);
+        return -1;
+    }
+
+    /* Get absolute basedir for "directory" field */
+    char abs_basedir[1024];
+#ifdef _WIN32
+    if (!_fullpath(abs_basedir, basedir, sizeof(abs_basedir)))
+        strncpy(abs_basedir, basedir, sizeof(abs_basedir) - 1);
+#else
+    if (!realpath(basedir, abs_basedir))
+        strncpy(abs_basedir, basedir, sizeof(abs_basedir) - 1);
+#endif
+    abs_basedir[sizeof(abs_basedir) - 1] = '\0';
+
+    /* Normalize backslashes to forward slashes */
+    for (char *p = abs_basedir; *p; p++)
+        if (*p == '\\') *p = '/';
+
+    fputs("[\n", f);
+    int count = 0;
+
+    for (size_t i = 0; i < ctx.sources.count; i++) {
+        const char *src = ctx.sources.paths[i];
+        const NowLangDef *lang = NULL;
+        const NowLangType *type = now_lang_classify(
+            src, (const char *const *)project->langs.items,
+            project->langs.count, &lang);
+
+        if (!type || type->role != NOW_ROLE_SOURCE) continue;
+
+        NowCompileJob job;
+        int jrc;
+        if (ctx.toolchain.is_msvc)
+            jrc = build_compile_job_msvc(&ctx, src, type, lang, &job);
+        else
+            jrc = build_compile_job(&ctx, src, type, lang, &job);
+        if (jrc != 0) continue;
+
+        if (count > 0) fputs(",\n", f);
+        fputs("  {\n", f);
+
+        /* directory */
+        fputs("    \"directory\": ", f);
+        json_escape(f, abs_basedir);
+        fputs(",\n", f);
+
+        /* file (absolute path) */
+        char *src_full = now_path_join(basedir, src);
+        char abs_src[1024];
+#ifdef _WIN32
+        if (!_fullpath(abs_src, src_full ? src_full : src, sizeof(abs_src)))
+            strncpy(abs_src, src_full ? src_full : src, sizeof(abs_src) - 1);
+#else
+        if (!realpath(src_full ? src_full : src, abs_src))
+            strncpy(abs_src, src_full ? src_full : src, sizeof(abs_src) - 1);
+#endif
+        abs_src[sizeof(abs_src) - 1] = '\0';
+        for (char *p = abs_src; *p; p++)
+            if (*p == '\\') *p = '/';
+        free(src_full);
+
+        fputs("    \"file\": ", f);
+        json_escape(f, abs_src);
+        fputs(",\n", f);
+
+        /* arguments (array form, preferred by clangd) */
+        fputs("    \"arguments\": [", f);
+        for (int a = 0; a < job.argc; a++) {
+            if (a > 0) fputs(", ", f);
+
+            /* Normalize backslashes in argument values too */
+            char *arg = strdup(job.argv[a]);
+            if (arg) {
+                for (char *p = arg; *p; p++)
+                    if (*p == '\\') *p = '/';
+                json_escape(f, arg);
+                free(arg);
+            } else {
+                json_escape(f, job.argv[a]);
+            }
+        }
+        fputs("]\n", f);
+
+        fputs("  }", f);
+        count++;
+
+        compile_job_free(&job);
+    }
+
+    fputs("\n]\n", f);
+    fclose(f);
+
+    if (result) {
+        result->code = NOW_OK;
+        snprintf(result->message, sizeof(result->message),
+                 "wrote %d entries to %s", count, out_path);
+    }
+
+    free(out_path);
+    now_build_free(&ctx);
+    return count;
 }
 
 NOW_API void now_build_free(NowBuildCtx *ctx) {
