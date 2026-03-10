@@ -11,6 +11,7 @@
 #include "now_build.h"
 #include "now_manifest.h"
 #include "now_procure.h"
+#include "now_auth.h"
 #include "pico_http.h"
 #include "pasta.h"
 
@@ -499,68 +500,32 @@ static char *read_file_all(const char *path, size_t *out_len) {
     return buf;
 }
 
-/* Load credentials for a registry URL from ~/.now/credentials.pasta.
- * Sets *token_out to a malloc'd string (caller frees), or NULL if not found. */
-static void load_credentials(const char *registry_url, char **token_out) {
-    *token_out = NULL;
-
-    const char *home = NULL;
-#ifdef _WIN32
-    home = getenv("USERPROFILE");
-    if (!home) home = getenv("HOME");
-#else
-    home = getenv("HOME");
-#endif
-    if (!home) return;
-
-    char *dot_now = now_path_join(home, ".now");
-    if (!dot_now) return;
-    char *cred_path = now_path_join(dot_now, "credentials.pasta");
-    free(dot_now);
-    if (!cred_path) return;
-
-    size_t cred_len;
-    char *cred_data = read_file_all(cred_path, &cred_len);
-    free(cred_path);
-    if (!cred_data) return;
-
-    PastaValue *root = pasta_parse(cred_data, cred_len, NULL);
-    free(cred_data);
-    if (!root || pasta_type(root) != PASTA_MAP) { pasta_free(root); return; }
-
-    const PastaValue *registries = pasta_map_get(root, "registries");
-    if (!registries || pasta_type(registries) != PASTA_ARRAY) { pasta_free(root); return; }
-
-    size_t nregs = pasta_count(registries);
-    for (size_t i = 0; i < nregs; i++) {
-        const PastaValue *entry = pasta_array_get(registries, i);
-        if (!entry || pasta_type(entry) != PASTA_MAP) continue;
-
-        const PastaValue *url_val = pasta_map_get(entry, "url");
-        if (!url_val || pasta_type(url_val) != PASTA_STRING) continue;
-
-        const char *entry_url = pasta_get_string(url_val);
-        if (!entry_url) continue;
-
-        /* Match by URL prefix */
-        if (strncmp(registry_url, entry_url, strlen(entry_url)) == 0) {
-            const PastaValue *tok = pasta_map_get(entry, "token");
-            if (tok && pasta_type(tok) == PASTA_STRING) {
-                const char *tok_str = pasta_get_string(tok);
-                if (tok_str) *token_out = strdup(tok_str);
-            }
-            break;
+/* Authenticate with registry: load credentials, exchange for JWT if possible.
+ * Returns malloc'd token string (JWT or raw token), or NULL if no credentials.
+ * Caller must free. */
+static char *auth_for_registry(const char *registry_url, const char *host,
+                                int port, const char *path_prefix, int tls,
+                                NowResult *result) {
+    NowCredentials creds;
+    char *jwt = NULL;
+    if (now_auth_load(registry_url, &creds) == 0) {
+        if (creds.username) {
+            now_auth_login(host, port, path_prefix, &creds, tls,
+                           &jwt, result);
         }
+        /* Fallback to raw token if no username or login failed */
+        if (!jwt && creds.token)
+            jwt = strdup(creds.token);
+        now_auth_creds_free(&creds);
     }
-
-    pasta_free(root);
+    return jwt;
 }
 
 /* PUT a file to the registry. Returns 0 on success. */
 static int publish_put(const char *host, int port, const char *path_prefix,
                        const char *rel_path, const char *data, size_t data_len,
-                       const char *auth_token, int use_tls, int verbose,
-                       NowResult *result) {
+                       const char *content_type, const char *auth_token,
+                       int use_tls, int verbose, NowResult *result) {
     /* Build path: {path_prefix}/artifact/{rel_path} */
     char put_path[1024];
     snprintf(put_path, sizeof(put_path), "%s/artifact/%s", path_prefix, rel_path);
@@ -587,8 +552,9 @@ static int publish_put(const char *host, int port, const char *path_prefix,
     if (verbose)
         fprintf(stderr, "  PUT %s:%d%s (%zu bytes)\n", host, port, put_path, data_len);
 
+    const char *ct = content_type ? content_type : "application/octet-stream";
     int rc = pico_http_put(host, port, put_path,
-                           "application/octet-stream", data, data_len,
+                           ct, data, data_len,
                            &opts, &res);
 
     if (rc != PICO_OK) {
@@ -675,9 +641,8 @@ NOW_API int now_publish(const NowProject *project, const char *basedir,
     size_t plen = strlen(prefix);
     while (plen > 0 && prefix[plen - 1] == '/') prefix[--plen] = '\0';
 
-    /* Load credentials */
-    char *token = NULL;
-    load_credentials(url, &token);
+    /* Authenticate with registry */
+    char *token = auth_for_registry(url, host, port, prefix, tls, result);
 
     /* Find tarball and SHA-256 sidecar in target/pkg/ */
     const char *triple   = now_host_triple();
@@ -732,8 +697,9 @@ NOW_API int now_publish(const NowProject *project, const char *basedir,
                 snprintf(rel, sizeof(rel), "%s/%s/%s/now.pasta",
                          group_path, artifact, version);
                 rc = publish_put(host, port, prefix, rel,
-                                 desc_data, desc_len, token, tls,
-                                 verbose, result);
+                                 desc_data, desc_len,
+                                 "application/x-pasta",
+                                 token, tls, verbose, result);
                 free(desc_data);
                 if (rc != 0) errors++;
             }
@@ -750,8 +716,8 @@ NOW_API int now_publish(const NowProject *project, const char *basedir,
             snprintf(rel, sizeof(rel), "%s/%s/%s/%s",
                      group_path, artifact, version, tarball_name);
             rc = publish_put(host, port, prefix, rel,
-                             tar_data, tar_len, token, tls,
-                             verbose, result);
+                             tar_data, tar_len, NULL,
+                             token, tls, verbose, result);
             free(tar_data);
             if (rc != 0) errors++;
         } else {
@@ -773,11 +739,34 @@ NOW_API int now_publish(const NowProject *project, const char *basedir,
             snprintf(rel, sizeof(rel), "%s/%s/%s/%s",
                      group_path, artifact, version, sha_name);
             rc = publish_put(host, port, prefix, rel,
-                             sha_data, sha_len, token, tls,
-                             verbose, result);
+                             sha_data, sha_len, NULL,
+                             token, tls, verbose, result);
             free(sha_data);
             if (rc != 0) errors++;
         }
+    }
+
+    /* 4. PUT the .sig file if present */
+    if (errors == 0) {
+        char sig_name[512];
+        snprintf(sig_name, sizeof(sig_name), "%s-%s-%s.sig",
+                 artifact, version, arch_str);
+        char *sig_path = now_path_join(pkg_dir, sig_name);
+        if (sig_path && now_path_exists(sig_path)) {
+            size_t sig_len;
+            char *sig_data = read_file_all(sig_path, &sig_len);
+            if (sig_data) {
+                char rel[512];
+                snprintf(rel, sizeof(rel), "%s/%s/%s/%s",
+                         group_path, artifact, version, sig_name);
+                rc = publish_put(host, port, prefix, rel,
+                                 sig_data, sig_len, NULL,
+                                 token, tls, verbose, result);
+                free(sig_data);
+                if (rc != 0) errors++;
+            }
+        }
+        free(sig_path);
     }
 
     free(tarball_path);
@@ -792,6 +781,125 @@ NOW_API int now_publish(const NowProject *project, const char *basedir,
     if (verbose)
         fprintf(stderr, "  published %s:%s:%s to %s\n",
                 group, artifact, version, url);
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return 0;
+}
+
+NOW_API int now_publish_yank(const char *registry_url,
+                              const char *group, const char *artifact,
+                              const char *version, const char *reason,
+                              int verbose, NowResult *result) {
+    if (!registry_url || !group || !artifact || !version) {
+        if (result) {
+            result->code = NOW_ERR_SCHEMA;
+            snprintf(result->message, sizeof(result->message),
+                     "yank requires registry URL, group, artifact, and version");
+        }
+        return -1;
+    }
+
+    /* Parse registry URL */
+    char *host = NULL;
+    int   port = 0;
+    char *path = NULL;
+    int   tls  = 0;
+
+    int rc = pico_http_parse_url_ex(registry_url, &host, &port, &path, &tls);
+    if (rc != 0 || !host) {
+        if (result) {
+            result->code = NOW_ERR_SCHEMA;
+            snprintf(result->message, sizeof(result->message),
+                     "invalid registry URL: %s", registry_url);
+        }
+        free(host); free(path);
+        return -1;
+    }
+
+    char *prefix = path ? path : strdup("");
+    size_t plen = strlen(prefix);
+    while (plen > 0 && prefix[plen - 1] == '/') prefix[--plen] = '\0';
+
+    /* Authenticate */
+    char *token = auth_for_registry(registry_url, host, port, prefix, tls, result);
+
+    /* Build path: {prefix}/artifact/{group_path}/{artifact}/{version}/{artifact}-{version}.tar.gz/yank */
+    char group_path[256];
+    strncpy(group_path, group, sizeof(group_path) - 1);
+    group_path[sizeof(group_path) - 1] = '\0';
+    for (char *p = group_path; *p; p++)
+        if (*p == '.') *p = '/';
+
+    char yank_path[1024];
+    snprintf(yank_path, sizeof(yank_path),
+             "%s/artifact/%s/%s/%s/%s-%s.tar.gz/yank",
+             prefix, group_path, artifact, version, artifact, version);
+
+    /* Build body: {"reason":"..."} if reason is given */
+    char body[1024] = "";
+    size_t body_len = 0;
+    if (reason && *reason) {
+        body_len = (size_t)snprintf(body, sizeof(body),
+                                    "{\"reason\":\"%s\"}", reason);
+    }
+
+    /* Build headers */
+    PicoHttpHeader headers[2];
+    int nhdr = 0;
+    char auth_buf[1024];
+    if (token && *token) {
+        snprintf(auth_buf, sizeof(auth_buf), "Bearer %s", token);
+        headers[nhdr].name  = "Authorization";
+        headers[nhdr].value = auth_buf;
+        nhdr++;
+    }
+
+    PicoHttpOptions opts = {0};
+    opts.headers = headers;
+    opts.header_count = (size_t)nhdr;
+    opts.max_redirects = -1;
+
+    PicoHttpResponse res;
+    memset(&res, 0, sizeof(res));
+
+    if (verbose)
+        fprintf(stderr, "  POST %s:%d%s\n", host, port, yank_path);
+
+    const char *ct = body_len > 0 ? "application/json" : NULL;
+    rc = pico_http_post(host, port, yank_path,
+                        ct, body_len > 0 ? body : NULL, body_len,
+                        &opts, &res);
+
+    free(host);
+    free(prefix);
+    free(token);
+
+    if (rc != PICO_OK) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "POST yank failed: %s", pico_http_strerror(rc));
+        }
+        return -1;
+    }
+
+    if (res.status < 200 || res.status >= 300) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "yank failed: registry returned HTTP %d", res.status);
+        }
+        pico_http_response_free(&res);
+        return -1;
+    }
+
+    pico_http_response_free(&res);
+
+    if (verbose)
+        fprintf(stderr, "  yanked %s:%s:%s\n", group, artifact, version);
 
     if (result) {
         result->code = NOW_OK;

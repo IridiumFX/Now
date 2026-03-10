@@ -55,6 +55,7 @@ static void usage(void) {
         "  package    Assemble distributable archive in target/pkg/\n"
         "  install    Install to local repo (~/.now/repo/)\n"
         "  publish    Upload package to remote registry\n"
+        "  yank       Yank a published version: yank <g:a:v> --repo URL\n"
         "  export:cmake Generate CMakeLists.txt from now.pasta\n"
         "  export:make  Generate Makefile from now.pasta\n"
         "  layers:show  Show layer stack and effective configuration\n"
@@ -223,6 +224,44 @@ int main(int argc, char *argv[]) {
         }
         printf("added key for scope '%s'\n", scope);
         now_trust_free(&store);
+        return 0;
+    }
+
+    if (strcmp(phase, "yank") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "usage: now yank <group:artifact:version> [--repo URL] [--reason \"...\"]\n");
+            return 1;
+        }
+        const char *coord_str = argv[2];
+        const char *reason = NULL;
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "--reason") == 0 && i + 1 < argc)
+                reason = argv[++i];
+        }
+
+        NowCoordinate coord;
+        if (now_coord_parse(coord_str, &coord) != 0) {
+            fprintf(stderr, "error: invalid coordinate '%s' (expected group:artifact:version)\n",
+                    coord_str);
+            return 1;
+        }
+
+        if (!repo_url) {
+            fprintf(stderr, "error: --repo is required for yank\n");
+            now_coord_free(&coord);
+            return 1;
+        }
+
+        NowResult result;
+        memset(&result, 0, sizeof(result));
+        int rc = now_publish_yank(repo_url, coord.group, coord.artifact,
+                                   coord.version, reason, verbose, &result);
+        now_coord_free(&coord);
+        if (rc != 0) {
+            fprintf(stderr, "error: %s\n", result.message);
+            return 1;
+        }
+        printf("yanked %s\n", coord_str);
         return 0;
     }
 

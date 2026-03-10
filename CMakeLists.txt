@@ -45,6 +45,7 @@ add_library(now
     src/main/c/now_trust.c
     src/main/c/now_repro.c
     src/main/c/now_advisory.c
+    src/main/c/now_auth.c
 )
 
 target_include_directories(now

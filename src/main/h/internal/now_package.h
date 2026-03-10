@@ -34,4 +34,12 @@ NOW_API int now_install(const NowProject *project, const char *basedir,
 NOW_API int now_publish(const NowProject *project, const char *basedir,
                         const char *repo_url, int verbose, NowResult *result);
 
+/* Yank a published artifact version.
+ * POSTs to /artifact/{g}/{a}/{v}/{file}/yank with optional reason.
+ * Returns 0 on success. */
+NOW_API int now_publish_yank(const char *registry_url,
+                              const char *group, const char *artifact,
+                              const char *version, const char *reason,
+                              int verbose, NowResult *result);
+
 #endif /* NOW_PACKAGE_H */

@@ -46,11 +46,13 @@ NOW_API int now_registry_resolve(const char *registry_url,
                                   NowResult *result);
 
 /* Download an artifact from registry to a local path.
+ * auth_token: Bearer JWT (may be NULL for public registries).
  * Returns 0 on success, -1 on error. */
 NOW_API int now_registry_download(const char *registry_url,
                                    const char *group, const char *artifact,
                                    const char *version, const char *filename,
                                    const char *dest_path,
+                                   const char *auth_token,
                                    NowResult *result);
 
 /* Check if a dependency is installed in the local repo.

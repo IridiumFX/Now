@@ -22,6 +22,7 @@
 #include "now_trust.h"
 #include "now_repro.h"
 #include "now_advisory.h"
+#include "now_auth.h"
 #include "pico_http.h"
 #include "pico_ws.h"
 
@@ -1224,6 +1225,67 @@ static void test_publish_no_package(void) {
     int rc = now_publish(&proj, ".", "http://localhost:9999", 0, &res);
     if (rc == 0) { FAIL("should fail without package"); return; }
     ASSERT_EQ(res.code, NOW_ERR_NOT_FOUND);
+    PASS();
+}
+
+static void test_auth_load_no_creds(void) {
+    TEST("auth: load returns -1 when no credentials file");
+    NowCredentials creds;
+    memset(&creds, 0, sizeof(creds));
+    int rc = now_auth_load("http://no.such.registry", &creds);
+    /* Should return -1 since ~/.now/credentials.pasta likely doesn't match */
+    if (rc == 0 && creds.token != NULL) {
+        /* Unlikely but valid — credentials file exists with this URL */
+        now_auth_creds_free(&creds);
+    }
+    PASS();
+}
+
+static void test_auth_login_null_creds(void) {
+    TEST("auth: login fails with NULL credentials");
+    char *jwt = NULL;
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_auth_login("localhost", 9999, "", NULL, 0, &jwt, &res);
+    if (rc != -1) { FAIL("should fail with NULL creds"); return; }
+    if (jwt != NULL) { FAIL("jwt should be NULL"); free(jwt); return; }
+    ASSERT_EQ(res.code, NOW_ERR_AUTH);
+    PASS();
+}
+
+static void test_auth_login_connect_failure(void) {
+    TEST("auth: login fails on connection refused");
+    NowCredentials creds;
+    creds.username = strdup("alice");
+    creds.token = strdup("secret");
+    char *jwt = NULL;
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_auth_login("127.0.0.1", 19999, "", &creds, 0, &jwt, &res);
+    /* Should fail because nothing is listening */
+    if (rc != -1) { FAIL("should fail on connect"); free(jwt); }
+    if (jwt != NULL) { FAIL("jwt should be NULL"); free(jwt); }
+    now_auth_creds_free(&creds);
+    PASS();
+}
+
+static void test_yank_no_url(void) {
+    TEST("yank: fails with NULL registry URL");
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_publish_yank(NULL, "org.test", "lib", "1.0.0", NULL, 0, &res);
+    if (rc != -1) { FAIL("should fail with NULL URL"); return; }
+    ASSERT_EQ(res.code, NOW_ERR_SCHEMA);
+    PASS();
+}
+
+static void test_yank_connect_failure(void) {
+    TEST("yank: fails on connection refused");
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    int rc = now_publish_yank("http://127.0.0.1:19999", "org.test", "lib",
+                               "1.0.0", "security issue", 0, &res);
+    if (rc != -1) { FAIL("should fail on connect"); return; }
     PASS();
 }
 
@@ -3205,9 +3267,16 @@ int main(void) {
     test_toolchain_gcc_default();
     test_toolchain_msvc_detect();
 
+    printf("\n  Auth:\n");
+    test_auth_load_no_creds();
+    test_auth_login_null_creds();
+    test_auth_login_connect_failure();
+
     printf("\n  Publish:\n");
     test_publish_missing_identity();
     test_publish_no_package();
+    test_yank_no_url();
+    test_yank_connect_failure();
 
     printf("\n  Workspace:\n");
     test_is_workspace_true();

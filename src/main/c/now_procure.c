@@ -10,6 +10,8 @@
 #include "now_fs.h"
 #include "now_version.h"
 #include "now_manifest.h"
+#include "now_auth.h"
+#include "now_trust.h"
 #include "pico_http.h"
 
 #include <stdio.h>
@@ -277,6 +279,7 @@ NOW_API int now_registry_download(const char *registry_url,
                                    const char *group, const char *artifact,
                                    const char *version, const char *filename,
                                    const char *dest_path,
+                                   const char *auth_token,
                                    NowResult *result) {
     char *host = NULL;
     char *base_path = NULL;
@@ -303,8 +306,23 @@ NOW_API int now_registry_download(const char *registry_url,
         return -1;
     }
 
+    /* Build options with auth header if provided */
+    PicoHttpHeader headers[1];
+    int nhdr = 0;
+    char auth_buf[1024];
+    if (auth_token && *auth_token) {
+        snprintf(auth_buf, sizeof(auth_buf), "Bearer %s", auth_token);
+        headers[nhdr].name  = "Authorization";
+        headers[nhdr].value = auth_buf;
+        nhdr++;
+    }
+
+    PicoHttpOptions opts = {0};
+    opts.headers = headers;
+    opts.header_count = (size_t)nhdr;
+
     PicoHttpResponse res;
-    int rc = pico_http_get_stream(host, port, path, NULL, &res,
+    int rc = pico_http_get_stream(host, port, path, &opts, &res,
                                   write_to_file, f);
     free(host);
     free(base_path);
@@ -455,12 +473,37 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         return -1;
     }
 
-    /* Step 2: Determine registry URL */
+    /* Step 2: Determine registry URL and authenticate */
     const char *registry_url = "http://localhost:8080";
     if (project->repos.count > 0 && project->repos.items[0].url)
         registry_url = project->repos.items[0].url;
 
     int offline = (opts && opts->offline);
+
+    /* Auth: load credentials and exchange for JWT if username is present */
+    NowCredentials creds;
+    char *jwt = NULL;
+    if (!offline && now_auth_load(registry_url, &creds) == 0) {
+        if (creds.username) {
+            char *host = NULL;
+            char *base_path = NULL;
+            int port = 80, tls = 0;
+            if (pico_http_parse_url_ex(registry_url, &host, &port,
+                                        &base_path, &tls) == 0) {
+                /* Strip trailing slash from prefix */
+                char *prefix = base_path ? base_path : strdup("");
+                size_t plen = strlen(prefix);
+                while (plen > 0 && prefix[plen - 1] == '/') prefix[--plen] = '\0';
+                now_auth_login(host, port, prefix, &creds, tls, &jwt, result);
+                free(prefix);
+            }
+            free(host);
+        }
+        /* If no username, use raw token as Bearer (backward compat) */
+        if (!jwt && creds.token)
+            jwt = strdup(creds.token);
+        now_auth_creds_free(&creds);
+    }
 
     /* Step 3: For each resolved dep, ensure it's installed */
     for (size_t i = 0; i < lockfile.count; i++) {
@@ -557,8 +600,20 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
             now_registry_download(registry_url,
                                   entry->group, entry->artifact,
                                   entry->version, "now.pasta",
-                                  desc_dest, result);
+                                  desc_dest, jwt, result);
             free(desc_dest);
+        }
+
+        /* Download the .sha256 sidecar first (needed for verification) */
+        char sha_name[256];
+        snprintf(sha_name, sizeof(sha_name), "%s-%s.sha256",
+                 entry->artifact, entry->version);
+        char *sha_dest = now_path_join(dep_dir, sha_name);
+        if (sha_dest) {
+            now_registry_download(registry_url,
+                                  entry->group, entry->artifact,
+                                  entry->version, sha_name,
+                                  sha_dest, jwt, result);
         }
 
         /* Download the archive */
@@ -570,49 +625,114 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
             if (now_registry_download(registry_url,
                                       entry->group, entry->artifact,
                                       entry->version, archive_name,
-                                      archive_dest, result) == 0) {
-                /* Verify SHA-256 if we have it */
-                if (entry->sha256 && strlen(entry->sha256) > 0) {
-                    char *actual = now_sha256_file(archive_dest);
-                    if (actual && strcmp(actual, entry->sha256) != 0) {
-                        if (result)
-                            snprintf(result->message, sizeof(result->message),
-                                     "SHA-256 mismatch for %s:%s:%s "
-                                     "(expected %s, got %s)",
-                                     entry->group, entry->artifact,
-                                     entry->version, entry->sha256, actual);
+                                      archive_dest, jwt, result) == 0) {
+                /* Verify SHA-256 against sidecar file */
+                char *actual = now_sha256_file(archive_dest);
+                if (actual) {
+                    int sha_ok = 1;
+
+                    /* Check against .sha256 sidecar if downloaded */
+                    if (sha_dest && now_path_exists(sha_dest)) {
+                        FILE *sf = fopen(sha_dest, "r");
+                        if (sf) {
+                            char expected[128] = {0};
+                            if (fgets(expected, sizeof(expected), sf)) {
+                                /* Strip trailing whitespace/newline */
+                                size_t elen = strlen(expected);
+                                while (elen > 0 && (expected[elen-1] == '\n' ||
+                                       expected[elen-1] == '\r' ||
+                                       expected[elen-1] == ' '))
+                                    expected[--elen] = '\0';
+
+                                if (elen > 0 && strcmp(actual, expected) != 0) {
+                                    if (result) {
+                                        result->code = NOW_ERR_IO;
+                                        snprintf(result->message, sizeof(result->message),
+                                                 "SHA-256 mismatch for %s:%s:%s "
+                                                 "(sidecar %s, actual %s)",
+                                                 entry->group, entry->artifact,
+                                                 entry->version, expected, actual);
+                                    }
+                                    sha_ok = 0;
+                                }
+                            }
+                            fclose(sf);
+                        }
+                    }
+
+                    /* Also check against lock file SHA if present */
+                    if (sha_ok && entry->sha256 && strlen(entry->sha256) > 0) {
+                        if (strcmp(actual, entry->sha256) != 0) {
+                            if (result) {
+                                result->code = NOW_ERR_IO;
+                                snprintf(result->message, sizeof(result->message),
+                                         "SHA-256 mismatch for %s:%s:%s "
+                                         "(lock %s, actual %s)",
+                                         entry->group, entry->artifact,
+                                         entry->version, entry->sha256, actual);
+                            }
+                            sha_ok = 0;
+                        }
+                    }
+
+                    if (!sha_ok) {
                         free(actual);
+                        remove(archive_dest);
                         free(archive_dest);
+                        free(sha_dest);
                         free(dep_dir);
                         now_resolver_free(&resolver);
                         now_lock_free(&lockfile);
                         free(repo_root);
                         free(lock_path);
+                        free(jwt);
                         return -1;
                     }
-                    free(actual);
-                }
 
-                /* Compute and store SHA-256 if not already known */
-                if (!entry->sha256 || strlen(entry->sha256) == 0) {
-                    free(entry->sha256);
-                    entry->sha256 = now_sha256_file(archive_dest);
+                    /* Store SHA-256 in lock entry */
+                    if (!entry->sha256 || strlen(entry->sha256) == 0) {
+                        free(entry->sha256);
+                        entry->sha256 = actual;
+                        actual = NULL;
+                    }
+                    free(actual);
                 }
             }
             free(archive_dest);
         }
+        free(sha_dest);
 
-        /* Download the .sha256 sidecar */
-        char sha_name[256];
-        snprintf(sha_name, sizeof(sha_name), "%s-%s.sha256",
-                 entry->artifact, entry->version);
-        char *sha_dest = now_path_join(dep_dir, sha_name);
-        if (sha_dest) {
-            now_registry_download(registry_url,
-                                  entry->group, entry->artifact,
-                                  entry->version, sha_name,
-                                  sha_dest, result);
-            free(sha_dest);
+        /* Download .sig if require_signatures is set */
+        NowTrustPolicy trust_policy = now_trust_policy_from_project(project);
+        if (trust_policy.require_signatures) {
+            char sig_name[256];
+            snprintf(sig_name, sizeof(sig_name), "%s-%s.sig",
+                     entry->artifact, entry->version);
+            char *sig_dest = now_path_join(dep_dir, sig_name);
+            if (sig_dest) {
+                int sig_rc = now_registry_download(registry_url,
+                                      entry->group, entry->artifact,
+                                      entry->version, sig_name,
+                                      sig_dest, jwt, result);
+                if (sig_rc != 0) {
+                    if (result) {
+                        result->code = NOW_ERR_AUTH;
+                        snprintf(result->message, sizeof(result->message),
+                                 "require_signatures is set but %s:%s:%s "
+                                 "has no .sig file on registry",
+                                 entry->group, entry->artifact, entry->version);
+                    }
+                    free(sig_dest);
+                    free(dep_dir);
+                    now_resolver_free(&resolver);
+                    now_lock_free(&lockfile);
+                    free(repo_root);
+                    free(lock_path);
+                    free(jwt);
+                    return -1;
+                }
+                free(sig_dest);
+            }
         }
 
         /* Build the URL for the lock file */
@@ -639,5 +759,6 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
     now_lock_free(&lockfile);
     free(repo_root);
     free(lock_path);
+    free(jwt);
     return 0;
 }
