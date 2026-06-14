@@ -3291,10 +3291,11 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
             for (size_t i = 0; i < ctx->objects.count; i++)
                 argv[argc++] = ctx->objects.paths[i];
 
-            /* Library directories: /LIBPATH:dir */
-            char *libdir_bufs[32];
+            /* Library directories: /LIBPATH:dir. Heap-sized to the count
+             * (a fixed cap dropped the tail on large workspaces). */
+            char **libdir_bufs = (char **)malloc((p->link.libdirs.count + 1) * sizeof(char *));
             size_t nlibdir = 0;
-            for (size_t i = 0; i < p->link.libdirs.count && nlibdir < 32; i++) {
+            for (size_t i = 0; libdir_bufs && i < p->link.libdirs.count; i++) {
                 char *full = now_path_join(basedir, p->link.libdirs.items[i]);
                 if (full) {
                     size_t len = strlen(full) + 12;
@@ -3312,10 +3313,10 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
             for (size_t i = 0; i < ctx->dep_libdirs.count; i++)
                 argv[argc++] = ctx->dep_libdirs.paths[i];
 
-            /* Libraries: name.lib */
-            char *lib_bufs[64];
+            /* Libraries: name.lib (heap-sized to the count) */
+            char **lib_bufs = (char **)malloc((p->link.libs.count + 1) * sizeof(char *));
             size_t nlib = 0;
-            for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+            for (size_t i = 0; lib_bufs && i < p->link.libs.count; i++) {
                 size_t len = strlen(p->link.libs.items[i]) + 5;
                 lib_bufs[nlib] = malloc(len);
                 if (lib_bufs[nlib]) {
@@ -3336,6 +3337,8 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
 
             for (size_t i = 0; i < nlibdir; i++) free(libdir_bufs[i]);
             for (size_t i = 0; i < nlib; i++)    free(lib_bufs[i]);
+            free(libdir_bufs);
+            free(lib_bufs);
             free(argv);
 
             if (rc != 0) {
@@ -3415,10 +3418,13 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
             for (size_t i = 0; i < ctx->objects.count; i++)
                 argv[argc++] = ctx->objects.paths[i];
 
-            /* Library directories: -L prepended */
-            char *libdir_bufs[32];
+            /* Library directories: -L prepended. Heap-sized to the
+             * libdir count — a fixed cap here silently dropped the tail
+             * of large workspaces (starletc: 34 sibling libdirs lost the
+             * last two, so -lstarletc_ide linked with no matching -L). */
+            char **libdir_bufs = (char **)malloc((p->link.libdirs.count + 1) * sizeof(char *));
             size_t nlibdir = 0;
-            for (size_t i = 0; i < p->link.libdirs.count && nlibdir < 32; i++) {
+            for (size_t i = 0; libdir_bufs && i < p->link.libdirs.count; i++) {
                 char *full = now_path_join(basedir, p->link.libdirs.items[i]);
                 if (full) {
                     size_t len = strlen(full) + 3;
@@ -3442,8 +3448,9 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
                 if (arc) argv[argc++] = arc;
             }
 
-            /* Libraries: -l prepended */
-            char *lib_bufs[64];
+            /* Libraries: -l prepended. Heap-sized to the lib count for
+             * the same reason as libdirs above. */
+            char **lib_bufs = (char **)malloc((p->link.libs.count + 1) * sizeof(char *));
             size_t nlib = 0;
             /* GNU ld is single-pass: if A depends on B, A must be -l'd
              * before B on the command line. Workspace dep order doesn't
@@ -3456,7 +3463,7 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
             use_group = 0;
 #endif
             if (use_group) argv[argc++] = "-Wl,--start-group";
-            for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+            for (size_t i = 0; lib_bufs && i < p->link.libs.count; i++) {
                 size_t len = strlen(p->link.libs.items[i]) + 3;
                 lib_bufs[nlib] = malloc(len);
                 if (lib_bufs[nlib]) {
@@ -3509,6 +3516,8 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
 
             for (size_t i = 0; i < nlibdir; i++) free(libdir_bufs[i]);
             for (size_t i = 0; i < nlib; i++)    free(lib_bufs[i]);
+            free(libdir_bufs);
+            free(lib_bufs);
             free(argv);
 
             if (rc != 0) {
@@ -3918,7 +3927,12 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                 const char **largv = (const char **)malloc(lneed * sizeof(char *));
                 if (!largv) { fail++; continue; }
                 int largc = 0;
-                char *lbufs[64];
+                /* One buffer pool shared by libdirs + libs; heap-sized to
+                 * their combined count so large workspaces don't lose the
+                 * tail (same cap bug as the main link path). */
+                char **lbufs = (char **)malloc(
+                    (p->link.libdirs.count + p->link.libs.count + 1) * sizeof(char *));
+                if (!lbufs) { free(largv); fail++; continue; }
                 size_t nl = 0;
 
                 if (ctx->toolchain.is_msvc) {
@@ -3933,7 +3947,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                         largv[largc++] = ctx->objects.paths[i];
                     }
                     /* link.libdirs → /LIBPATH: */
-                    for (size_t i = 0; i < p->link.libdirs.count && nl < 64; i++) {
+                    for (size_t i = 0; i < p->link.libdirs.count; i++) {
                         char *full = now_path_join(basedir, p->link.libdirs.items[i]);
                         if (!full) continue;
                         size_t len = strlen(full) + 12;
@@ -3948,7 +3962,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                     /* dep_libdirs from procure (pre-formatted) */
                     for (size_t i = 0; i < ctx->dep_libdirs.count; i++)
                         largv[largc++] = ctx->dep_libdirs.paths[i];
-                    for (size_t i = 0; i < p->link.libs.count && nl < 64; i++) {
+                    for (size_t i = 0; i < p->link.libs.count; i++) {
                         size_t len = strlen(p->link.libs.items[i]) + 5;
                         lbufs[nl] = malloc(len);
                         if (lbufs[nl]) {
@@ -3969,7 +3983,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                         largv[largc++] = ctx->objects.paths[i];
                     }
                     /* link.libdirs → -L */
-                    for (size_t i = 0; i < p->link.libdirs.count && nl < 64; i++) {
+                    for (size_t i = 0; i < p->link.libdirs.count; i++) {
                         char *full = now_path_join(basedir, p->link.libdirs.items[i]);
                         if (!full) continue;
                         size_t len = strlen(full) + 3;
@@ -3984,7 +3998,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                     /* dep_libdirs from procure (pre-formatted) */
                     for (size_t i = 0; i < ctx->dep_libdirs.count; i++)
                         largv[largc++] = ctx->dep_libdirs.paths[i];
-                    for (size_t i = 0; i < p->link.libs.count && nl < 64; i++) {
+                    for (size_t i = 0; i < p->link.libs.count; i++) {
                         size_t len = strlen(p->link.libs.items[i]) + 3;
                         lbufs[nl] = malloc(len);
                         if (lbufs[nl]) {
@@ -4003,6 +4017,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
 
                 int link_rc = now_exec(largv, ctx->verbose);
                 for (size_t i = 0; i < nl; i++) free(lbufs[i]);
+                free(lbufs);
                 free(largv);
 
                 if (link_rc != 0) {
@@ -4113,7 +4128,20 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         return -1;
     }
     int argc = 0;
-    char *lib_bufs[64];
+    /* One buffer pool shared by libdirs + libs; heap-sized to their
+     * combined count so large workspaces don't lose the tail. */
+    char **lib_bufs = (char **)malloc(
+        (p->link.libdirs.count + p->link.libs.count + 1) * sizeof(char *));
+    if (!lib_bufs) {
+        free(argv);
+        now_filelist_free(&test_objects);
+        if (result) {
+            result->code = NOW_ERR_TOOL;
+            snprintf(result->message, sizeof(result->message),
+                     "out of memory linking test binary");
+        }
+        return -1;
+    }
     size_t nlib = 0;
 
     if (ctx->toolchain.is_msvc) {
@@ -4132,7 +4160,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             argv[argc++] = ctx->objects.paths[i];
         }
 
-        for (size_t i = 0; i < p->link.libdirs.count && nlib < 64; i++) {
+        for (size_t i = 0; i < p->link.libdirs.count; i++) {
             char *full = now_path_join(basedir, p->link.libdirs.items[i]);
             if (!full) continue;
             size_t len = strlen(full) + 12;
@@ -4147,7 +4175,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         for (size_t i = 0; i < ctx->dep_libdirs.count; i++)
             argv[argc++] = ctx->dep_libdirs.paths[i];
 
-        for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+        for (size_t i = 0; i < p->link.libs.count; i++) {
             size_t len = strlen(p->link.libs.items[i]) + 5;
             lib_bufs[nlib] = malloc(len);
             if (lib_bufs[nlib]) {
@@ -4175,7 +4203,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             argv[argc++] = ctx->objects.paths[i];
         }
 
-        for (size_t i = 0; i < p->link.libdirs.count && nlib < 64; i++) {
+        for (size_t i = 0; i < p->link.libdirs.count; i++) {
             char *full = now_path_join(basedir, p->link.libdirs.items[i]);
             if (!full) continue;
             size_t len = strlen(full) + 3;
@@ -4190,7 +4218,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         for (size_t i = 0; i < ctx->dep_libdirs.count; i++)
             argv[argc++] = ctx->dep_libdirs.paths[i];
 
-        for (size_t i = 0; i < p->link.libs.count && nlib < 64; i++) {
+        for (size_t i = 0; i < p->link.libs.count; i++) {
             size_t len = strlen(p->link.libs.items[i]) + 3;
             lib_bufs[nlib] = malloc(len);
             if (lib_bufs[nlib]) {
@@ -4210,6 +4238,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
     rc = now_exec(argv, ctx->verbose);
 
     for (size_t i = 0; i < nlib; i++) free(lib_bufs[i]);
+    free(lib_bufs);
     free(argv);
     now_filelist_free(&test_objects);
 

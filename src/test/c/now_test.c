@@ -2813,6 +2813,107 @@ static void test_workspace_inject_sibling(void) {
     PASS();
 }
 
+/* Regression for the link-phase libdir/lib cap (starletc BLOCKER):
+ * an executable depending on >32 sibling static libs had its 33rd+
+ * injected -L<dir> silently dropped, so the matching -l resolved
+ * against nothing ("cannot find -lXXX"). Inject was correct — the cap
+ * was in the link argv builder — so this must actually link to catch
+ * it. Generates a workspace of 35 trivial static libs + one exe that
+ * depends on all of them. */
+static void test_workspace_libdir_cap(void) {
+    TEST("workspace: >32 sibling libdirs all reach the link line");
+
+    enum { NLIB = 35 };
+    char root[512];
+    snprintf(root, sizeof(root), "%s/ws_libcap", NOW_TEST_RESOURCES);
+    rmtree_best_effort(root);
+    now_mkdir_p(root);
+
+    char p[700], f[900];
+    FILE *fp;
+
+    /* NLIB trivial static-lib modules: libNN/ with one unique symbol. */
+    for (int i = 0; i < NLIB; i++) {
+        snprintf(p, sizeof(p), "%s/lib%02d/src/main/c", root, i);
+        now_mkdir_p(p);
+        snprintf(f, sizeof(f), "%s/lib%02d/src/main/c/a.c", root, i);
+        fp = fopen(f, "w");
+        if (!fp) { FAIL("setup lib src"); return; }
+        fprintf(fp, "int wscaplib%02d_fn(void){return %d;}\n", i, i);
+        fclose(fp);
+
+        snprintf(f, sizeof(f), "%s/lib%02d/now.pasta", root, i);
+        fp = fopen(f, "w");
+        if (!fp) { FAIL("setup lib pasta"); return; }
+        fprintf(fp,
+            "{ group: \"org.test\", artifact: \"wscaplib%02d\", version: \"1\","
+            "  langs: [\"c\"],"
+            "  output: { type: \"static\", name: \"wscaplib%02d\" } }\n", i, i);
+        fclose(fp);
+    }
+
+    /* The executable consumer depending on every lib. */
+    snprintf(p, sizeof(p), "%s/app/src/main/c", root);
+    now_mkdir_p(p);
+    snprintf(f, sizeof(f), "%s/app/src/main/c/main.c", root);
+    fp = fopen(f, "w");
+    if (!fp) { FAIL("setup app main"); return; }
+    fputs("int main(void){return 0;}\n", fp);
+    fclose(fp);
+
+    snprintf(f, sizeof(f), "%s/app/now.pasta", root);
+    fp = fopen(f, "w");
+    if (!fp) { FAIL("setup app pasta"); return; }
+    fputs("{ group: \"org.test\", artifact: \"wscapapp\", version: \"1\","
+          "  langs: [\"c\"],"
+          "  output: { type: \"executable\", name: \"wscapapp\" },"
+          "  depends: [", fp);
+    for (int i = 0; i < NLIB; i++)
+        fprintf(fp, "%s { id: \"org.test:wscaplib%02d:*\" }",
+                i ? "," : "", i);
+    fputs(" ] }\n", fp);
+    fclose(fp);
+
+    /* Root workspace listing all libs (in order) then the app. */
+    snprintf(f, sizeof(f), "%s/now.pasta", root);
+    fp = fopen(f, "w");
+    if (!fp) { FAIL("setup root pasta"); return; }
+    fputs("{ group: \"org.test\", artifact: \"wscap\", version: \"1\","
+          "  langs: [\"c\"], modules: [", fp);
+    for (int i = 0; i < NLIB; i++)
+        fprintf(fp, "%s \"lib%02d\"", i ? "," : "", i);
+    fputs(", \"app\" ] }\n", fp);
+    fclose(fp);
+
+    NowResult res;
+    NowProject *prj = now_project_load(f, &res);
+    if (!prj) { FAIL(res.message); return; }
+
+    NowWorkspace ws;
+    int rc = now_workspace_init(&ws, prj, root, &res);
+    if (rc != 0) { FAIL(res.message); now_project_free(prj); return; }
+    rc = now_workspace_build(&ws, 0, 0, &res);
+    now_workspace_free(&ws);
+    now_project_free(prj);
+
+    if (rc != 0) {
+        /* Pre-fix: link fails with "cannot find -lwscaplib32".. */
+        FAIL(res.message[0] ? res.message : "workspace build failed");
+        return;
+    }
+
+    char exe[700];
+#ifdef _WIN32
+    snprintf(exe, sizeof(exe), "%s/app/target/bin/wscapapp.exe", root);
+#else
+    snprintf(exe, sizeof(exe), "%s/app/target/bin/wscapapp", root);
+#endif
+    if (!now_path_exists(exe)) { FAIL("app exe not produced"); return; }
+
+    rmtree_best_effort(root);
+    PASS();
+}
+
 /* ---- Plugin system ---- */
 
 static void test_plugin_is_builtin(void) {
@@ -6914,6 +7015,7 @@ int main(void) {
     test_workspace_init();
     test_workspace_topo_sort();
     test_workspace_inject_sibling();
+    test_workspace_libdir_cap();
 
     printf("\n  Plugins:\n");
     test_plugin_is_builtin();
