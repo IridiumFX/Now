@@ -1118,6 +1118,25 @@ static int         g_default_target_set = 0;
 static char      **g_default_tags;
 static size_t      g_default_tag_count;
 
+/* Return the portion of `src` relative to `dir` (dir prefix stripped).
+ * Comparison is lenient across '/' vs '\' so callers may mix native
+ * and pasta-style separators. Returns `src` unchanged if it is not
+ * under `dir`. Used to root sources.pattern / sources.exclude globs at
+ * sources.dir per spec §26.2. */
+static const char *path_rel_to_dir(const char *src, const char *dir) {
+    if (!dir || !*dir) return src;
+    size_t dl = strlen(dir);
+    size_t k = 0;
+    for (; k < dl && src[k]; k++) {
+        char a = src[k] == '\\' ? '/' : src[k];
+        char b = dir[k]  == '\\' ? '/' : dir[k];
+        if (a != b) return src;
+    }
+    if (k == dl && (src[dl] == '/' || src[dl] == '\\'))
+        return src + dl + 1;
+    return src;
+}
+
 NOW_API int now_build_init(NowBuildCtx *ctx, const NowProject *project,
                    const char *basedir, NowResult *result) {
     memset(ctx, 0, sizeof(*ctx));
@@ -1223,6 +1242,26 @@ NOW_API int now_build_init(NowBuildCtx *ctx, const NowProject *project,
                      "cannot scan source directory: %s", src_dir);
         }
         return -1;
+    }
+
+    /* Apply sources.pattern (glob, rooted at sources.dir) to the
+     * project's own discovered sources. Spec §1.3 resolution order is
+     * pattern -> include -> exclude; this is the pattern step. With no
+     * pattern, the extension-based candidate set from discovery stands.
+     * The pattern narrows that set (a file must match both a source
+     * extension and the pattern). Module/component sources are merged
+     * in below, AFTER this filter, so they keep their own layout. */
+    if (project->sources.pattern && *project->sources.pattern) {
+        size_t w = 0;
+        for (size_t i = 0; i < ctx->sources.count; i++) {
+            const char *rel = path_rel_to_dir(ctx->sources.paths[i], src_dir);
+            if (now_glob_match(project->sources.pattern, rel)) {
+                ctx->sources.paths[w++] = ctx->sources.paths[i];
+            } else {
+                free(ctx->sources.paths[i]);
+            }
+        }
+        ctx->sources.count = w;
     }
 
     /* Append explicit sources.include entries */
@@ -2488,20 +2527,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
          * normalizes separators, so pass the prefix-stripped path. */
         int excluded = 0;
         if (p->sources.exclude.count > 0) {
-            const char *rel = src;
-            const char *src_dir_rel = p->sources.dir;
-            if (src_dir_rel && *src_dir_rel) {
-                size_t dl = strlen(src_dir_rel);
-                /* Compare leniently across separator styles. */
-                size_t k = 0;
-                for (; k < dl && src[k]; k++) {
-                    char a = src[k] == '\\' ? '/' : src[k];
-                    char b = src_dir_rel[k] == '\\' ? '/' : src_dir_rel[k];
-                    if (a != b) break;
-                }
-                if (k == dl && (src[dl] == '/' || src[dl] == '\\'))
-                    rel = src + dl + 1;
-            }
+            const char *rel = path_rel_to_dir(src, p->sources.dir);
             for (size_t ex = 0; ex < p->sources.exclude.count; ex++) {
                 if (now_glob_match(p->sources.exclude.items[ex], rel)) {
                     excluded = 1;

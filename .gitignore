@@ -20,3 +20,4 @@ target/
 src/test/resources/arch_tree/
 src/test/resources/arch_build/
 src/test/resources/exclude_proj/
+src/test/resources/pattern_proj/

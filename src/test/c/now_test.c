@@ -52,6 +52,7 @@
 
 /* Shared test helpers defined later in the file. */
 static void rmtree_best_effort(const char *path);
+static int  write_empty(const char *path);
 
 static int tests_run    = 0;
 static int tests_passed = 0;
@@ -1504,6 +1505,59 @@ static void test_build_exclude_glob(void) {
     }
 
     rmtree_best_effort(target);
+    PASS();
+}
+
+/* sources.pattern selects the candidate set (spec §1.3 resolution
+ * order: pattern -> include -> exclude). Verified by inspecting the
+ * sources now_build_init discovers — no compiler needed. */
+static void test_build_pattern_filter(void) {
+    TEST("build: sources.pattern narrows discovery (keep/**.c)");
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/pattern_proj", NOW_TEST_RESOURCES);
+    char csrc[512];
+    snprintf(csrc, sizeof(csrc), "%s/src/main/c", root);
+    rmtree_best_effort(csrc);
+
+    char dir[512];
+    now_mkdir_p(csrc);
+    snprintf(dir, sizeof(dir), "%s/src/main/c/keep", root); now_mkdir_p(dir);
+    snprintf(dir, sizeof(dir), "%s/src/main/c/skip", root); now_mkdir_p(dir);
+
+    char p[512];
+    snprintf(p, sizeof(p), "%s/src/main/c/top.c", root);       write_empty(p);
+    snprintf(p, sizeof(p), "%s/src/main/c/keep/a.c", root);    write_empty(p);
+    snprintf(p, sizeof(p), "%s/src/main/c/skip/b.c", root);    write_empty(p);
+
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"pat\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"pat\" },"
+        "  sources: { dir: \"src/main/c\", pattern: \"keep/**.c\" } }";
+
+    NowResult res;
+    NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+
+    NowBuildCtx ctx;
+    int rc = now_build_init(&ctx, prj, root, &res);
+    if (rc != 0) { FAIL(res.message); now_project_free(prj); return; }
+
+    int has_top = 0, has_keep = 0, has_skip = 0;
+    for (size_t i = 0; i < ctx.sources.count; i++) {
+        const char *path = ctx.sources.paths[i];
+        if (strstr(path, "top.c")) has_top = 1;
+        if (strstr(path, "a.c"))   has_keep = 1;
+        if (strstr(path, "b.c"))   has_skip = 1;
+    }
+    ASSERT_EQ(has_keep, 1);   /* keep/a.c matches keep/**.c */
+    ASSERT_EQ(has_top, 0);    /* top.c at root — not under keep/ */
+    ASSERT_EQ(has_skip, 0);   /* skip/b.c — different subtree */
+
+    now_build_free(&ctx);
+    now_project_free(prj);
+    rmtree_best_effort(csrc);
     PASS();
 }
 
@@ -7152,6 +7206,7 @@ int main(void) {
     printf("\n  Build integration:\n");
     test_build_hello();
     test_build_exclude_glob();
+    test_build_pattern_filter();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 
