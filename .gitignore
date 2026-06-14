@@ -19,3 +19,4 @@ target/
 # layout collisions across platforms.
 src/test/resources/arch_tree/
 src/test/resources/arch_build/
+src/test/resources/exclude_proj/

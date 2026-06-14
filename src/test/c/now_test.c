@@ -50,6 +50,9 @@
   #define NOW_TEST_RESOURCES "."
 #endif
 
+/* Shared test helpers defined later in the file. */
+static void rmtree_best_effort(const char *path);
+
 static int tests_run    = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -422,6 +425,89 @@ static void test_fs_obj_path(void) {
         return;
     }
     free(obj);
+    PASS();
+}
+
+/* ---- Glob matching (spec §26) ---- */
+
+static void test_glob_star_basename(void) {
+    TEST("glob: * matches within a segment, basename rule");
+    /* No '/' in pattern → matches the basename only. */
+    ASSERT_EQ(now_glob_match("*.c", "foo.c"), 1);
+    ASSERT_EQ(now_glob_match("*.c", "sub/foo.c"), 1);   /* basename foo.c */
+    ASSERT_EQ(now_glob_match("*.c", "foo.h"), 0);
+    ASSERT_EQ(now_glob_match("*.c", "foo.c.o"), 0);     /* must end at .c */
+    PASS();
+}
+
+static void test_glob_doublestar_suffix(void) {
+    TEST("glob: **.c crosses segments");
+    ASSERT_EQ(now_glob_match("**.c", "foo.c"), 1);
+    ASSERT_EQ(now_glob_match("**.c", "sub/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("**.c", "a/b/c/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("**.c", "foo.h"), 0);
+    PASS();
+}
+
+static void test_glob_doublestar_slash_zero(void) {
+    TEST("glob: **/foo.c matches zero or more dirs");
+    ASSERT_EQ(now_glob_match("**/foo.c", "foo.c"), 1);   /* zero dirs */
+    ASSERT_EQ(now_glob_match("**/foo.c", "sub/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("**/foo.c", "a/b/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("**/foo.c", "foo.h"), 0);
+    PASS();
+}
+
+static void test_glob_doublestar_middle(void) {
+    TEST("glob: src/**/foo.c anchored prefix + middle **");
+    ASSERT_EQ(now_glob_match("src/**/foo.c", "src/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("src/**/foo.c", "src/a/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("src/**/foo.c", "src/a/b/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("src/**/foo.c", "other/foo.c"), 0);
+    PASS();
+}
+
+static void test_glob_single_star_no_cross_slash(void) {
+    TEST("glob: single * does not cross /");
+    /* Pattern has '/', so matched against full path. */
+    ASSERT_EQ(now_glob_match("src/*.c", "src/foo.c"), 1);
+    ASSERT_EQ(now_glob_match("src/*.c", "src/sub/foo.c"), 0);
+    PASS();
+}
+
+static void test_glob_question_and_class(void) {
+    TEST("glob: ? and [..] character classes");
+    ASSERT_EQ(now_glob_match("f?o.c", "foo.c"), 1);
+    ASSERT_EQ(now_glob_match("f?o.c", "fo.c"), 0);      /* ? needs one char */
+    ASSERT_EQ(now_glob_match("foo.[ch]", "foo.c"), 1);
+    ASSERT_EQ(now_glob_match("foo.[ch]", "foo.h"), 1);
+    ASSERT_EQ(now_glob_match("foo.[ch]", "foo.o"), 0);
+    ASSERT_EQ(now_glob_match("foo.[a-z]", "foo.q"), 1);
+    ASSERT_EQ(now_glob_match("foo.[!ch]", "foo.o"), 1); /* negated */
+    ASSERT_EQ(now_glob_match("foo.[!ch]", "foo.c"), 0);
+    PASS();
+}
+
+static void test_glob_double_extension(void) {
+    TEST("glob: dots are literal (double-extension objects)");
+    ASSERT_EQ(now_glob_match("**.c.o", "target/obj/parser.c.o"), 1);
+    ASSERT_EQ(now_glob_match("**.c.o", "target/obj/parser.s.o"), 0);
+    ASSERT_EQ(now_glob_match("**/*.o", "target/obj/parser.c.o"), 1);
+    PASS();
+}
+
+static void test_glob_escape_and_literal(void) {
+    TEST("glob: escape + plain literal match");
+    ASSERT_EQ(now_glob_match("foo.c", "foo.c"), 1);
+    ASSERT_EQ(now_glob_match("a\\*b", "a*b"), 1);       /* escaped star = literal */
+    ASSERT_EQ(now_glob_match("a\\*b", "axb"), 0);
+    PASS();
+}
+
+static void test_glob_backslash_path_normalized(void) {
+    TEST("glob: backslash path separators are normalized");
+    ASSERT_EQ(now_glob_match("src/*.c", "src\\foo.c"), 1);
+    ASSERT_EQ(now_glob_match("**/foo.c", "a\\b\\foo.c"), 1);
     PASS();
 }
 
@@ -1345,6 +1431,79 @@ static void test_build_hello(void) {
         FAIL("output binary not found");
         return;
     }
+    PASS();
+}
+
+/* Two-sided proof that sources.exclude is glob-matched end-to-end
+ * through the build loop. The excluded files contain a #error, so:
+ *   - with the glob exclude, they are skipped → build succeeds
+ *   - without it, they compile → #error → build fails
+ * This is layout-independent (no assumptions about target/obj paths)
+ * and exercises the §26.2 base-path rooting (pattern relative to
+ * sources.dir, while discovered paths include the dir prefix). */
+static void test_build_exclude_glob(void) {
+    TEST("build: sources.exclude is glob-matched (vendor/**.c)");
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/exclude_proj", NOW_TEST_RESOURCES);
+    char csrc[512];
+    snprintf(csrc, sizeof(csrc), "%s/src/main/c", root);
+    char target[512];
+    snprintf(target, sizeof(target), "%s/target", root);
+
+    rmtree_best_effort(csrc);
+    rmtree_best_effort(target);
+
+    char dir[512];
+    now_mkdir_p(csrc);
+    snprintf(dir, sizeof(dir), "%s/src/main/c/vendor/sqlite", root);
+    now_mkdir_p(dir);
+
+    char p[512];
+    FILE *f;
+    snprintf(p, sizeof(p), "%s/src/main/c/keep.c", root);
+    f = fopen(p, "w"); if (!f) { FAIL("setup keep.c"); return; }
+    fputs("int keep_fn(void) { return 42; }\n", f); fclose(f);
+
+    /* Broken sources under vendor/ — compile iff NOT excluded. */
+    snprintf(p, sizeof(p), "%s/src/main/c/vendor/sqlite/amalg.c", root);
+    f = fopen(p, "w"); if (!f) { FAIL("setup amalg.c"); return; }
+    fputs("#error this file should have been excluded\n", f); fclose(f);
+
+    /* Static lib output — no main() / link entry point needed. */
+    const char *pasta_excl =
+        "{ group: \"org.test\", artifact: \"excl\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"excl\" },"
+        "  sources: { dir: \"src/main/c\", exclude: [\"vendor/**.c\"] } }";
+
+    NowResult res;
+    NowProject *prj = now_project_load_string(pasta_excl, strlen(pasta_excl), &res);
+    if (!prj) { FAIL(res.message); return; }
+    int rc_excl = now_build(prj, root, 0, 0, &res);
+    now_project_free(prj);
+    if (rc_excl != 0) {
+        FAIL("build failed despite vendor/**.c exclude (glob not applied?)");
+        return;
+    }
+
+    /* Negative control: same tree, no exclude → the #error must bite. */
+    rmtree_best_effort(target);
+    const char *pasta_noexcl =
+        "{ group: \"org.test\", artifact: \"excl\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"excl\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+    NowProject *prj2 = now_project_load_string(pasta_noexcl, strlen(pasta_noexcl), &res);
+    if (!prj2) { FAIL(res.message); return; }
+    int rc_noexcl = now_build(prj2, root, 0, 0, &res);
+    now_project_free(prj2);
+    if (rc_noexcl == 0) {
+        FAIL("build succeeded without exclude — broken vendor file was not compiled");
+        return;
+    }
+
+    rmtree_best_effort(target);
     PASS();
 }
 
@@ -6584,6 +6743,17 @@ int main(void) {
     test_lang_classify_unknown();
     test_lang_source_exts();
 
+    printf("\n  Glob matching:\n");
+    test_glob_star_basename();
+    test_glob_doublestar_suffix();
+    test_glob_doublestar_slash_zero();
+    test_glob_doublestar_middle();
+    test_glob_single_star_no_cross_slash();
+    test_glob_question_and_class();
+    test_glob_double_extension();
+    test_glob_escape_and_literal();
+    test_glob_backslash_path_normalized();
+
     printf("\n  Filesystem:\n");
     test_fs_path_join();
     test_fs_path_join_trailing_sep();
@@ -6981,6 +7151,7 @@ int main(void) {
 
     printf("\n  Build integration:\n");
     test_build_hello();
+    test_build_exclude_glob();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 

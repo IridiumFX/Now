@@ -45,6 +45,25 @@ NOW_API void now_filelist_free(NowFileList *fl);
 NOW_API int now_discover_sources(const char *basedir, const char *dir,
                                   const char **exts, NowFileList *out);
 
+/* Glob matcher (spec §26). Returns 1 if `path` matches `pattern`, else 0.
+ *
+ * Supported syntax:
+ *   *        any run of chars except '/'
+ *   **       any run of chars including '/' (zero or more segments)
+ *   ?        any single char except '/'
+ *   [abc]    character class; [a-z] range; [!abc] / [^abc] negation
+ *   \x       literal x (escape)
+ *
+ * Per §26.1, a pattern WITHOUT a '/' is matched against the final path
+ * segment (basename); a pattern WITH a '/' is matched against the whole
+ * `path`. Backslashes in `path` are normalized to '/' first, so callers
+ * may pass platform-native separators. `pattern` keeps '\' as the escape
+ * char and is never separator-normalized.
+ *
+ * `path` is taken as-is — callers that need §26.2 base-path rooting
+ * (e.g. exclude rooted at sources.dir) must strip that prefix first. */
+NOW_API int now_glob_match(const char *pattern, const char *path);
+
 #include "now_pom.h"  /* NowProject + NowStrArray (NowTagSet alias) */
 
 /* Platform-gated source discovery: walks dir like now_discover_sources

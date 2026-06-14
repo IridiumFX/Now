@@ -212,6 +212,102 @@ NOW_API void now_filelist_free(NowFileList *fl) {
     now_filelist_init(fl);
 }
 
+/* ---- Glob matching (spec §26) ---- */
+
+/* Core recursive matcher over a single slash-separated string.
+ * Star, question-mark and char classes never cross a slash; ** does. */
+static int glob_core(const char *p, const char *s) {
+    while (*p) {
+        if (p[0] == '*' && p[1] == '*') {
+            /* double-star matches any run including slashes. Collapse a
+             * run of stars, then match the remainder at every position. */
+            while (*p == '*') p++;
+            if (*p == '\0') return 1;          /* trailing star: matches rest */
+            if (*p == '/') {
+                /* a double-star followed by slash may also match zero
+                 * segments (so star-star-slash-foo.c matches foo.c):
+                 * try skipping the slash here. */
+                if (glob_core(p + 1, s)) return 1;
+            }
+            for (const char *t = s; ; t++) {
+                if (glob_core(p, t)) return 1;
+                if (!*t) break;
+            }
+            return 0;
+        } else if (*p == '*') {
+            /* single star: any run except a slash */
+            for (const char *t = s; ; t++) {
+                if (glob_core(p + 1, t)) return 1;
+                if (!*t || *t == '/') break;
+            }
+            return 0;
+        } else if (*p == '?') {
+            if (!*s || *s == '/') return 0;
+            p++; s++;
+        } else if (*p == '[') {
+            /* character class */
+            if (!*s || *s == '/') return 0;
+            const char *q = p + 1;
+            int neg = 0;
+            if (*q == '!' || *q == '^') { neg = 1; q++; }
+            int matched = 0;
+            while (*q && *q != ']') {
+                if (*q == '\\' && q[1]) {
+                    if (*s == q[1]) matched = 1;
+                    q += 2;
+                } else if (q[1] == '-' && q[2] && q[2] != ']') {
+                    unsigned char lo = (unsigned char)q[0];
+                    unsigned char hi = (unsigned char)q[2];
+                    unsigned char c  = (unsigned char)*s;
+                    if (c >= lo && c <= hi) matched = 1;
+                    q += 3;
+                } else {
+                    if (*s == *q) matched = 1;
+                    q++;
+                }
+            }
+            if (*q == ']') q++;
+            if (matched == neg) return 0;
+            p = q; s++;
+        } else if (*p == '\\' && p[1]) {
+            /* escape — next pattern char is literal */
+            p++;
+            if (*p != *s) return 0;
+            p++; s++;
+        } else {
+            if (*p != *s) return 0;
+            p++; s++;
+        }
+    }
+    return *s == '\0';
+}
+
+NOW_API int now_glob_match(const char *pattern, const char *path) {
+    if (!pattern || !path) return 0;
+
+    /* Normalize separators in the path (patterns keep '\' as escape). */
+    char normbuf[PATH_MAX];
+    char *norm = normbuf;
+    size_t len = strlen(path);
+    if (len + 1 > sizeof(normbuf)) {
+        norm = (char *)malloc(len + 1);
+        if (!norm) return 0;
+    }
+    for (size_t i = 0; i <= len; i++)
+        norm[i] = (path[i] == '\\') ? '/' : path[i];
+
+    /* §26.1: a pattern without '/' matches the basename only. */
+    const char *target = norm;
+    if (!strchr(pattern, '/')) {
+        const char *slash = strrchr(norm, '/');
+        if (slash) target = slash + 1;
+    }
+
+    int rc = glob_core(pattern, target);
+    if (norm != normbuf) free(norm);
+    return rc;
+}
+
 /* ---- Source discovery ---- */
 
 static int ext_matches(const char *path, const char **exts) {

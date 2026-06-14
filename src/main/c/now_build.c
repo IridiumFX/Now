@@ -2480,17 +2480,33 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
     for (size_t i = 0; i < ctx->sources.count; i++) {
         const char *src = ctx->sources.paths[i];
 
-        /* Check exclude list */
+        /* Check exclude list (glob, spec §26). Patterns are rooted at
+         * sources.dir (§26.2), but discovered paths are basedir-relative
+         * and include that prefix — strip it so a pattern like
+         * "vendor/sqlite/**.c" matches src/main/c/vendor/sqlite/foo.c.
+         * now_glob_match applies the basename-vs-full-path rule and
+         * normalizes separators, so pass the prefix-stripped path. */
         int excluded = 0;
-        for (size_t ex = 0; ex < p->sources.exclude.count; ex++) {
-            const char *pat = p->sources.exclude.items[ex];
-            /* Match by basename or full relative path */
-            const char *basename = strrchr(src, '/');
-            if (!basename) basename = strrchr(src, '\\');
-            if (basename) basename++; else basename = src;
-            if (strcmp(src, pat) == 0 || strcmp(basename, pat) == 0) {
-                excluded = 1;
-                break;
+        if (p->sources.exclude.count > 0) {
+            const char *rel = src;
+            const char *src_dir_rel = p->sources.dir;
+            if (src_dir_rel && *src_dir_rel) {
+                size_t dl = strlen(src_dir_rel);
+                /* Compare leniently across separator styles. */
+                size_t k = 0;
+                for (; k < dl && src[k]; k++) {
+                    char a = src[k] == '\\' ? '/' : src[k];
+                    char b = src_dir_rel[k] == '\\' ? '/' : src_dir_rel[k];
+                    if (a != b) break;
+                }
+                if (k == dl && (src[dl] == '/' || src[dl] == '\\'))
+                    rel = src + dl + 1;
+            }
+            for (size_t ex = 0; ex < p->sources.exclude.count; ex++) {
+                if (now_glob_match(p->sources.exclude.items[ex], rel)) {
+                    excluded = 1;
+                    break;
+                }
             }
         }
         if (excluded) continue;
