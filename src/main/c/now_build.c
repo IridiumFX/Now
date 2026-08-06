@@ -1869,6 +1869,54 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
 /* Build a hash of the compile flags for a given source file.
  * Used for incremental rebuild detection. */
 static char *link_flags_hash(const NowProject *p);
+/* Expand the built-in ${project.dir} placeholder in a descriptor value.
+ *
+ * A define whose value is a path is only useful if it can name a
+ * location, and a relative path is resolved by whoever consumes it —
+ * fine for a test that just opens a fixture, wrong for one that hands
+ * the path to a nested build, which re-resolves it against its own
+ * base. There is no way to write "the project directory" in a
+ * descriptor otherwise: `properties:` and general ${...} interpolation
+ * are specified but not implemented, so this is the minimum needed to
+ * keep such a define portable rather than machine-absolute.
+ *
+ * Returns a malloc'd string the caller frees, or NULL if `in` has no
+ * placeholder (caller then uses `in` as-is). */
+static char *expand_project_vars(const char *in, const char *basedir) {
+    static const char *TOK = "${project.dir}";
+    if (!in || !basedir) return NULL;
+    const char *hit = strstr(in, TOK);
+    if (!hit) return NULL;
+
+    size_t toklen = strlen(TOK), blen = strlen(basedir);
+    size_t extra = 0;
+    for (const char *s = in; (s = strstr(s, TOK)) != NULL; s += toklen) extra++;
+
+    size_t out_len = strlen(in) + extra * blen + 1;
+    char *out = (char *)malloc(out_len);
+    if (!out) return NULL;
+
+    size_t at = 0;
+    const char *cur = in;
+    while ((hit = strstr(cur, TOK)) != NULL) {
+        size_t pre = (size_t)(hit - cur);
+        memcpy(out + at, cur, pre); at += pre;
+        /* Emit the path with forward slashes. The common use is a -D
+         * whose value lands inside a C string literal, where a native
+         * Windows separator would be read as an escape sequence
+         * (C:\Users\... -> \U, \I, ...) and fail to compile. Forward
+         * slashes are accepted by the Win32 file APIs all the same. */
+        for (size_t k = 0; k < blen; k++)
+            out[at + k] = (basedir[k] == '\\') ? '/' : basedir[k];
+        at += blen;
+        cur = hit + toklen;
+    }
+    size_t tail = strlen(cur);
+    memcpy(out + at, cur, tail); at += tail;
+    out[at] = '\0';
+    return out;
+}
+
 static char *compile_flags_hash(const NowProject *p) {
     /* Concatenate all flags that affect compilation */
     size_t cap = 256;
@@ -3112,12 +3160,23 @@ static char *link_flags_hash(const NowProject *p) {
 
     const char *out_type = p->output.type ? p->output.type : "executable";
     APPEND(out_type);
+    /* output.name matters: renaming the binary must relink, not leave
+     * the previous name sitting in target/bin. */
+    if (p->output.name) APPEND(p->output.name);
     for (size_t i = 0; i < p->link.flags.count; i++)
         APPEND(p->link.flags.items[i]);
     for (size_t i = 0; i < p->link.libs.count; i++)
         APPEND(p->link.libs.items[i]);
     for (size_t i = 0; i < p->link.libdirs.count; i++)
         APPEND(p->link.libdirs.items[i]);
+    /* archives and script are link inputs too — omitting them meant
+     * editing either one left the fast-path skip convinced nothing had
+     * changed, so you kept a stale binary. Same failure shape as the
+     * test-object staleness: silent, and wrong rather than merely slow. */
+    for (size_t i = 0; i < p->link.archives.count; i++)
+        APPEND(p->link.archives.items[i]);
+    if (p->link.script)      APPEND(p->link.script);
+    if (p->link.script_body) APPEND(p->link.script_body);
     #undef APPEND
 
     char *hash = now_sha256_string(buf, len);
@@ -3847,6 +3906,14 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             for (size_t ii = 0; ii < ctx->dep_includes.count; ii++)
                 argv[argc++] = ctx->dep_includes.paths[ii];
 
+            /* Production compile.flags — codegen and ABI must match the
+             * objects the test links against. Kept in step with the
+             * GCC branch below; emitting these on only one toolchain
+             * is how a descriptor comes to build differently on
+             * Windows than everywhere else. */
+            for (size_t ii = 0; ii < p->compile.flags.count; ii++)
+                argv[argc++] = p->compile.flags.items[ii];
+
             /* Production compile.defines — the test TU links against the
              * production objects, so it must see the same macro world.
              * Without this, a project whose headers switch on a
@@ -3863,13 +3930,17 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             }
 
             /* tests.defines — extra -DKEY=VAL macros (e.g. fixture paths) */
-            for (size_t ii = 0; ii < p->tests.defines.count && argc < 60; ii++) {
-                size_t blen = strlen(p->tests.defines.items[ii]) + 4;
+            for (size_t ii = 0; ii < p->tests.defines.count; ii++) {
+                const char *raw = p->tests.defines.items[ii];
+                char *exp = expand_project_vars(raw, basedir);
+                const char *val = exp ? exp : raw;
+                size_t blen = strlen(val) + 4;
                 char *d = (char *)malloc(blen);
                 if (d) {
-                    snprintf(d, blen, "/D%s", p->tests.defines.items[ii]);
+                    snprintf(d, blen, "/D%s", val);
                     argv[argc++] = d;
                 }
+                free(exp);
             }
 
             argv[argc++] = "/c";
@@ -3948,12 +4019,16 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
 
             /* tests.defines — extra -DKEY=VAL macros (e.g. fixture paths) */
             for (size_t ii = 0; ii < p->tests.defines.count; ii++) {
-                size_t blen = strlen(p->tests.defines.items[ii]) + 4;
+                const char *raw = p->tests.defines.items[ii];
+                char *exp = expand_project_vars(raw, basedir);
+                const char *val = exp ? exp : raw;
+                size_t blen = strlen(val) + 4;
                 char *d = (char *)malloc(blen);
                 if (d) {
-                    snprintf(d, blen, "-D%s", p->tests.defines.items[ii]);
+                    snprintf(d, blen, "-D%s", val);
                     argv[argc++] = d;
                 }
+                free(exp);
             }
 
             argv[argc++] = "-c";
