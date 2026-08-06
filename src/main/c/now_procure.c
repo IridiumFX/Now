@@ -617,28 +617,85 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
             free(desc_dest);
         }
 
-        /* Download the .sha256 sidecar first (needed for verification) */
+        /* `now package` names its output {artifact}-{version}-{triple},
+         * and that is what lands in the registry — but procure asked for
+         * {artifact}-{version}, a name the publisher never creates. Ask
+         * for the triple-qualified name the lock entry describes, and
+         * fall back to the bare form so registries populated before this
+         * (or by hand) still resolve. */
+        /* Prefer the triple the registry told us about; otherwise the
+         * host's, which is what `now package` stamps into the name for
+         * anything that isn't header-only. Defaulting straight to
+         * "noarch" asked for a file no publisher had produced. */
+        const char *raw_triple = (entry->triple && entry->triple[0])
+                                 ? entry->triple : now_host_triple();
+        if (!raw_triple || !raw_triple[0]) raw_triple = "noarch";
+
+        /* The registry reports triples colon-separated (windows:x86_64:gnu)
+         * while `now package` spells them with dashes in the filename
+         * (windows-x86_64-gnu). Normalise, or we ask for a name that
+         * cannot exist. */
+        char ent_triple[128];
+        {
+            size_t ti = 0;
+            for (; raw_triple[ti] && ti < sizeof(ent_triple) - 1; ti++)
+                ent_triple[ti] = (raw_triple[ti] == ':') ? '-' : raw_triple[ti];
+            ent_triple[ti] = '\0';
+        }
+
         char sha_name[256];
-        snprintf(sha_name, sizeof(sha_name), "%s-%s.sha256",
-                 entry->artifact, entry->version);
+        snprintf(sha_name, sizeof(sha_name), "%s-%s-%s.sha256",
+                 entry->artifact, entry->version, ent_triple);
         char *sha_dest = now_path_join(dep_dir, sha_name);
         if (sha_dest) {
-            now_registry_download(registry_url,
-                                  entry->group, entry->artifact,
-                                  entry->version, sha_name,
-                                  sha_dest, jwt, result);
+            if (now_registry_download(registry_url,
+                                      entry->group, entry->artifact,
+                                      entry->version, sha_name,
+                                      sha_dest, jwt, result) != 0) {
+                snprintf(sha_name, sizeof(sha_name), "%s-%s.sha256",
+                         entry->artifact, entry->version);
+                now_registry_download(registry_url,
+                                      entry->group, entry->artifact,
+                                      entry->version, sha_name,
+                                      sha_dest, jwt, result);
+            }
         }
 
         /* Download the archive (.basta or legacy .tar.gz) */
         char archive_name[256];
-        snprintf(archive_name, sizeof(archive_name), "%s-%s.basta",
-                 entry->artifact, entry->version);
+        snprintf(archive_name, sizeof(archive_name), "%s-%s-%s.basta",
+                 entry->artifact, entry->version, ent_triple);
         char *archive_dest = now_path_join(dep_dir, archive_name);
         if (archive_dest) {
-            if (now_registry_download(registry_url,
-                                      entry->group, entry->artifact,
-                                      entry->version, archive_name,
-                                      archive_dest, jwt, result) == 0) {
+            /* Try, in order: the triple the lock/registry recorded, the
+             * host triple, then the bare name. The recorded triple is
+             * often "noarch" even for a platform build, so trusting it
+             * alone asks for a file that was never published. */
+            const char *host_tr = now_host_triple();
+            const char *cands[3];
+            char c0[256], c1[256], c2[256];
+            snprintf(c0, sizeof(c0), "%s-%s-%s.basta",
+                     entry->artifact, entry->version, ent_triple);
+            snprintf(c1, sizeof(c1), "%s-%s-%s.basta",
+                     entry->artifact, entry->version,
+                     (host_tr && host_tr[0]) ? host_tr : "noarch");
+            snprintf(c2, sizeof(c2), "%s-%s.basta",
+                     entry->artifact, entry->version);
+            cands[0] = c0; cands[1] = c1; cands[2] = c2;
+
+            int adl = -1;
+            for (int ci = 0; ci < 3 && adl != 0; ci++) {
+                if (ci > 0 && strcmp(cands[ci], cands[ci - 1]) == 0) continue;
+                /* Only the remote name varies; the local file is always
+                 * archive_dest, so archive_name must keep matching it —
+                 * renaming it here made the later signature check look
+                 * for a path that was never written. */
+                adl = now_registry_download(registry_url,
+                                            entry->group, entry->artifact,
+                                            entry->version, cands[ci],
+                                            archive_dest, jwt, result);
+            }
+            if (adl == 0) {
                 /* Verify SHA-256 against sidecar file */
                 char *actual = now_sha256_file(archive_dest);
                 if (actual) {
