@@ -220,14 +220,62 @@ PICO_API int pico_http_request(const char *method, const char *url,
     /* Copy response */
     out->status = (int)resp.status;
 
-    if (resp.body && resp.body_len > 0) {
-        out->body = (char *)malloc((size_t)resp.body_len + 1);
-        if (out->body) {
-            memcpy(out->body, resp.body, (size_t)resp.body_len);
-            out->body[(size_t)resp.body_len] = '\0';
+    /* De-chunk if the server used Transfer-Encoding: chunked.
+     *
+     * https_client copies the parsed body through verbatim and never
+     * consults Transfer-Encoding, so a chunked response arrives with
+     * its framing still embedded — a 64-byte signature comes back as
+     * 75 bytes beginning "40\r\n". That corrupts every artifact `now`
+     * downloads, and the damage surfaces far away as a SHA-256
+     * mismatch or "invalid signature (expected 64 bytes)", blaming the
+     * artifact for a transport bug. Decode here with apennines' own
+     * public decoder so the semantics match its parser.
+     *
+     * The proper fix belongs in https_client itself; this keeps `now`
+     * correct until that lands upstream. */
+    u8 *dechunked = NULL;
+    u64 dechunked_len = 0;
+    {
+        int is_chunked = 0;
+        for (u64 hi = 0; hi < resp.headers.count; hi++) {
+            const char *hn = resp.headers.items[hi].name;
+            const char *hv = resp.headers.items[hi].value;
+            if (!hn || !hv) continue;
+#ifdef _WIN32
+            if (_stricmp(hn, "Transfer-Encoding") != 0) continue;
+#else
+            if (strcasecmp(hn, "Transfer-Encoding") != 0) continue;
+#endif
+            for (const char *p = hv; *p; p++) {
+                if ((p[0] == 'c' || p[0] == 'C') &&
+                    (strncmp(p + 1, "hunked", 6) == 0 ||
+                     strncmp(p + 1, "HUNKED", 6) == 0)) { is_chunked = 1; break; }
+            }
+            break;
         }
-        out->body_len = (size_t)resp.body_len;
+
+        if (is_chunked && resp.body && resp.body_len > 0) {
+            http_chunked_decoder *d = NULL;
+            if (http_chunked_decoder_create(&d) == 0) {
+                if (http_chunked_decoder_feed(d, resp.body, resp.body_len) == 0)
+                    http_chunked_decoder_read(&dechunked, &dechunked_len, d);
+                http_chunked_decoder_destroy(d);
+            }
+        }
     }
+
+    const u8 *body_src = dechunked ? dechunked : resp.body;
+    size_t    body_n   = dechunked ? (size_t)dechunked_len : (size_t)resp.body_len;
+
+    if (body_src && body_n > 0) {
+        out->body = (char *)malloc(body_n + 1);
+        if (out->body) {
+            memcpy(out->body, body_src, body_n);
+            out->body[body_n] = '\0';
+        }
+        out->body_len = body_n;
+    }
+    free(dechunked);
 
     /* Convert headers */
     if (resp.headers.count > 0) {
