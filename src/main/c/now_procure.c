@@ -744,6 +744,66 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                     free(jwt);
                     return -1;
                 }
+
+                /* Actually verify it.
+                 *
+                 * Downloading the .sig and checking only that the HTTP
+                 * GET succeeded is not verification — any registry that
+                 * serves any bytes at that URL would have passed. Look
+                 * the publisher key up in the trust store and check the
+                 * detached Ed25519 signature over the archive we just
+                 * fetched. Fail closed: no key, or no signature match,
+                 * means the dependency does not get installed. */
+                {
+                    char *verify_archive = now_path_join(dep_dir, archive_name);
+                    NowTrustStore store;
+                    now_trust_init(&store);
+                    NowResult tr;
+                    memset(&tr, 0, sizeof(tr));
+                    now_trust_load(&store, &tr);
+
+                    const NowTrustKey *tk =
+                        now_trust_find(&store, entry->group, entry->artifact);
+
+                    int vrc = -1;
+                    const char *why = NULL;
+                    if (!verify_archive) {
+                        why = "cannot resolve downloaded archive path";
+                    } else if (!tk || !tk->key) {
+                        why = "no trusted key for this coordinate in "
+                              "~/.now/trust.pasta (add one with 'now trust:add')";
+                    } else {
+                        NowResult vr;
+                        memset(&vr, 0, sizeof(vr));
+                        vrc = now_verify_file(verify_archive, sig_dest,
+                                              tk->key, &vr);
+                        if (vrc != 0)
+                            why = vr.message[0] ? vr.message
+                                                : "signature does not verify";
+                    }
+
+                    now_trust_free(&store);
+                    free(verify_archive);
+
+                    if (vrc != 0) {
+                        if (result) {
+                            result->code = NOW_ERR_AUTH;
+                            snprintf(result->message, sizeof(result->message),
+                                     "signature verification failed for "
+                                     "%s:%s:%s — %s",
+                                     entry->group, entry->artifact,
+                                     entry->version, why ? why : "unknown");
+                        }
+                        free(sig_dest);
+                        free(dep_dir);
+                        now_resolver_free(&resolver);
+                        now_lock_free(&lockfile);
+                        free(repo_root);
+                        free(lock_path);
+                        free(jwt);
+                        return -1;
+                    }
+                }
                 free(sig_dest);
             }
         }
