@@ -222,7 +222,8 @@ NOW_API int now_registry_resolve(const char *registry_url,
     char *host = NULL;
     char *base_path = NULL;
     int port = 80;
-    if (pico_http_parse_url(registry_url, &host, &port, &base_path) != 0) {
+    int reg_tls = 0;
+    if (pico_http_parse_url_ex(registry_url, &host, &port, &base_path, &reg_tls) != 0) {
         if (result) snprintf(result->message, sizeof(result->message),
                              "Invalid registry URL: %s", registry_url);
         return -1;
@@ -240,6 +241,7 @@ NOW_API int now_registry_resolve(const char *registry_url,
     PicoHttpOptions opts = {0};
     opts.headers = &accept_hdr;
     opts.header_count = 1;
+    opts.tls = reg_tls ? 1 : -1;   /* scheme from the registry URL, not the port */
 
     PicoHttpResponse res;
     int rc = pico_http_get(host, port, path, &opts, &res);
@@ -286,7 +288,8 @@ NOW_API int now_registry_download(const char *registry_url,
     char *host = NULL;
     char *base_path = NULL;
     int port = 80;
-    if (pico_http_parse_url(registry_url, &host, &port, &base_path) != 0) {
+    int reg_tls = 0;
+    if (pico_http_parse_url_ex(registry_url, &host, &port, &base_path, &reg_tls) != 0) {
         if (result) snprintf(result->message, sizeof(result->message),
                              "Invalid registry URL: %s", registry_url);
         return -1;
@@ -322,6 +325,9 @@ NOW_API int now_registry_download(const char *registry_url,
     PicoHttpOptions opts = {0};
     opts.headers = headers;
     opts.header_count = (size_t)nhdr;
+    /* Artifact bytes plus a Bearer JWT — say the scheme rather than
+     * letting the port decide it. */
+    opts.tls = reg_tls ? 1 : -1;
 
     PicoHttpResponse res;
     int rc = pico_http_get_stream(host, port, path, &opts, &res,
@@ -1021,6 +1027,7 @@ NOW_API int now_cache_mirror(const char *registry_url, const char *coords,
     PicoHttpOptions opts = {0};
     opts.headers = headers;
     opts.header_count = (size_t)nhdr;
+    opts.tls = tls ? 1 : -1;   /* scheme from the registry URL, not the port */
 
     /* Fetch manifest */
     PicoHttpResponse res;

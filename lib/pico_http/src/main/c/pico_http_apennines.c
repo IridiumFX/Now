@@ -224,6 +224,19 @@ PICO_API int pico_http_request(const char *method, const char *url,
 
 /* ---- Per-method wrappers ---- */
 
+/* Decide the scheme for a host/port call.
+ *
+ * These entry points carry no scheme, so this used to be inferred from
+ * the port alone — and an https registry on :8443 was therefore spoken
+ * to over plain HTTP, Authorization header and artifact bytes included.
+ * opts->tls lets a caller that parsed a URL state the answer; the port
+ * heuristic remains only as the default for callers that don't. */
+static int resolve_tls(const PicoHttpOptions *opts, int port) {
+    if (opts && opts->tls > 0) return 1;
+    if (opts && opts->tls < 0) return 0;
+    return port == 443;
+}
+
 static char *build_url(const char *host, int port, const char *path, int tls) {
     char url[2048];
     snprintf(url, sizeof(url), "%s://%s:%d%s",
@@ -234,21 +247,21 @@ static char *build_url(const char *host, int port, const char *path, int tls) {
 PICO_API int pico_http_get(const char *host, int port, const char *path,
                             const PicoHttpOptions *opts, PicoHttpResponse *out) {
     if (!host || !path || !out) return PICO_ERR_INVALID;
-    char *url = build_url(host, port, path, port == 443);
+    char *url = build_url(host, port, path, resolve_tls(opts, port));
     int rc = pico_http_request("GET", url, NULL, NULL, 0, opts, out);
     free(url); return rc;
 }
 
 PICO_API int pico_http_head(const char *host, int port, const char *path,
                              const PicoHttpOptions *opts, PicoHttpResponse *out) {
-    char *url = build_url(host, port, path, port == 443);
+    char *url = build_url(host, port, path, resolve_tls(opts, port));
     int rc = pico_http_request("HEAD", url, NULL, NULL, 0, opts, out);
     free(url); return rc;
 }
 
 PICO_API int pico_http_delete(const char *host, int port, const char *path,
                                const PicoHttpOptions *opts, PicoHttpResponse *out) {
-    char *url = build_url(host, port, path, port == 443);
+    char *url = build_url(host, port, path, resolve_tls(opts, port));
     int rc = pico_http_request("DELETE", url, NULL, NULL, 0, opts, out);
     free(url); return rc;
 }
@@ -256,7 +269,7 @@ PICO_API int pico_http_delete(const char *host, int port, const char *path,
 PICO_API int pico_http_put(const char *host, int port, const char *path,
                             const char *ct, const void *body, size_t blen,
                             const PicoHttpOptions *opts, PicoHttpResponse *out) {
-    char *url = build_url(host, port, path, port == 443);
+    char *url = build_url(host, port, path, resolve_tls(opts, port));
     int rc = pico_http_request("PUT", url, ct, body, blen, opts, out);
     free(url); return rc;
 }
@@ -264,7 +277,7 @@ PICO_API int pico_http_put(const char *host, int port, const char *path,
 PICO_API int pico_http_post(const char *host, int port, const char *path,
                              const char *ct, const void *body, size_t blen,
                              const PicoHttpOptions *opts, PicoHttpResponse *out) {
-    char *url = build_url(host, port, path, port == 443);
+    char *url = build_url(host, port, path, resolve_tls(opts, port));
     int rc = pico_http_request("POST", url, ct, body, blen, opts, out);
     free(url); return rc;
 }
@@ -272,7 +285,7 @@ PICO_API int pico_http_post(const char *host, int port, const char *path,
 PICO_API int pico_http_patch(const char *host, int port, const char *path,
                               const char *ct, const void *body, size_t blen,
                               const PicoHttpOptions *opts, PicoHttpResponse *out) {
-    char *url = build_url(host, port, path, port == 443);
+    char *url = build_url(host, port, path, resolve_tls(opts, port));
     int rc = pico_http_request("PATCH", url, ct, body, blen, opts, out);
     free(url); return rc;
 }

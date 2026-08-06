@@ -86,6 +86,18 @@ typedef struct {
     int                   connect_timeout_ms; /* Connect timeout (0 = 5000) */
     int                   timeout_ms;        /* Read/write timeout (0 = 30000) */
     int                   max_redirects;     /* Max redirects to follow (0 = 10, -1 = disable) */
+    /* Transport selection for the host/port entry points (pico_http_get,
+     * _post, _put, _delete, _head, _get_stream). Those take no scheme, so
+     * without this the backend can only guess from the port number —
+     * which silently sends an https:// registry on any non-443 port
+     * (e.g. :8443) in cleartext, Authorization header included. Callers
+     * that know the scheme must say so.
+     *   0  = auto: https when port == 443 (legacy behaviour)
+     *   1  = force TLS
+     *  -1  = force plaintext
+     * Ignored by pico_http_request(), which takes a full URL. */
+    int                   tls;
+
     /* TLS certificate verification (HTTPS only).
      * Default (0): verify server certificate against system CA store.
      * Set tls_noverify=1 to skip verification (development/localhost only). */

@@ -234,8 +234,6 @@ NOW_API void now_auth_creds_free(NowCredentials *creds) {
 NOW_API int now_auth_login(const char *host, int port, const char *path_prefix,
                            const NowCredentials *creds, int use_tls,
                            char **jwt_out, NowResult *result) {
-    (void)use_tls;
-
     if (!jwt_out) return -1;
     *jwt_out = NULL;
 
@@ -273,6 +271,12 @@ NOW_API int now_auth_login(const char *host, int port, const char *path_prefix,
     PicoHttpOptions opts = {0};
     opts.headers = headers;
     opts.header_count = 1;
+    /* This request carries the user's password as HTTP Basic. The
+     * host/port entry point cannot infer the scheme, so state it: the
+     * caller parsed it out of the registry URL. Left to the port
+     * heuristic, an https registry on any non-443 port sent these
+     * credentials in the clear. */
+    opts.tls = use_tls ? 1 : -1;
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/auth/token",

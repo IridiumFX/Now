@@ -789,6 +789,10 @@ static int publish_put(const char *host, int port, const char *path_prefix,
     opts.headers = headers;
     opts.header_count = (size_t)nhdr;
     opts.max_redirects = -1;  /* no redirects on PUT */
+    /* publish carries a Bearer JWT and the artifact bytes — use the
+     * scheme the caller parsed, not the port heuristic. This parameter
+     * was previously accepted and ignored. */
+    opts.tls = use_tls ? 1 : -1;
 
     PicoHttpResponse res;
     memset(&res, 0, sizeof(res));
@@ -1085,6 +1089,7 @@ NOW_API int now_publish_yank(const char *registry_url,
     opts.headers = headers;
     opts.header_count = (size_t)nhdr;
     opts.max_redirects = -1;
+    opts.tls = tls ? 1 : -1;  /* yank carries a Bearer JWT — use the URL's scheme */
 
     PicoHttpResponse res;
     memset(&res, 0, sizeof(res));
