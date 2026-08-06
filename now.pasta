@@ -52,14 +52,21 @@
 
   ; now_test.c falls back to NOW_TEST_RESOURCES "." when this is not
   ; set, which silently turns every fixture-loading test into a
-  ; failure. Tests run with CWD at the project root, so the path is
-  ; relative to it. The triple-quoted form is required because Pasta
-  ; strings have no escape sequences and the value must reach the
-  ; compiler quoted; the trailing space keeps its closing quote from
-  ; merging with the closing delimiter.
+  ; failure.
+  ;
+  ; ${project.dir} expands to this project's absolute directory. A
+  ; relative path would be enough for tests that merely open a fixture,
+  ; but the libdir-cap test hands this path to a nested workspace build
+  ; that re-resolves it against its own base — so it has to be
+  ; absolute, and it must not be hardcoded to one machine.
+  ;
+  ; The triple-quoted form is required because Pasta strings have no
+  ; escape sequences and the value must reach the compiler quoted; the
+  ; trailing space keeps its closing quote from merging with the
+  ; closing delimiter.
   tests: {
     dir: "src/test/c",
-    defines: ["""NOW_TEST_RESOURCES="src/test/resources" """]
+    defines: ["""NOW_TEST_RESOURCES="${project.dir}/src/test/resources" """]
   },
 
   profiles: {
