@@ -295,9 +295,52 @@ PICO_API int pico_http_get_stream(const char *host, int port, const char *path,
                                     const PicoHttpOptions *opts,
                                     PicoHttpResponse *out,
                                     PicoHttpWriteFn write_fn, void *userdata) {
-    (void)host; (void)port; (void)path; (void)opts;
-    (void)out; (void)write_fn; (void)userdata;
-    return PICO_ERR_INVALID;
+    /* Every artifact download goes through here. This was a stub that
+     * ignored its arguments and returned PICO_ERR_INVALID, so on the
+     * apennines backend `now procure` could not fetch a single
+     * dependency — and the failure surfaced far away, as "no .sig file
+     * on registry" or a silently skipped archive.
+     *
+     * apennines' client hands back a complete response rather than
+     * streaming chunks, so the body is delivered to write_fn in one
+     * call. That is not real streaming: the whole artifact is held in
+     * memory once. Correct beats absent here, and artifacts are
+     * modest; switching to https_client_download (which writes
+     * straight to a file) would be the fix if large artifacts ever
+     * make the buffering hurt. */
+    if (!host || !path || !out || !write_fn) return PICO_ERR_INVALID;
+
+    char *url = build_url(host, port, path, resolve_tls(opts, port));
+    if (!url) return PICO_ERR_ALLOC;
+
+    PicoHttpResponse resp;
+    memset(&resp, 0, sizeof(resp));
+    int rc = pico_http_request("GET", url, NULL, NULL, 0, opts, &resp);
+    free(url);
+    if (rc != PICO_OK) {
+        pico_http_response_free(&resp);
+        return rc;
+    }
+
+    /* Hand the body to the caller's sink, then report the response
+     * with the body detached — the caller has it now. */
+    if (resp.body && resp.body_len > 0) {
+        if (write_fn(resp.body, resp.body_len, userdata) != 0) {
+            pico_http_response_free(&resp);
+            return PICO_ERR_RECV;
+        }
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->status       = resp.status;
+    out->status_text  = resp.status_text;  resp.status_text = NULL;
+    out->headers      = resp.headers;      resp.headers = NULL;
+    out->header_count = resp.header_count; resp.header_count = 0;
+    out->body         = NULL;              /* delivered via write_fn */
+    out->body_len     = resp.body_len;
+
+    pico_http_response_free(&resp);
+    return PICO_OK;
 }
 
 #endif /* PICO_HTTP_APENNINES */

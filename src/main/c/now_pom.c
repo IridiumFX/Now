@@ -416,7 +416,13 @@ static const char *const k_known_keys[] = {
     "group", "artifact", "version", "name", "description", "url", "license",
     "lang", "langs", "std", "sources", "tests", "output", "compile", "link",
     "deps", "depends", "repos", "convergence", "private_groups", "plugins",
-    "components", "vendored", "modules", "java", "arch", "reproducible",
+    "components", "vendored", "modules", "java", "arch",
+    /* Read out-of-band from the raw Pasta tree rather than into
+     * NowProject, so they have no struct field to grep for — but they
+     * are live config and must not be reported as unknown:
+     *   reproducible -> now_repro.c   trust -> now_trust.c
+     *   advisories   -> now_advisory.c */
+    "reproducible", "trust", "advisories",
     "inherit_defaults", "inherit", "workspace_mode", NULL
 };
 
