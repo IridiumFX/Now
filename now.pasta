@@ -30,7 +30,14 @@
   compile: {
     warnings: ["Wall", "Wextra"],
     includes: ["lib/basta/src/main/h", "lib/basta/src/main/c"],
-    defines:  ["NOW_STATIC", "PICO_HTTP_STATIC", "ALF_STATIC", "BASTA_STATIC", "APENNINES_STATIC"],
+    ; PICO_HTTP_APENNINES selects the apennines HTTPS backend behind the
+    ; pico_http API. CMakeLists.txt has defined it since rc3; this file
+    ; did not, so `now build` and `cmake --build` produced binaries with
+    ; different HTTP stacks — the CMake one on apennines TLS 1.3, the
+    ; self-hosted one on pico's native transport. Same source, different
+    ; network behaviour, depending only on which build you ran.
+    defines:  ["NOW_STATIC", "PICO_HTTP_STATIC", "PICO_HTTP_APENNINES",
+               "ALF_STATIC", "BASTA_STATIC", "APENNINES_STATIC"],
 
     ; glibc hides clock_gettime, strdup, setenv, realpath, struct
     ; timespec st_mtim, etc. behind these under strict -std=c11.
