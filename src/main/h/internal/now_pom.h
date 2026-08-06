@@ -72,6 +72,32 @@ typedef struct {
     char *dir;
 } NowOutput;
 
+/* Per-field inheritance policy (§1.11).
+ *
+ * Every field is tri-state: 1 = inherit, 0 = don't, -1 = unstated (the
+ * caller falls back to the next policy level, and finally to the spec
+ * default of `true`).
+ *
+ * Resolution order for a given field, first stated value wins:
+ *   module `inherit:` -> root `inherit_defaults:` -> true
+ *
+ * `all` carries the `inherit: *` / `inherit: null` shorthands, which
+ * answer for every field at once.
+ *
+ * Note: `profiles` and `properties` are parsed so a descriptor that
+ * names them keeps its meaning, but neither subsystem exists in the
+ * implementation yet, so inheriting them is currently a no-op. */
+typedef struct {
+    int declared;          /* the block was present at all */
+    int all;               /* `*` -> 1, null -> 0, absent -> -1 */
+    int version;
+    int deps;
+    int compile;
+    int link;
+    int profiles;          /* accepted; profiles are not implemented */
+    int properties;        /* accepted; properties are not implemented */
+} NowInherit;
+
 /* Dependency entry (§1.6) */
 typedef struct {
     char *id;              /* group:artifact:version-or-range */
@@ -230,6 +256,9 @@ struct NowProject {
 
     /* Workspace (§1.11) */
     NowStrArray modules;
+    NowInherit  inherit_defaults;  /* root: policy applied to every module */
+    NowInherit  inherit;           /* module: override of the root policy */
+    char       *workspace_mode;    /* monorepo | aggregate | inferred */
 
     /* Raw Pasta tree — kept alive for the project lifetime */
     void *_pasta_root;

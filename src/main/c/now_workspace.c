@@ -241,6 +241,137 @@ static void inject_sibling_artifacts(NowWorkspace *ws, int consumer_idx) {
     }
 }
 
+/* ---- Root -> module inheritance (§1.11) ----
+ *
+ * Resolution for one field, first stated value wins:
+ *   module `inherit:` -> root `inherit_defaults:` -> spec default (true)
+ * with the `*` / null shorthands answering for every field at once.
+ */
+static int inherit_field(const NowInherit *root, const NowInherit *mod, int which) {
+    /* which: 0 version, 1 deps, 2 compile, 3 link */
+    const NowInherit *lvl[2];
+    lvl[0] = mod;   /* module speaks first */
+    lvl[1] = root;
+    for (int i = 0; i < 2; i++) {
+        const NowInherit *p = lvl[i];
+        if (!p || !p->declared) continue;
+        int v = -1;
+        switch (which) {
+            case 0: v = p->version; break;
+            case 1: v = p->deps;    break;
+            case 2: v = p->compile; break;
+            default: v = p->link;   break;
+        }
+        if (v >= 0) return v;
+        if (p->all >= 0) return p->all;   /* `*` / null shorthand */
+    }
+    return 1;   /* §1.11: absent policy means inherit */
+}
+
+/* Rebuild `dst` as root-items-then-own-items.
+ *
+ * Order matters: the root's values are the workspace-wide baseline and
+ * must appear first, so a module's own flags land later on the command
+ * line and win where a compiler takes last-one-wins. */
+static void prepend_strarray(NowStrArray *dst, const NowStrArray *src) {
+    if (!src || src->count == 0) return;
+    NowStrArray merged;
+    now_strarray_init(&merged);
+    for (size_t i = 0; i < src->count; i++)
+        now_strarray_push(&merged, src->items[i]);
+    for (size_t i = 0; i < dst->count; i++)
+        now_strarray_push(&merged, dst->items[i]);
+    now_strarray_free(dst);
+    *dst = merged;
+}
+
+/* Prepend the root's deps to a module's, deep-copying each entry.
+ * A module that already names the same id keeps its own (more specific)
+ * entry — the root is only a default. */
+static void prepend_deps(NowDepArray *dst, const NowDepArray *src) {
+    if (!src || src->count == 0) return;
+    NowDepArray merged;
+    now_deparray_init(&merged);
+    for (size_t s = 0; s < src->count; s++) {
+        const NowDep *rd = &src->items[s];
+        int shadowed = 0;
+        for (size_t d = 0; d < dst->count; d++) {
+            if (rd->id && dst->items[d].id &&
+                strcmp(rd->id, dst->items[d].id) == 0) { shadowed = 1; break; }
+        }
+        if (shadowed) continue;
+        int idx = now_deparray_push(&merged);
+        if (idx < 0) continue;
+        NowDep *nd = &merged.items[idx];
+        nd->id                 = rd->id    ? strdup(rd->id)    : NULL;
+        nd->scope              = rd->scope ? strdup(rd->scope) : NULL;
+        nd->optional           = rd->optional;
+        nd->is_volatile        = rd->is_volatile;
+        nd->override           = rd->override;
+        nd->is_workspace_local = rd->is_workspace_local;
+        now_strarray_init(&nd->exclude);
+        for (size_t e = 0; e < rd->exclude.count; e++)
+            now_strarray_push(&nd->exclude, rd->exclude.items[e]);
+    }
+    if (merged.count == 0) { now_deparray_free(&merged); return; }
+    for (size_t d = 0; d < dst->count; d++) {
+        int idx = now_deparray_push(&merged);
+        if (idx < 0) continue;
+        merged.items[idx] = dst->items[d];   /* move: ownership transfers */
+    }
+    free(dst->items);
+    *dst = merged;
+}
+
+/* Push the root's inheritable configuration into one module.
+ *
+ * Never inherited regardless of policy (§1.11): group, artifact,
+ * modules, output, sources, tests, langs — a module's identity and
+ * layout are its own. */
+static void apply_root_inheritance(const NowProject *root, NowProject *mod) {
+    if (!root || !mod) return;
+
+    if (inherit_field(&root->inherit_defaults, &mod->inherit, 0)) {
+        if (!mod->version && root->version) mod->version = strdup(root->version);
+    }
+    if (inherit_field(&root->inherit_defaults, &mod->inherit, 2)) {
+        prepend_strarray(&mod->compile.flags,    &root->compile.flags);
+        prepend_strarray(&mod->compile.warnings, &root->compile.warnings);
+        prepend_strarray(&mod->compile.defines,  &root->compile.defines);
+        prepend_strarray(&mod->compile.includes, &root->compile.includes);
+        if (!mod->compile.std && root->compile.std)
+            mod->compile.std = strdup(root->compile.std);
+        if (!mod->compile.opt && root->compile.opt)
+            mod->compile.opt = strdup(root->compile.opt);
+        if (!mod->std && root->std) mod->std = strdup(root->std);
+    }
+    if (inherit_field(&root->inherit_defaults, &mod->inherit, 3)) {
+        prepend_strarray(&mod->link.flags,    &root->link.flags);
+        prepend_strarray(&mod->link.libs,     &root->link.libs);
+        prepend_strarray(&mod->link.libdirs,  &root->link.libdirs);
+        prepend_strarray(&mod->link.archives, &root->link.archives);
+    }
+    if (inherit_field(&root->inherit_defaults, &mod->inherit, 1)) {
+        prepend_deps(&mod->deps, &root->deps);
+    }
+}
+
+/* Monorepo mode carries root config down to modules; aggregate mode
+ * leaves every module standing alone.
+ *
+ * §1.11 infers the mode from `inherit_defaults` being present, and
+ * `workspace_mode:` overrides that. Gating on an explicit signal is
+ * also what keeps existing aggregate workspaces byte-identical: a root
+ * that never asked for inheritance does not silently acquire it. */
+static int workspace_inherits(const NowProject *root) {
+    if (!root) return 0;
+    if (root->workspace_mode) {
+        if (strcmp(root->workspace_mode, "monorepo")  == 0) return 1;
+        if (strcmp(root->workspace_mode, "aggregate") == 0) return 0;
+    }
+    return root->inherit_defaults.declared ? 1 : 0;
+}
+
 NOW_API int now_workspace_init(NowWorkspace *ws, NowProject *root,
                                 const char *root_dir, NowResult *result) {
     memset(ws, 0, sizeof(*ws));
@@ -293,6 +424,12 @@ NOW_API int now_workspace_init(NowWorkspace *ws, NowProject *root,
             }
             return -1;
         }
+
+        /* Root -> module inheritance (§1.11). Runs before the DAG and
+         * before sibling auto-injection, so inherited compile flags are
+         * in place for every later phase. */
+        if (workspace_inherits(root))
+            apply_root_inheritance(root, ws->modules[i].project);
     }
 
     /* Build adjacency list for the DAG.

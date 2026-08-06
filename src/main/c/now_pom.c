@@ -368,6 +368,90 @@ static void load_link(NowLink *dst, const PastaValue *src) {
     apply_os_overrides(dst, src, merge_link);
 }
 
+/* Parse an inheritance policy block (§1.11).
+ *
+ * Shapes accepted:
+ *   { version: true, compile: false, ... }   per-field
+ *   *                                        everything  (string or label)
+ *   null                                     nothing
+ *   true / false                             everything / nothing
+ *
+ * Fields left unmentioned stay -1; resolve_inherit() applies the
+ * spec's `true` default only after the module block has had its say. */
+static void load_inherit(NowInherit *dst, const PastaValue *src) {
+    dst->declared = 0;
+    dst->all = dst->version = dst->deps = -1;
+    dst->compile = dst->link = dst->profiles = dst->properties = -1;
+    if (!src) return;
+    dst->declared = 1;
+
+    int t = pasta_type(src);
+    if (t == PASTA_NULL) { dst->all = 0; return; }
+    if (t == PASTA_BOOL) { dst->all = pasta_get_bool(src) ? 1 : 0; return; }
+    if (t == PASTA_STRING || t == PASTA_LABEL) {
+        const char *s = pasta_get_string(src);
+        if (s && strcmp(s, "*") == 0) dst->all = 1;
+        return;
+    }
+    if (t != PASTA_MAP) return;
+
+    dst->version    = get_map_bool(src, "version",    -1);
+    dst->deps       = get_map_bool(src, "deps",       -1);
+    dst->compile    = get_map_bool(src, "compile",    -1);
+    dst->link       = get_map_bool(src, "link",       -1);
+    dst->profiles   = get_map_bool(src, "profiles",   -1);
+    dst->properties = get_map_bool(src, "properties", -1);
+}
+
+/* ---- Descriptor key diagnostics ----
+ *
+ * A descriptor key that neither list below mentions is either a typo or
+ * a field from a newer spec than this binary. Either way the loader
+ * drops it, and dropping it silently is how a correct-looking
+ * `inherit_defaults` block can sit in a workspace root for weeks doing
+ * nothing. Say so instead. */
+
+/* Top-level keys the loader reads and acts on. */
+static const char *const k_known_keys[] = {
+    "group", "artifact", "version", "name", "description", "url", "license",
+    "lang", "langs", "std", "sources", "tests", "output", "compile", "link",
+    "deps", "depends", "repos", "convergence", "private_groups", "plugins",
+    "components", "vendored", "modules", "java", "arch", "reproducible",
+    "inherit_defaults", "inherit", "workspace_mode", NULL
+};
+
+/* Top-level keys the spec defines but this build does not act on. These
+ * parse fine and are then ignored — warn so nobody plans around them. */
+static const char *const k_inert_keys[] = {
+    "profiles", "properties", "walk_boundary", "inheritance",
+    "publish", "assembly", NULL
+};
+
+static int str_in_list(const char *const *list, const char *s) {
+    for (size_t i = 0; list[i]; i++)
+        if (strcmp(list[i], s) == 0) return 1;
+    return 0;
+}
+
+static void warn_descriptor_keys(const PastaValue *root, const char *path) {
+    if (!root || pasta_type(root) != PASTA_MAP) return;
+    const char *where = path ? path : "now.pasta";
+    size_t n = pasta_count(root);
+    for (size_t i = 0; i < n; i++) {
+        const char *k = pasta_map_key(root, i);
+        if (!k || !*k) continue;
+        if (str_in_list(k_known_keys, k)) continue;
+        if (str_in_list(k_inert_keys, k)) {
+            fprintf(stderr,
+                    "warning: %s: '%s' is recognized but not implemented "
+                    "in this build - it is ignored\n", where, k);
+        } else {
+            fprintf(stderr,
+                    "warning: %s: unknown key '%s' - ignored\n", where, k);
+        }
+    }
+}
+
 static void load_output(NowOutput *dst, const PastaValue *src) {
     if (!src || pasta_type(src) != PASTA_MAP) return;
     dst->type = dup_map_str(src, "type");
@@ -614,6 +698,7 @@ NOW_API void now_project_free(NowProject *p) {
     now_strarray_free(&p->vendored);
     now_strarray_free(&p->private_groups);
     now_strarray_free(&p->modules);
+    free(p->workspace_mode);
     free(p->java.main_class);
     free(p->java.encoding);
     now_strarray_free(&p->java.classpath);
@@ -741,8 +826,11 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
     load_strarray(&p->components, pasta_map_get(root, "components"));
     load_strarray(&p->vendored, pasta_map_get(root, "vendored"));
 
-    /* Modules (§1.11) */
+    /* Workspace (§1.11) */
     load_strarray(&p->modules, pasta_map_get(root, "modules"));
+    load_inherit(&p->inherit_defaults, pasta_map_get(root, "inherit_defaults"));
+    load_inherit(&p->inherit,          pasta_map_get(root, "inherit"));
+    p->workspace_mode = dup_map_str(root, "workspace_mode");
 
     /* Java-specific config */
     const PastaValue *java_map = pasta_map_get(root, "java");
@@ -756,6 +844,8 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
     load_arch(&p->arch, pasta_map_get(root, "arch"));
 
     apply_maven_defaults(p);
+
+    warn_descriptor_keys(root, path);
 
     if (result) {
         result->code = NOW_OK;
