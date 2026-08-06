@@ -3667,6 +3667,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
     NowFileList test_objects;
     now_filelist_init(&test_objects);
     int errors = 0;
+    char *test_flags_key = NULL;   /* lazily built; see the sidecar below */
 
     for (size_t i = 0; i < test_sources.count; i++) {
         const char *src = test_sources.paths[i];
@@ -3714,16 +3715,61 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         if (last) { *last = '\0'; now_mkdir_p(obj_dir_copy); }
         free(obj_dir_copy);
 
-        /* Skip the compile when the .o exists and is newer than the
-         * source. Production compile uses the full content-addressed
-         * manifest; test compile doesn't have its own manifest layer,
-         * so a plain mtime check is the lightweight equivalent. Without
-         * this every `now test` re-ran gcc per test TU and re-linked
-         * the test exe even on no-op runs (vulpes perf finding). */
+        /* Sidecar recording the flags this object was built with.
+         * Production compile is content-addressed and folds
+         * compile_flags_hash into its cache key; test compile has no
+         * manifest layer, so mtime alone used to decide freshness —
+         * which meant editing tests.defines (or any compile flag) left
+         * the old object in place and `now test` silently ran a binary
+         * built with the previous macros. */
+        char *tflags_sidecar = NULL;
+        {
+            size_t sl = strlen(obj) + 8;
+            tflags_sidecar = (char *)malloc(sl);
+            if (tflags_sidecar) snprintf(tflags_sidecar, sl, "%s.flags", obj);
+        }
+        if (!test_flags_key) {
+            /* Built once per run: production flags + test-only defines. */
+            char *base = compile_flags_hash(p);
+            size_t need = (base ? strlen(base) : 0) + 2;
+            for (size_t d = 0; d < p->tests.defines.count; d++)
+                need += strlen(p->tests.defines.items[d]) + 1;
+            char *acc = (char *)malloc(need);
+            if (acc) {
+                size_t at = 0;
+                if (base) { at += (size_t)snprintf(acc, need, "%s\n", base); }
+                else acc[0] = '\0';
+                for (size_t d = 0; d < p->tests.defines.count; d++)
+                    at += (size_t)snprintf(acc + at, need - at, "%s\n",
+                                           p->tests.defines.items[d]);
+                test_flags_key = now_sha256_string(acc, at);
+                free(acc);
+            }
+            free(base);
+        }
+
+        /* Skip the compile when the .o exists, is newer than the source,
+         * AND was built with the flags we are about to use. Without the
+         * mtime half every `now test` re-ran gcc per TU and re-linked on
+         * no-op runs (vulpes perf finding); without the flags half the
+         * result is worse than slow, it is wrong. */
         {
             struct stat src_st, obj_st;
             char *src_full_check = now_path_join(basedir, src);
-            if (src_full_check && stat(obj, &obj_st) == 0 &&
+            int flags_match = 0;
+            if (tflags_sidecar && test_flags_key) {
+                FILE *fp = fopen(tflags_sidecar, "rb");
+                if (fp) {
+                    char prev[80];
+                    size_t n = fread(prev, 1, sizeof(prev) - 1, fp);
+                    fclose(fp);
+                    prev[n] = '\0';
+                    while (n > 0 && (prev[n-1] == '\n' || prev[n-1] == '\r'))
+                        prev[--n] = '\0';
+                    flags_match = (strcmp(prev, test_flags_key) == 0);
+                }
+            }
+            if (flags_match && src_full_check && stat(obj, &obj_st) == 0 &&
                 stat(src_full_check, &src_st) == 0 &&
                 (long long)src_st.st_mtime <= (long long)obj_st.st_mtime) {
                 if (ctx->verbose)
@@ -3731,6 +3777,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                 now_filelist_push(&test_objects, obj);
                 free(obj);
                 free(src_full_check);
+                free(tflags_sidecar);
                 continue;
             }
             free(src_full_check);
@@ -3952,13 +3999,23 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                          "test compile failed on %s (exit %d)", src, rc);
             }
             free(obj);
+            free(tflags_sidecar);
             errors++;
             continue;
         }
 
+        /* Record the flags this object was built with, so a later run
+         * that changes them recompiles instead of trusting mtime. */
+        if (tflags_sidecar && test_flags_key) {
+            FILE *fp = fopen(tflags_sidecar, "wb");
+            if (fp) { fputs(test_flags_key, fp); fclose(fp); }
+        }
+        free(tflags_sidecar);
+
         now_filelist_push(&test_objects, obj);
         free(obj);
     }
+    free(test_flags_key);
 
     if (errors) {
         now_filelist_free(&test_objects);
