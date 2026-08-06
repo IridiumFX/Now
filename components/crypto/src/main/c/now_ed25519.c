@@ -1054,3 +1054,119 @@ NOW_API int now_verify_file(const char *archive_path, const char *sig_path,
     }
     return -1;
 }
+
+/* ================================================================
+ *  Signing: key management and detached file signatures
+ *
+ *  Until this existed, `now` could verify a signature but never
+ *  produce one — so `trust: { require_signatures: true }` could not
+ *  be satisfied by anything now published, and `now verify` needed a
+ *  .sig the tool had no way to create.
+ *
+ *  Key file: ~/.now/signing.key, the raw 64-byte Ed25519 private key
+ *  (seed || public). Binary, not base64 — it never needs to be
+ *  pasted anywhere, unlike the public half.
+ *
+ *  Signature file: the raw 64 signature bytes. now_verify_file
+ *  accepts raw-64 or base64; raw keeps producer and consumer simple.
+ * ================================================================ */
+
+static const char b64_enc_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+NOW_API char *now_b64_encode(const unsigned char *in, size_t len) {
+    if (!in) return NULL;
+    size_t out_len = ((len + 2) / 3) * 4;
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) return NULL;
+
+    size_t i = 0, j = 0;
+    while (i + 2 < len) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+        out[j++] = b64_enc_chars[(v >> 18) & 63];
+        out[j++] = b64_enc_chars[(v >> 12) & 63];
+        out[j++] = b64_enc_chars[(v >>  6) & 63];
+        out[j++] = b64_enc_chars[v & 63];
+        i += 3;
+    }
+    if (i < len) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        int rem = 1;
+        if (i + 1 < len) { v |= (uint32_t)in[i+1] << 8; rem = 2; }
+        out[j++] = b64_enc_chars[(v >> 18) & 63];
+        out[j++] = b64_enc_chars[(v >> 12) & 63];
+        out[j++] = (rem == 2) ? b64_enc_chars[(v >> 6) & 63] : '=';
+        out[j++] = '=';
+    }
+    out[j] = '\0';
+    return out;
+}
+
+NOW_API char *now_signing_key_path(void) {
+    const char *home = NULL;
+#ifdef _WIN32
+    home = getenv("USERPROFILE");
+    if (!home) home = getenv("HOME");
+#else
+    home = getenv("HOME");
+#endif
+    const char *env = getenv("NOW_SIGNING_KEY");
+    if (env && *env) return strdup(env);
+    if (!home) return NULL;
+    char *dot = now_path_join(home, ".now");
+    if (!dot) return NULL;
+    char *p = now_path_join(dot, "signing.key");
+    free(dot);
+    return p;
+}
+
+NOW_API int now_signing_key_load(unsigned char priv[64]) {
+    char *path = now_signing_key_path();
+    if (!path) return -1;
+    FILE *fp = fopen(path, "rb");
+    free(path);
+    if (!fp) return -1;
+    size_t n = fread(priv, 1, 64, fp);
+    fclose(fp);
+    return (n == 64) ? 0 : -1;
+}
+
+NOW_API int now_sign_file(const char *path, const char *sig_path,
+                           const unsigned char priv[64], NowResult *result) {
+    if (!path || !sig_path || !priv) return -1;
+
+    size_t len = 0;
+    char *data = ed_read_file(path, &len);
+    if (!data) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "sign: cannot read %s", path);
+        }
+        return -1;
+    }
+
+    unsigned char sig[64];
+    int rc = now_ed25519_sign(sig, (const unsigned char *)data, len, priv);
+    free(data);
+    if (rc != 0) {
+        if (result) {
+            result->code = NOW_ERR_TOOL;
+            snprintf(result->message, sizeof(result->message), "sign: failed");
+        }
+        return -1;
+    }
+
+    FILE *fp = fopen(sig_path, "wb");
+    if (!fp) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "sign: cannot write %s", sig_path);
+        }
+        return -1;
+    }
+    size_t w = fwrite(sig, 1, 64, fp);
+    fclose(fp);
+    return (w == 64) ? 0 : -1;
+}

@@ -106,4 +106,24 @@ NOW_API int now_ed25519_verify(const unsigned char *sig,
 NOW_API int now_verify_file(const char *archive_path, const char *sig_path,
                              const char *pubkey_b64, NowResult *result);
 
+/* ---- Signing (the producing half of the above) ---- */
+
+/* Base64-encode raw bytes. Caller frees. Used for the public key,
+ * which has to be pasted into a trust store; signatures and the
+ * private key stay raw. */
+NOW_API char *now_b64_encode(const unsigned char *in, size_t len);
+
+/* Path to the signing key: $NOW_SIGNING_KEY, else ~/.now/signing.key.
+ * Caller frees. NULL if no home directory can be determined. */
+NOW_API char *now_signing_key_path(void);
+
+/* Load the raw 64-byte private key. Returns 0 on success, -1 if the
+ * key is absent or malformed. */
+NOW_API int now_signing_key_load(unsigned char priv[64]);
+
+/* Write a detached Ed25519 signature over `path` to `sig_path`
+ * (raw 64 bytes). Returns 0 on success. */
+NOW_API int now_sign_file(const char *path, const char *sig_path,
+                           const unsigned char priv[64], NowResult *result);
+
 #endif /* NOW_TRUST_H */

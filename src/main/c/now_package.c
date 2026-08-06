@@ -12,6 +12,7 @@
 #include "now_manifest.h"
 #include "now_procure.h"
 #include "now_auth.h"
+#include "now_trust.h"
 #include "pico_http.h"
 #include "pasta.h"
 #include "basta.h"
@@ -423,6 +424,35 @@ NOW_API int now_package(const NowProject *project, const char *basedir,
             free(sha_path);
         }
         free(sha);
+    }
+
+    /* Sign the package when a publisher key is configured.
+     *
+     * `now publish` has always uploaded a .sig "if present" — nothing
+     * ever produced one, so require_signatures could not be satisfied
+     * by anything now published. Signing here closes that loop. Absence
+     * of a key is not an error: unsigned publishing stays the default,
+     * and consumers decide whether to demand signatures. */
+    {
+        unsigned char priv[64];
+        if (now_signing_key_load(priv) == 0) {
+            char sig_name[512];
+            snprintf(sig_name, sizeof(sig_name), "%s-%s-%s.sig",
+                     artifact, version, is_header_only ? "noarch" : triple);
+            char *sig_path = now_path_join(pkg_dir, sig_name);
+            if (sig_path) {
+                NowResult sr;
+                memset(&sr, 0, sizeof(sr));
+                if (now_sign_file(basta_path, sig_path, priv, &sr) == 0) {
+                    if (verbose) fprintf(stderr, "  signed %s\n", sig_name);
+                } else {
+                    fprintf(stderr, "warning: signing failed: %s\n",
+                            sr.message[0] ? sr.message : "unknown error");
+                }
+                free(sig_path);
+            }
+            memset(priv, 0, sizeof(priv));
+        }
     }
 
     free(basta_path);

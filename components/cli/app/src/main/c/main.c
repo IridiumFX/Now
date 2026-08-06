@@ -29,6 +29,7 @@
 #include "now_remote.h"
 #include "now_sbom.h"
 #include "now_trust.h"
+#include "apennines/t1/random/entropy.h"   /* keygen seed */
 #include "now_repro.h"
 #include "now_advisory.h"
 #include "now_cache.h"
@@ -190,6 +191,7 @@ static void usage(void) {
         "  plugin:info   Show plugin details\n"
         "  sbom          Generate CycloneDX 1.5 SBOM (JSON)\n"
         "  layers:show  Show layer stack and effective configuration\n"
+        "  keygen       Generate a publisher signing keypair\n"
         "  trust:list   List trusted keys\n"
         "  trust:add    Add key: trust:add <scope> <key> [comment]\n"
         "  verify       Verify archive signature\n"
@@ -855,6 +857,79 @@ skip_header:
     }
 
     /* Trust store commands (no project file needed) */
+    if (strcmp(phase, "keygen") == 0) {
+        /* Generate the publisher signing keypair.
+         *
+         * The private half stays raw at ~/.now/signing.key and is what
+         * `now publish` signs with; the public half is printed base64
+         * for consumers to paste into their trust store. Without this
+         * there was no way to produce a signature at all, which left
+         * require_signatures unsatisfiable. */
+        char *key_path = now_signing_key_path();
+        if (!key_path) {
+            fprintf(stderr, "error: cannot determine signing key path "
+                            "(set NOW_SIGNING_KEY or HOME)\n");
+            return 1;
+        }
+        if (now_path_exists(key_path)) {
+            fprintf(stderr, "error: signing key already exists at %s\n"
+                            "       remove it first if you mean to replace it\n",
+                    key_path);
+            free(key_path);
+            return 1;
+        }
+
+        unsigned char seed[32], pub[32], priv[64];
+        if (entropy_get_system(seed, sizeof(seed)) != 0) {
+            fprintf(stderr, "error: cannot gather entropy for key generation\n");
+            free(key_path);
+            return 1;
+        }
+        if (now_ed25519_keypair(pub, priv, seed) != 0) {
+            fprintf(stderr, "error: key generation failed\n");
+            free(key_path);
+            return 1;
+        }
+
+        /* Make sure ~/.now exists before writing into it. */
+        char *dir_end = strrchr(key_path, '/');
+        char *dir_end_w = strrchr(key_path, '\\');
+        if (dir_end_w && (!dir_end || dir_end_w > dir_end)) dir_end = dir_end_w;
+        if (dir_end) {
+            char saved = *dir_end;
+            *dir_end = '\0';
+            now_mkdir_p(key_path);
+            *dir_end = saved;
+        }
+
+        FILE *kf = fopen(key_path, "wb");
+        if (!kf) {
+            fprintf(stderr, "error: cannot write %s\n", key_path);
+            free(key_path);
+            return 1;
+        }
+        size_t wrote = fwrite(priv, 1, sizeof(priv), kf);
+        fclose(kf);
+        memset(priv, 0, sizeof(priv));
+        memset(seed, 0, sizeof(seed));
+        if (wrote != sizeof(priv)) {
+            fprintf(stderr, "error: short write to %s\n", key_path);
+            free(key_path);
+            return 1;
+        }
+
+        char *pub_b64 = now_b64_encode(pub, sizeof(pub));
+        printf("signing key written to %s\n", key_path);
+        printf("public key: %s\n", pub_b64 ? pub_b64 : "(encode failed)");
+        printf("\nPublishers keep the private key. Consumers add the public\n"
+               "half to their trust store:\n\n");
+        printf("  now trust:add \"<group>\" %s \"publisher key\"\n",
+               pub_b64 ? pub_b64 : "<pubkey>");
+        free(pub_b64);
+        free(key_path);
+        return 0;
+    }
+
     if (strcmp(phase, "trust:list") == 0) {
         NowTrustStore store;
         now_trust_init(&store);
@@ -1681,7 +1756,13 @@ skip_header:
                         project->group, project->artifact);
                 rc = 1;
             } else if (tk) {
-                rc = now_verify_file(archive, sigfile, tk->key, &result);
+                /* Normalise to 1. now_verify_file returns -1, which
+                 * reaches the shell as 255/127 depending on platform —
+                 * and 127 conventionally means "command not found", so
+                 * a CI script would misread a failed verification as a
+                 * broken invocation. */
+                rc = (now_verify_file(archive, sigfile, tk->key, &result) != 0)
+                     ? 1 : 0;
                 if (rc != 0)
                     fprintf(stderr, "error: %s\n", result.message);
                 else
