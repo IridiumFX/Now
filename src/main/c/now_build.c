@@ -2529,7 +2529,17 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         if (p->sources.exclude.count > 0) {
             const char *rel = path_rel_to_dir(src, p->sources.dir);
             for (size_t ex = 0; ex < p->sources.exclude.count; ex++) {
-                if (now_glob_match(p->sources.exclude.items[ex], rel)) {
+                const char *pat = p->sources.exclude.items[ex];
+                /* Match the sources.dir-rooted form (§26.2) *and* the
+                 * project-relative form. Rooting at sources.dir alone
+                 * silently stopped honouring every descriptor written
+                 * the older way — e.g. cookbook excluding a second
+                 * main() as "src/main/c/cookbook_import.c" — and a
+                 * dropped exclude shows up as a duplicate-symbol link
+                 * failure, far from its cause. Both spellings are
+                 * unambiguous here, so accept either. */
+                if (now_glob_match(pat, rel) ||
+                    (rel != src && now_glob_match(pat, src))) {
                     excluded = 1;
                     break;
                 }
@@ -3414,6 +3424,25 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
             for (size_t i = 0; i < p->link.flags.count; i++)
                 argv[argc++] = p->link.flags.items[i];
 
+            /* Linker script (link.script). Resolved against the module
+             * directory — same rule as libdirs below — so a freestanding
+             * module can name its script the way it names everything
+             * else. Raw entries in link.flags are still passed through
+             * untouched and resolve against the process CWD instead. */
+            char *script_buf = NULL;
+            if (p->link.script && p->link.script[0]) {
+                char *full = now_path_join(basedir, p->link.script);
+                if (full) {
+                    size_t len = strlen(full) + 8;
+                    script_buf = (char *)malloc(len);
+                    if (script_buf) {
+                        snprintf(script_buf, len, "-Wl,-T,%s", full);
+                        argv[argc++] = script_buf;
+                    }
+                    free(full);
+                }
+            }
+
             /* Object files */
             for (size_t i = 0; i < ctx->objects.count; i++)
                 argv[argc++] = ctx->objects.paths[i];
@@ -3518,6 +3547,7 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
             for (size_t i = 0; i < nlib; i++)    free(lib_bufs[i]);
             free(libdir_bufs);
             free(lib_bufs);
+            free(script_buf);
             free(argv);
 
             if (rc != 0) {
