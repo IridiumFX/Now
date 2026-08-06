@@ -205,6 +205,10 @@ target_include_directories(now_cli PRIVATE
     ${CMAKE_SOURCE_DIR}/src/main/h/internal
     ${CMAKE_SOURCE_DIR}/lib/alforno/src/main/h
     ${CMAKE_SOURCE_DIR}/lib/basta/src/main/h
+    # entropy.h — `now keygen` seeds its Ed25519 keypair from it.
+    # `now build` finds this via the vendored: discovery; CMake needs
+    # telling, or the two build systems disagree again.
+    ${CMAKE_SOURCE_DIR}/lib/apennines/src/main/h
     ${CMAKE_SOURCE_DIR}/lib/pico_http/src/main/h
     ${CMAKE_SOURCE_DIR}/components/enterprise/src/main/h/internal
     ${CMAKE_SOURCE_DIR}/components/export/src/main/h/internal
