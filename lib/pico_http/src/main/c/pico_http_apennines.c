@@ -169,12 +169,36 @@ PICO_API int pico_http_request(const char *method, const char *url,
         http_url parsed;
         unsigned long urc = http_url_parse(&parsed, url);
         if (urc == 0 && parsed.host && parsed.host[0]) {
-            dns_response dnr;
-            memset(&dnr, 0, sizeof(dnr));
-            unsigned long drc = dns_query(&dnr, parsed.host);
-            dns_response_free(&dnr);
-            http_url_free(&parsed);
-            if (drc != 0) return PICO_ERR_DNS;
+            /* Skip the probe for names the resolver would not answer
+             * for anyway. `localhost` and IP literals come from the
+             * hosts file or need no lookup at all, so a DNS query for
+             * them fails — and failing the probe aborted the request
+             * before a single packet was sent. That silently made
+             * every localhost registry unreachable, including
+             * procure's own default of http://localhost:8080 and any
+             * cookbook started from cookbook_start.bat. */
+            const char *h = parsed.host;
+            int skip = (strcmp(h, "localhost") == 0);
+            if (!skip) {
+                /* IPv4/IPv6 literal: only hex digits, dots, colons. */
+                skip = 1;
+                for (const char *p = h; *p; p++) {
+                    if (!((*p >= '0' && *p <= '9') || *p == '.' || *p == ':' ||
+                          (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
+                        skip = 0; break;
+                    }
+                }
+            }
+            if (!skip) {
+                dns_response dnr;
+                memset(&dnr, 0, sizeof(dnr));
+                unsigned long drc = dns_query(&dnr, parsed.host);
+                dns_response_free(&dnr);
+                http_url_free(&parsed);
+                if (drc != 0) return PICO_ERR_DNS;
+            } else {
+                http_url_free(&parsed);
+            }
         } else {
             http_url_free(&parsed);
         }
