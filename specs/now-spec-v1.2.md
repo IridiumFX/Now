@@ -368,8 +368,14 @@ Shorthand: `inherit: *` (inherit everything), `inherit: null` (inherit
 nothing).
 
 Fields never inherited regardless of policy: `group`, `artifact`,
-`version`, `modules`, `output`, `sources`, `tests`, `langs`, `assembly`,
+`modules`, `output`, `sources`, `tests`, `langs`, `assembly`,
 `publish`.
+
+`version` *is* inheritable and is listed in `inherit_defaults` above —
+a module that omits `version` takes the root's (see also Chapter 21,
+"Inherited Root Version"). A module that declares its own always keeps
+it. Earlier drafts listed `version` in both places; the inheritable
+reading is the correct one.
 
 ### Property volatility
 
@@ -2621,6 +2627,22 @@ through verbatim (they are MSVC-native and `now` does not translate them).
 | `-Wl,--heap,size` | `/HEAP:size` | Heap size |
 | `-Wl,--entry,sym` | `/ENTRY:sym` | Entry point |
 | `-Wl,--version-script` | *(no equivalent — use DEF file)* | See §7.10 |
+
+### Path resolution inside link flags
+
+`link.flags` entries are passed to the link driver **verbatim**. `now`
+does not inspect them for paths, so a relative path inside a flag — say
+`-Wl,-T,ld/board.ld` or `-Wl,-Map,out/app.map` — is resolved by the
+linker against the **current working directory of the `now` process**,
+not the module directory. In a workspace built from the root, that is
+the workspace root; the same descriptor built from inside the module
+directory resolves the same flag differently.
+
+Fields that hold a path in their own right — `link.libdirs`,
+`link.archives`, and `link.script` — are resolved against the module
+directory, so prefer them over hand-rolled flags where one exists.
+`link.script` emits `-T` (GNU driver); on MSVC it has no equivalent and
+is ignored.
 
 ---
 
