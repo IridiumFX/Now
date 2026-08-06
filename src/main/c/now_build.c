@@ -3670,6 +3670,24 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
 
     for (size_t i = 0; i < test_sources.count; i++) {
         const char *src = test_sources.paths[i];
+
+        /* tests.exclude (glob), same matching rule as sources.exclude:
+         * try the tests.dir-rooted spelling and the project-relative one.
+         * Needed for the common case of a long-running stress or bench
+         * driver that lives beside the unit tests but must not be run
+         * as one — without this the field parsed and did nothing, and
+         * `now test` would hang on it. */
+        if (p->tests.exclude.count > 0) {
+            const char *rel = path_rel_to_dir(src, p->tests.dir);
+            int skip = 0;
+            for (size_t ex = 0; ex < p->tests.exclude.count; ex++) {
+                const char *pat = p->tests.exclude.items[ex];
+                if (now_glob_match(pat, rel) ||
+                    (rel != src && now_glob_match(pat, src))) { skip = 1; break; }
+            }
+            if (skip) continue;
+        }
+
         const NowLangDef *lang = NULL;
         const NowLangType *type = now_lang_classify(
             src, (const char *const *)p->langs.items, p->langs.count, &lang);
@@ -3718,8 +3736,18 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             free(src_full_check);
         }
 
-        /* Build argv — MSVC vs GCC/Clang */
-        const char *argv[64];
+        /* Build argv — MSVC vs GCC/Clang.
+         * Heap-sized to the actual flag counts: a fixed cap here would
+         * silently drop the tail, and a dropped -D is not a truncated
+         * command line but a link failure hundreds of symbols long. */
+        size_t argv_need = 24
+                         + p->compile.includes.count
+                         + ctx->dep_includes.count
+                         + p->compile.defines.count
+                         + p->compile.flags.count
+                         + p->tests.defines.count;
+        const char **argv = (const char **)malloc(argv_need * sizeof(char *));
+        if (!argv) { free(obj); continue; }
         int argc = 0;
         char *inc_src = NULL, *inc_hdr = NULL;
         char *src_full = now_path_join(basedir, src);
@@ -3759,7 +3787,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                     free(prv);
                 }
             }
-            for (size_t ii = 0; ii < p->compile.includes.count && argc < 60; ii++) {
+            for (size_t ii = 0; ii < p->compile.includes.count; ii++) {
                 char *inc_full = now_path_join(basedir, p->compile.includes.items[ii]);
                 if (inc_full) {
                     char inc_flag[PATH_MAX + 4];
@@ -3769,8 +3797,23 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                 }
             }
             /* dep_includes are pre-formatted with /I prefix by procure */
-            for (size_t ii = 0; ii < ctx->dep_includes.count && argc < 60; ii++)
+            for (size_t ii = 0; ii < ctx->dep_includes.count; ii++)
                 argv[argc++] = ctx->dep_includes.paths[ii];
+
+            /* Production compile.defines — the test TU links against the
+             * production objects, so it must see the same macro world.
+             * Without this, a project whose headers switch on a
+             * static-vs-shared macro (COOKBOOK_STATIC, NOW_STATIC, ...)
+             * compiles its tests expecting __declspec(dllimport) and
+             * fails to link with hundreds of __imp_ undefined symbols. */
+            for (size_t ii = 0; ii < p->compile.defines.count; ii++) {
+                size_t blen = strlen(p->compile.defines.items[ii]) + 4;
+                char *d = (char *)malloc(blen);
+                if (d) {
+                    snprintf(d, blen, "/D%s", p->compile.defines.items[ii]);
+                    argv[argc++] = d;
+                }
+            }
 
             /* tests.defines — extra -DKEY=VAL macros (e.g. fixture paths) */
             for (size_t ii = 0; ii < p->tests.defines.count && argc < 60; ii++) {
@@ -3822,7 +3865,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                     free(prv);
                 }
             }
-            for (size_t ii = 0; ii < p->compile.includes.count && argc < 60; ii++) {
+            for (size_t ii = 0; ii < p->compile.includes.count; ii++) {
                 char *inc_full = now_path_join(basedir, p->compile.includes.items[ii]);
                 if (inc_full) {
                     char inc_flag[PATH_MAX + 4];
@@ -3832,11 +3875,32 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                 }
             }
             /* dep_includes are pre-formatted with -I prefix by procure */
-            for (size_t ii = 0; ii < ctx->dep_includes.count && argc < 60; ii++)
+            for (size_t ii = 0; ii < ctx->dep_includes.count; ii++)
                 argv[argc++] = ctx->dep_includes.paths[ii];
 
+            /* Production compile.flags — codegen and ABI must match the
+             * objects the test links against (packing, freestanding,
+             * reserved registers, and so on). */
+            for (size_t ii = 0; ii < p->compile.flags.count; ii++)
+                argv[argc++] = p->compile.flags.items[ii];
+
+            /* Production compile.defines — the test TU links against the
+             * production objects, so it must see the same macro world.
+             * Without this, a project whose headers switch on a
+             * static-vs-shared macro (COOKBOOK_STATIC, NOW_STATIC, ...)
+             * compiles its tests expecting __declspec(dllimport) and
+             * fails to link with hundreds of __imp_ undefined symbols. */
+            for (size_t ii = 0; ii < p->compile.defines.count; ii++) {
+                size_t blen = strlen(p->compile.defines.items[ii]) + 4;
+                char *d = (char *)malloc(blen);
+                if (d) {
+                    snprintf(d, blen, "-D%s", p->compile.defines.items[ii]);
+                    argv[argc++] = d;
+                }
+            }
+
             /* tests.defines — extra -DKEY=VAL macros (e.g. fixture paths) */
-            for (size_t ii = 0; ii < p->tests.defines.count && argc < 60; ii++) {
+            for (size_t ii = 0; ii < p->tests.defines.count; ii++) {
                 size_t blen = strlen(p->tests.defines.items[ii]) + 4;
                 char *d = (char *)malloc(blen);
                 if (d) {
@@ -3863,16 +3927,23 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             if (!((p_a[0] == '-' || p_a[0] == '/') &&
                   (p_a[1] == 'I' || p_a[1] == 'D')))
                 continue;
-            /* Skip if this pointer is owned by ctx->dep_includes. */
+            /* Skip pointers we borrowed rather than allocated: the
+             * filelist owns dep_includes, and the project owns
+             * compile.flags — a flag spelled -DFOO would otherwise be
+             * freed out from under the NowProject. */
             int borrowed = 0;
             for (size_t k = 0; k < ctx->dep_includes.count; k++) {
                 if (argv[a] == ctx->dep_includes.paths[k]) { borrowed = 1; break; }
+            }
+            for (size_t k = 0; !borrowed && k < p->compile.flags.count; k++) {
+                if (argv[a] == p->compile.flags.items[k]) { borrowed = 1; break; }
             }
             if (!borrowed) free((char *)argv[a]);
         }
         free(inc_src);
         free(inc_hdr);
         free(src_full);
+        free(argv);
 
         if (rc != 0) {
             if (result) {
