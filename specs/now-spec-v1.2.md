@@ -7957,9 +7957,37 @@ ecosystem. A Cargo user, an npm user, and a Maven user can all write a
 
 | Format | File extension | Comment char | Unquoted keys | Trailing commas | `now` role |
 |--------|---------------|--------------|---------------|-----------------|-----------|
-| Pasta  | `.pasta`      | `;`          | ✓             | ✓               | Native authoring format |
+| Pasta  | `.pasta`      | `;`, `//`, `/* */` | ✓       | ✗               | Native authoring format |
 | JSON5  | `.json5`      | `//` and `/* */` | ✓         | ✓               | Transition format |
 | JSON   | `.json`       | ✗            | ✗             | ✗               | Integration and onboarding format |
+
+**Pasta rejects trailing commas**, unlike JSON5. This table previously
+claimed otherwise; the Pasta grammar (`specs/Pasta.txt`, which predates
+the parser) has always required every comma to be followed by another
+member or element, and the parser enforces it:
+
+```
+member-list   : member , { blank , "," , blank , member } ;
+elements-list : element , { blank , "," , blank , element } ;
+```
+
+The format owners weighed relaxing it and chose to keep one exact
+grammar rather than a family of accepted dialects — JSON5 remains the
+looser surface for anyone who wants it. A stray trailing comma fails
+with `expected label or quoted key in map`, which is worth recognising:
+it usually means a line was deleted and its separator left behind.
+
+Pasta strings have **no escape sequences** — `"` cannot appear inside a
+simple string at all, and `\` is an ordinary character. Where a value
+must itself contain quotes (a `-D` whose value reaches the compiler
+quoted, say), use a multiline string:
+
+```pasta
+defines: ["""FOO="src/test/resources" """]
+```
+
+The trailing space matters: it keeps the value's closing quote from
+merging with the closing `"""` delimiter.
 
 All three map to identical in-memory data structures. The data model is
 the same — only the surface syntax differs.
