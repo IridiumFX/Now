@@ -82,4 +82,24 @@ NOW_API int now_cache_store_ex(const char *source_key,
                                 const char *obj_ext,
                                 const NowDepList *deps);
 
+/* Read the header dependencies recorded in a key's .deps sidecar.
+ *
+ * A cache hit restores an object without compiling, so nothing on that
+ * path learns which headers the object was built against — the build
+ * needs them to write a manifest entry that can go stale later.
+ * Without this, a restored object got a manifest entry with zero deps
+ * and was reported "up to date" forever, whatever happened to its
+ * headers.
+ *
+ * On success the caller owns both arrays and every string; free with
+ * now_cache_deps_free(). Returns 0 on success, -1 if there is no
+ * sidecar (in which case *count is 0 and the arrays are NULL). */
+NOW_API int now_cache_deps_for_key(const char *source_key,
+                                    char ***dep_paths,
+                                    char ***dep_hashes,
+                                    size_t *dep_count);
+
+NOW_API void now_cache_deps_free(char **dep_paths, char **dep_hashes,
+                                  size_t dep_count);
+
 #endif /* NOW_CACHE_H */

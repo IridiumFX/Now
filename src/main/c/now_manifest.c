@@ -353,10 +353,20 @@ NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
         int changed = !entry->source_hash ||
                       strcmp(cur_hash, entry->source_hash) != 0;
         free(cur_hash);
-        return changed;
+        if (changed) return 1;
+        /* Content is identical and only the mtime moved — fall through
+         * to the header check rather than returning "up to date".
+         *
+         * Returning here meant any operation that touches a .c without
+         * changing its bytes (git checkout, pull, branch switch, stash
+         * pop, rsync, a rewrite-on-save editor) disabled header
+         * tracking for that translation unit entirely: the loop below
+         * was never reached, so an edited header could not mark it
+         * stale. The object then kept the old declarations while
+         * compiling, archiving and linking all reported success. */
+    } else {
+        free(full);
     }
-
-    free(full);
 
     /* Check object file exists */
     if (entry->object && !now_path_exists(entry->object))

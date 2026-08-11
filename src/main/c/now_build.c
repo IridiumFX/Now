@@ -2651,12 +2651,37 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                     }
 
                     if (restored) {
-                        struct stat cst;
-                        long long mtime = 0;
-                        if (src_full && stat(src_full, &cst) == 0)
-                            mtime = (long long)cst.st_mtime;
-                        now_manifest_set(&manifest, src, obj,
-                                         src_hash, fhash, mtime);
+                        /* Carry the header deps across from the cache
+                         * sidecar.
+                         *
+                         * A restored object never ran the compiler, so
+                         * nothing here knows which headers it was built
+                         * against. Writing a manifest entry without them
+                         * left dep_count == 0, and now_manifest_needs_
+                         * rebuild's dep loop then iterated zero times and
+                         * reported "up to date" forever — an object frozen
+                         * against whatever its headers said when it was
+                         * first cached. If there is no sidecar to carry,
+                         * write no entry at all, so the next build probes
+                         * again rather than trusting a depless one. */
+                        char **dpaths = NULL, **dhashes = NULL;
+                        size_t dn = 0;
+                        int have_deps =
+                            (now_cache_deps_for_key(ckey, &dpaths, &dhashes, &dn) == 0);
+
+                        if (have_deps) {
+                            struct stat cst;
+                            long long mtime = 0;
+                            if (src_full && stat(src_full, &cst) == 0)
+                                mtime = (long long)cst.st_mtime;
+                            now_manifest_set(&manifest, src, obj,
+                                             src_hash, fhash, mtime);
+                            if (dn > 0)
+                                now_manifest_set_deps(&manifest, src,
+                                                      (const char **)dpaths,
+                                                      (const char **)dhashes, dn);
+                            now_cache_deps_free(dpaths, dhashes, dn);
+                        }
                         now_filelist_push(&ctx->objects, obj);
                         free(obj);
                         free(ckey);
@@ -3259,26 +3284,67 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
         if (stat(out_file, &out_st) == 0) {
             long long out_mtime = (long long)out_st.st_mtime;
             int up_to_date = 1;
-            if (ctx->last_compile_count > 0) {
-                /* compile actually recompiled — fall back to per-object check */
-                for (size_t i = 0; i < ctx->objects.count; i++) {
-                    struct stat obj_st;
-                    if (stat(ctx->objects.paths[i], &obj_st) != 0 ||
-                        (long long)obj_st.st_mtime > out_mtime) {
-                        up_to_date = 0;
-                        break;
-                    }
-                }
-            } else {
-                /* If ctx tracks zero recompiles, trust the manifest-state
-                 * invariant (objects on disk match what the manifest
-                 * recorded). Still cheap to defend against external
-                 * tampering: if compile_count==0 but objects somehow
-                 * vanished, the manifest_load below would catch the
-                 * lfh mismatch only on flag changes. The per-object stat
-                 * walk in this branch was the dominant link-skip cost. */
-                (void)out_mtime;
+
+            /* Every link input is compared against the output, always.
+             *
+             * Two separate holes lived here. The compile_count == 0 branch
+             * stat'd nothing at all and simply trusted that no input could
+             * have moved — but a workspace sibling rebuilding its .a is
+             * exactly that, and it recompiles nothing in *this* module. And
+             * the object walk used `>`, while st_mtime is second-resolution:
+             * an object written 274ms after the archive compares EQUAL and
+             * was treated as older. Both produce the same result, a stale
+             * binary reported "up to date", which is worse than no
+             * incremental mode at all because it is the default.
+             *
+             * `>=` costs an occasional redundant relink when timestamps
+             * genuinely tie; that is the right side to err on. */
+            #define NOW_INPUT_NEWER(path) do {                              \
+                struct stat _st;                                            \
+                if (stat((path), &_st) != 0 ||                              \
+                    (long long)_st.st_mtime >= out_mtime) {                 \
+                    up_to_date = 0;                                         \
+                }                                                           \
+            } while (0)
+
+            for (size_t i = 0; up_to_date && i < ctx->objects.count; i++)
+                NOW_INPUT_NEWER(ctx->objects.paths[i]);
+
+            /* Dependency archives: in a workspace this is how module B
+             * learns that module A's .a was rebuilt. Nothing else carries
+             * that signal — inject_sibling_artifacts passes only strings. */
+            for (size_t i = 0; up_to_date && i < ctx->dep_libs.count; i++)
+                NOW_INPUT_NEWER(ctx->dep_libs.paths[i]);
+
+            /* Explicitly listed pre-built archives. */
+            for (size_t i = 0; up_to_date && i < p->link.archives.count; i++) {
+                char *arc = now_path_join(basedir, p->link.archives.items[i]);
+                if (arc) { NOW_INPUT_NEWER(arc); free(arc); }
             }
+
+            /* Sibling/library search dirs x lib names: resolve the archive
+             * each -l would pick up and treat it as an input too. */
+            for (size_t li = 0; up_to_date && li < p->link.libs.count; li++) {
+                for (size_t di = 0; up_to_date && di < p->link.libdirs.count; di++) {
+                    char *dir = now_path_join(basedir, p->link.libdirs.items[di]);
+                    if (!dir) continue;
+                    char cand[PATH_MAX];
+                    snprintf(cand, sizeof(cand), "%s/lib%s.a",
+                             dir, p->link.libs.items[li]);
+                    free(dir);
+                    struct stat _cs;
+                    if (stat(cand, &_cs) == 0 &&
+                        (long long)_cs.st_mtime >= out_mtime)
+                        up_to_date = 0;
+                }
+            }
+
+            /* The linker script is an input as much as any object. */
+            if (up_to_date && p->link.script && p->link.script[0]) {
+                char *scr = now_path_join(basedir, p->link.script);
+                if (scr) { NOW_INPUT_NEWER(scr); free(scr); }
+            }
+            #undef NOW_INPUT_NEWER
             if (up_to_date) {
                 /* Compare current link flags against what compile saved.
                  * Use ctx->last_link_flags_hash when set (compile ran in

@@ -779,3 +779,38 @@ NOW_API int now_cache_print_stats(void) {
 
     return 0;
 }
+
+/* ---- Dep sidecar accessor (see now_cache.h) ---- */
+
+NOW_API int now_cache_deps_for_key(const char *source_key,
+                                    char ***dep_paths,
+                                    char ***dep_hashes,
+                                    size_t *dep_count) {
+    if (dep_paths)  *dep_paths = NULL;
+    if (dep_hashes) *dep_hashes = NULL;
+    if (dep_count)  *dep_count = 0;
+    if (!source_key || !dep_paths || !dep_hashes || !dep_count) return -1;
+
+    char *deps_path = now_cache_path(source_key, ".deps");
+    if (!deps_path) return -1;
+
+    char *stored_rkey = NULL;
+    int rc = read_deps_file(deps_path, &stored_rkey,
+                            dep_paths, dep_hashes, dep_count);
+    free(deps_path);
+    free(stored_rkey);   /* the result key is not the caller's concern */
+
+    if (rc != 0) {
+        *dep_paths = NULL;
+        *dep_hashes = NULL;
+        *dep_count = 0;
+        return -1;
+    }
+    return 0;
+}
+
+NOW_API void now_cache_deps_free(char **dep_paths, char **dep_hashes,
+                                  size_t dep_count) {
+    if (!dep_paths && !dep_hashes) return;
+    free_deps_arrays(dep_paths, dep_hashes, dep_count);
+}
