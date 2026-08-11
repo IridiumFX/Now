@@ -1917,7 +1917,24 @@ static char *expand_project_vars(const char *in, const char *basedir) {
     return out;
 }
 
-static char *compile_flags_hash(const NowProject *p) {
+/* Hash everything that changes the meaning of a compile: the descriptor
+ * flags, and the compiler itself.
+ *
+ * The compiler half is not decoration. This hash lands in the manifest as
+ * `flags_hash`, and the manifest is what decides whether a source needs
+ * recompiling *at all* — before the object cache is ever consulted. With
+ * only flags in it, switching toolchains left every object "up to date",
+ * and the link then mixed objects from two ABIs: two gcc majors disagree
+ * on how `stat` maps to a CRT symbol, so the failure showed up as an
+ * undefined reference at link. The quieter version of the same bug is two
+ * compilers that agree on symbol names and disagree on struct layout,
+ * which links clean and faults at runtime.
+ *
+ * Hash the driver's *content*, not just its path: an in-place upgrade
+ * keeps the path and changes the compiler. That also closes a cache hole,
+ * since now_cache_key() keys on the path alone and would otherwise serve
+ * an object built by the previous compiler installed at the same place. */
+static char *compile_flags_hash(const NowProject *p, const NowToolchain *tc) {
     /* Concatenate all flags that affect compilation */
     size_t cap = 256;
     char *buf = malloc(cap);
@@ -1943,6 +1960,21 @@ static char *compile_flags_hash(const NowProject *p) {
         APPEND(p->compile.includes.items[i]);
     for (size_t i = 0; i < p->compile.flags.count; i++)
         APPEND(p->compile.flags.items[i]);
+
+    /* Compiler identity. A tool that cannot be resolved contributes its
+     * name only — there is nothing to hash, and failing the build here
+     * would be worse than the coarser key. */
+    if (tc) {
+        const char *tools[2];
+        tools[0] = tc->cc;
+        tools[1] = tc->cxx;
+        for (size_t i = 0; i < 2; i++) {
+            if (!tools[i]) continue;
+            APPEND(tools[i]);
+            char *th = now_sha256_file_memo(tools[i], now_hash_memo_global);
+            if (th) { APPEND(th); free(th); }
+        }
+    }
     #undef APPEND
 
     char *hash = now_sha256_string(buf, len);
@@ -2493,7 +2525,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
     now_hash_memo_global = &hash_memo;
 
     /* Compute flags hash once for all sources */
-    char *fhash = compile_flags_hash(p);
+    char *fhash = compile_flags_hash(p, &ctx->toolchain);
     if (g_timing_on) now_timing_mark("  .flags_hash");
 
     /* Determine job count */
@@ -2558,6 +2590,10 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
     int skipped = 0;
     int cache_hits = 0;
     int remote_hits = 0;
+    /* Set whenever an entry is written outside the compile path — a cache
+     * restore writes one without compiling anything, and `compiled` alone
+     * would report the manifest as untouched. */
+    int manifest_dirty = 0;
 
     /* Load remote cache config (optional, silent on failure) */
     NowRemoteCacheConfig remote_cfg;
@@ -2681,6 +2717,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                                                       (const char **)dpaths,
                                                       (const char **)dhashes, dn);
                             now_cache_deps_free(dpaths, dhashes, dn);
+                            manifest_dirty = 1;
                         }
                         now_filelist_push(&ctx->objects, obj);
                         free(obj);
@@ -3085,9 +3122,16 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
     if (g_timing_on) now_timing_mark("  .pool+jobs");
 
     /* Save manifest only when its content changed. On a no-op rebuild
-     * (compiled=0 AND link_flags_hash unchanged), the on-disk manifest
-     * is already correct; rewriting it via pasta serialization is a
-     * 600ms tax for nothing. */
+     * (nothing compiled, nothing restored, link_flags_hash unchanged),
+     * the on-disk manifest is already correct; rewriting it via pasta
+     * serialization is a 600ms tax for nothing.
+     *
+     * `compiled` alone is not that condition. A build served entirely
+     * from the object cache compiles nothing yet writes a manifest entry
+     * per restored object; dropping those meant the next build found no
+     * usable entry, restored again, and discarded them again — a project
+     * whose objects all came from the cache never converged to "up to
+     * date" and paid a full copy-and-verify pass on every build. */
     if (manifest_path) {
         char *lfh = link_flags_hash(ctx->project);
         int lfh_changed = (lfh && (!manifest.link_flags_hash ||
@@ -3098,7 +3142,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         } else {
             free(lfh);
         }
-        if (compiled > 0 || lfh_changed)
+        if (compiled > 0 || manifest_dirty || lfh_changed)
             now_manifest_save(&manifest, manifest_path);
         /* Hand the current link_flags_hash forward so the link phase
          * doesn't need to reload the manifest just to compare. */
@@ -3855,7 +3899,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         }
         if (!test_flags_key) {
             /* Built once per run: production flags + test-only defines. */
-            char *base = compile_flags_hash(p);
+            char *base = compile_flags_hash(p, &ctx->toolchain);
             size_t need = (base ? strlen(base) : 0) + 2;
             for (size_t d = 0; d < p->tests.defines.count; d++)
                 need += strlen(p->tests.defines.items[d]) + 1;
