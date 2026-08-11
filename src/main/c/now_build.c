@@ -2634,7 +2634,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                     int restored = 0;
 
                     /* Try local cache first */
-                    if (obj && now_cache_restore_ex(ckey, obj, obj_ext) == 0) {
+                    if (obj && now_cache_restore_ex(ckey, obj, obj_ext, ctx->basedir) == 0) {
                         restored = 1;
                         cache_hits++;
                         if (now_tui_global) now_tui_cache_hit(now_tui_global, 0);
@@ -2894,7 +2894,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                     if (ckey) {
                         const char *ext = ctx->toolchain.is_msvc ? ".obj" : ".o";
                         now_cache_store_ex(ckey, job->obj_path, ext,
-                                           deps.count > 0 ? &deps : NULL);
+                                           deps.count > 0 ? &deps : NULL, ctx->basedir);
                         /* Push to remote cache */
                         if (has_remote)
                             now_remote_cache_store(&remote_cfg, ckey,
@@ -3046,7 +3046,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                             if (ckey) {
                                 const char *ext = ctx->toolchain.is_msvc ? ".obj" : ".o";
                                 now_cache_store_ex(ckey, job->obj_path, ext,
-                                                   deps.count > 0 ? &deps : NULL);
+                                                   deps.count > 0 ? &deps : NULL, ctx->basedir);
                                 /* Push to remote cache */
                                 if (has_remote)
                                     now_remote_cache_store(&remote_cfg, ckey,

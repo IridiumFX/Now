@@ -72,7 +72,8 @@ NOW_API int now_depfile_parse_msvc(const char *output, size_t output_len,
  * Returns 0 on hit, -1 on miss. */
 NOW_API int now_cache_restore_ex(const char *source_key,
                                   const char *dst_path,
-                                  const char *obj_ext);
+                                  const char *obj_ext,
+                                  const char *basedir);
 
 /* Dep-aware cache store. Stores object under result_key (computed from
  * source_key + dep hashes), and writes a .deps sidecar.
@@ -80,7 +81,8 @@ NOW_API int now_cache_restore_ex(const char *source_key,
 NOW_API int now_cache_store_ex(const char *source_key,
                                 const char *obj_path,
                                 const char *obj_ext,
-                                const NowDepList *deps);
+                                const NowDepList *deps,
+                                const char *basedir);
 
 /* Read the header dependencies recorded in a key's .deps sidecar.
  *

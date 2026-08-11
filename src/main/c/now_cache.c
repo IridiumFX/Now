@@ -525,6 +525,85 @@ static int read_deps_file(const char *deps_path,
     return (*stored_result_key) ? 0 : -1;
 }
 
+/* ---- Tree-portable dependency paths ----
+ *
+ * Depfiles give absolute header paths. Storing them verbatim made a
+ * cached object validate against the tree it was BUILT in rather than
+ * the tree it is being restored into: two checkouts with byte-identical
+ * sources and identical flags share a cache key, and the recorded paths
+ * still exist and still hash correctly over in the other tree, so
+ * validation passed and an object compiled against a foreign header was
+ * restored. (Reproduced: one module got offsetof == 0x40 restored from a
+ * sibling tree while its own header said 0x38.)
+ *
+ * Rewriting paths under the project root to a ${PROJ}/ sentinel fixes
+ * that — on restore they re-resolve against the current basedir, so the
+ * hash compares this tree's header and a foreign entry misses. It also
+ * makes entries portable between machines, which the remote cache wants:
+ * absolute paths would otherwise never match across two checkouts.
+ *
+ * Headers outside the project (system, toolchain) stay absolute: they
+ * are genuinely machine-global and their content is the thing that
+ * matters. */
+#define NOW_DEP_PROJ_TOKEN "${PROJ}/"
+
+static int path_char_eq(char a, char b) {
+    if (a == '\\') a = '/';
+    if (b == '\\') b = '/';
+#ifdef _WIN32
+    if (a >= 'A' && a <= 'Z') a += 32;
+    if (b >= 'A' && b <= 'Z') b += 32;
+#endif
+    return a == b;
+}
+
+/* abs -> "${PROJ}/rel" when under basedir, else a plain copy. */
+static char *dep_path_portable(const char *abs, const char *basedir) {
+    if (!abs) return NULL;
+    if (!basedir || !*basedir) return strdup(abs);
+
+    size_t bl = strlen(basedir);
+    while (bl > 0 && (basedir[bl-1] == '/' || basedir[bl-1] == '\\')) bl--;
+
+    size_t i = 0;
+    for (; i < bl; i++) {
+        if (!abs[i] || !path_char_eq(abs[i], basedir[i])) return strdup(abs);
+    }
+    if (abs[i] != '/' && abs[i] != '\\') return strdup(abs);
+    i++;  /* skip the separator */
+
+    size_t tlen = strlen(NOW_DEP_PROJ_TOKEN);
+    size_t rl = strlen(abs + i);
+    char *out = (char *)malloc(tlen + rl + 1);
+    if (!out) return strdup(abs);
+    memcpy(out, NOW_DEP_PROJ_TOKEN, tlen);
+    /* normalise separators so the same header spells identically on
+     * both sides of a machine boundary */
+    for (size_t k = 0; k < rl; k++)
+        out[tlen + k] = (abs[i + k] == '\\') ? '/' : abs[i + k];
+    out[tlen + rl] = '\0';
+    return out;
+}
+
+/* "${PROJ}/rel" -> "<basedir>/rel"; anything else copied through. */
+static char *dep_path_resolve(const char *stored, const char *basedir) {
+    if (!stored) return NULL;
+    size_t tlen = strlen(NOW_DEP_PROJ_TOKEN);
+    if (strncmp(stored, NOW_DEP_PROJ_TOKEN, tlen) != 0) return strdup(stored);
+    if (!basedir || !*basedir) return strdup(stored + tlen);
+
+    size_t bl = strlen(basedir);
+    while (bl > 0 && (basedir[bl-1] == '/' || basedir[bl-1] == '\\')) bl--;
+    const char *rel = stored + tlen;
+    size_t rl = strlen(rel);
+    char *out = (char *)malloc(bl + 1 + rl + 1);
+    if (!out) return NULL;
+    memcpy(out, basedir, bl);
+    out[bl] = '/';
+    memcpy(out + bl + 1, rel, rl + 1);
+    return out;
+}
+
 static void free_deps_arrays(char **paths, char **hashes, size_t count) {
     for (size_t i = 0; i < count; i++) {
         free(paths[i]);
@@ -583,7 +662,8 @@ static void sort_deps(char **paths, char **hashes, size_t count) {
 
 NOW_API int now_cache_restore_ex(const char *source_key,
                                   const char *dst_path,
-                                  const char *obj_ext) {
+                                  const char *obj_ext,
+                                  const char *basedir) {
     if (!source_key || !dst_path) return -1;
 
     char *deps_path = now_cache_path(source_key, ".deps");
@@ -616,7 +696,15 @@ NOW_API int now_cache_restore_ex(const char *source_key,
 
     int valid = 1;
     for (size_t i = 0; i < dep_count; i++) {
-        cur_hashes[i] = now_sha256_file_memo(dep_paths[i], now_hash_memo_global);
+        /* Resolve ${PROJ}/ against THIS tree before hashing. That is what
+         * makes a foreign entry miss: the stored hash came from another
+         * checkout's header, so hashing ours disagrees and we recompile
+         * instead of restoring an object built against a different
+         * declaration. */
+        char *real = dep_path_resolve(dep_paths[i], basedir);
+        cur_hashes[i] = real ? now_sha256_file_memo(real, now_hash_memo_global)
+                             : NULL;
+        free(real);
         if (!cur_hashes[i] ||
             strcmp(cur_hashes[i], dep_hashes[i]) != 0) {
             valid = 0;
@@ -661,7 +749,8 @@ NOW_API int now_cache_restore_ex(const char *source_key,
 NOW_API int now_cache_store_ex(const char *source_key,
                                 const char *obj_path,
                                 const char *obj_ext,
-                                const NowDepList *deps) {
+                                const NowDepList *deps,
+                                const char *basedir) {
     if (!source_key || !obj_path) return -1;
 
     /* No deps → fall back to simple store */
@@ -679,7 +768,8 @@ NOW_API int now_cache_store_ex(const char *source_key,
     }
 
     for (size_t i = 0; i < n; i++) {
-        sorted_paths[i] = strdup(deps->paths[i]);
+        /* Hash the real file, but record a tree-portable spelling. */
+        sorted_paths[i] = dep_path_portable(deps->paths[i], basedir);
         sorted_hashes[i] = now_sha256_file_memo(deps->paths[i], now_hash_memo_global);
         if (!sorted_paths[i] || !sorted_hashes[i]) {
             /* Cleanup on error — fall back to simple store */

@@ -6647,7 +6647,7 @@ static void test_cache_restore_ex_no_deps(void) {
     /* Use a fresh key that has no .deps file */
     char *key = now_cache_key("no_deps_test_xyz", "flags", "/cc");
     ASSERT_NOT_NULL(key);
-    int rc = now_cache_restore_ex(key, "target/_nodeps.o", ".o");
+    int rc = now_cache_restore_ex(key, "target/_nodeps.o", ".o", NULL);
     ASSERT_EQ(rc, -1);
     free(key);
     PASS();
@@ -6681,12 +6681,12 @@ static void test_cache_store_restore_ex_with_deps(void) {
     deps.count = 1;
     deps.capacity = 1;
 
-    int rc = now_cache_store_ex(skey, objfile, ".o", &deps);
+    int rc = now_cache_store_ex(skey, objfile, ".o", &deps, NULL);
     ASSERT_EQ(rc, 0);
 
     /* Restore should succeed */
     const char *dst = "target/_deptest_restore.o";
-    rc = now_cache_restore_ex(skey, dst, ".o");
+    rc = now_cache_restore_ex(skey, dst, ".o", NULL);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(now_path_exists(dst), 1);
     remove(dst);
@@ -6697,7 +6697,7 @@ static void test_cache_store_restore_ex_with_deps(void) {
         fprintf(f, "#define FOO 2\n");
         fclose(f);
     }
-    rc = now_cache_restore_ex(skey, dst, ".o");
+    rc = now_cache_restore_ex(skey, dst, ".o", NULL);
     ASSERT_EQ(rc, -1);
 
     /* Cleanup */
@@ -6735,13 +6735,13 @@ static void test_cache_restore_ex_dep_deleted(void) {
     deps.count = 1;
     deps.capacity = 1;
 
-    now_cache_store_ex(skey, objfile, ".o", &deps);
+    now_cache_store_ex(skey, objfile, ".o", &deps, NULL);
 
     /* Delete the dep file */
     remove(hdr);
 
     /* Restore should fail */
-    int rc = now_cache_restore_ex(skey, "target/_deldep_restore.o", ".o");
+    int rc = now_cache_restore_ex(skey, "target/_deldep_restore.o", ".o", NULL);
     ASSERT_EQ(rc, -1);
 
     now_deplist_free(&deps);
