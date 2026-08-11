@@ -28,13 +28,28 @@ RISC-V — our most demanding freestanding consumer).
 
 ## Build
 
-Toolchain is bundled inside CLion; nothing is on PATH by default.
-Resolve it without hardcoding a version — the IDE upgrades break any
-pinned path:
+The toolchain is bundled inside CLion. `C:\Users\Iridium\toolchain\mingw`
+is a junction to it and sits first on the user PATH, so a plain shell
+gets **gcc 15.2.0**. After a CLion upgrade the junction points at the
+old install — repoint it (unelevated):
+
+```
+cmd /c rmdir C:\Users\Iridium\toolchain\mingw && cmd /c mklink /J C:\Users\Iridium\toolchain\mingw "C:\Program Files\JetBrains\CLion <ver>\bin\mingw"
+```
+
+To resolve it directly without depending on the junction:
 
 ```
 export PATH="$(ls -d '/c/Program Files/JetBrains/CLion '*/bin/mingw/bin | tail -1):$PATH"
 ```
+
+**A WinLibs gcc 14.2.0 is still later on PATH** (winget). Anything that
+resets PATH gets that one instead, and mixing the two across builds is
+a real failure mode — 14 and 15 disagree on how `stat` maps to a CRT
+symbol, so a mixed link dies on `undefined reference to stat64i32`.
+`now` now recompiles on a compiler change rather than reusing the
+objects, but a *partial* PATH is still worth checking first when a
+build fails oddly.
 
 ```
 now build -j 32          # 16C/32T machine — use it
@@ -61,14 +76,12 @@ for when `target/bin/now.exe` is missing or broken.
 - **The version lives in two places**: `now.pasta` and
   `now_version()` at `src/main/c/now.c:20`. Bump both — the binary
   reports the latter.
-- **Trailing commas break parsing** even though spec §23.1 lists them
-  as legal Pasta. The parser is basta's
-  (`lib/basta/src/main/c/basta_parser.c:212`), an external repo. Keep
-  descriptors comma-clean until that is fixed upstream. `//` comments
-  are JSON5, not Pasta (`;`), though the parser tolerates them.
-- **`lib/alforno` cannot be advanced** past `e28f82f`: every commit
-  from `f176e12` onward carries a trailing comma in its own `now.pasta`
-  that our parser rejects.
+- **Trailing commas are not legal Pasta** — the format owner ruled on
+  this, and spec §23.1 was wrong, not the parser. Keep descriptors
+  comma-clean. `//` comments are JSON5, not Pasta (`;`), though the
+  parser tolerates them.
+- **`lib/alforno`** is at `078be82`; the descriptor problems that
+  pinned it to `e28f82f` were fixed upstream on 2026-08-11.
 - **Changing `struct NowProject`'s layout needs a clean rebuild**
   (`rm -rf target`). A partial rebuild once left stale objects reading
   `_pasta_root` at the old offset, segfaulting in
