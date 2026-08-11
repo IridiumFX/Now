@@ -72,6 +72,12 @@ add_library(now
     lib/alforno/src/main/c/alforno_link.c
     lib/alforno/src/main/c/alforno_include.c
     lib/alforno/src/main/c/alforno_validate.c
+    # Pass 6 (prune/filter), added upstream 347a2ba. `now build` finds
+    # vendored sources by walking the tree, so it picked this up on its
+    # own; this explicit list did not, and the divergence only showed as
+    # an undefined reference at CMake link time. Any alforno source added
+    # upstream has to be added here too.
+    lib/alforno/src/main/c/alforno_select.c
     # Apennines (vendored — tier paths match canonical apennines repo
     # one-to-one so refreshes are a literal cp -R)
     lib/apennines/src/main/c/t3/fs/fwatch.c
