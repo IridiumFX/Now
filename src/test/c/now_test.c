@@ -1889,6 +1889,33 @@ static void test_sha256_string(void) {
 
 /* ---- Resolver ---- */
 
+static void test_resolver_highest_defers_to_registry(void) {
+    TEST("resolver: 'highest' defers version choice to the registry");
+    NowResolver r;
+    now_resolver_init(&r, "highest");
+    ASSERT_EQ(now_resolver_add(&r, "zlib:zlib:^1.3.0", "compile", "root", 0), 0);
+
+    NowLockFile lf;
+    now_lock_init(&lf);
+    NowResult res;
+    ASSERT_EQ(now_resolver_resolve(&r, &lf, &res), 0);
+
+    const NowLockEntry *e = now_lock_find(&lf, "zlib", "zlib");
+    ASSERT_NOT_NULL(e);
+    /* Empty means "ask the registry". Writing the floor here is what
+     * made `convergence: "highest"` silently behave as "lowest". */
+    ASSERT_NOT_NULL(e->version);
+    if (e->version[0] != '\0') {
+        FAIL("highest should not pin the range floor");
+        now_lock_free(&lf); now_resolver_free(&r);
+        return;
+    }
+
+    now_lock_free(&lf);
+    now_resolver_free(&r);
+    PASS();
+}
+
 static void test_resolver_single_dep(void) {
     TEST("resolver: single dependency resolves");
     NowResolver r;
@@ -7026,6 +7053,7 @@ int main(void) {
 
     printf("\n  Resolver:\n");
     test_resolver_single_dep();
+    test_resolver_highest_defers_to_registry();
     test_resolver_convergence_lowest();
     test_resolver_conflict();
     test_resolver_multiple_deps();

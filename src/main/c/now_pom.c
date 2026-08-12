@@ -484,6 +484,10 @@ static const char *const k_known_keys[] = {
  * parse fine and are then ignored — warn so nobody plans around them. */
 static const char *const k_inert_keys[] = {
     "profiles", "properties", "walk_boundary", "inheritance",
+    /* Parsed by nobody: reported as "recognized but not implemented"
+     * rather than "unknown", which is the difference between a user
+     * checking their spelling and a user checking the roadmap. */
+    "allow_prerelease",
     "publish", "assembly", NULL
 };
 
@@ -491,6 +495,93 @@ static int str_in_list(const char *const *list, const char *s) {
     for (size_t i = 0; list[i]; i++)
         if (strcmp(list[i], s) == 0) return 1;
     return 0;
+}
+
+/* Nested fields that parse and are then never read.
+ *
+ * The key diagnostics only ever walked the top level, so every one of
+ * these was accepted in silence — which is how they survived: a user
+ * writes `output: { dir: "dist" }`, sees no complaint, and reasonably
+ * concludes the build honours it. A silently ignored field is worse
+ * than a missing one, because nothing tells you it did nothing.
+ *
+ * Warn rather than reject: these appear in real descriptors already,
+ * and failing a build on a field that has always been a no-op would
+ * break working projects to no benefit.
+ *
+ * Verified dead 2026-08-12 — check before adding, and delete an entry
+ * the moment it is implemented. */
+typedef struct {
+    const char        *section;   /* top-level key */
+    int                is_array;  /* section holds an array of maps */
+    const char *const *dead;      /* NULL-terminated */
+} NowDeadNested;
+
+static const char *const k_dead_output[]  = { "dir", NULL };
+static const char *const k_dead_link[]    = { "script_body", NULL };
+static const char *const k_dead_sources[] = { "mode", NULL };
+static const char *const k_dead_tests[]   = { "pattern", "headers",
+                                              "private_headers", NULL };
+static const char *const k_dead_deps[]    = { "exclude", "volatile", NULL };
+static const char *const k_dead_repos[]   = { "release", "snapshot",
+                                              "auth", NULL };
+static const char *const k_dead_plugins[] = { "type", "run", NULL };
+static const char *const k_dead_inherit[] = { "profiles", "properties", NULL };
+
+static const NowDeadNested k_dead_nested[] = {
+    { "output",  0, k_dead_output  },
+    { "link",    0, k_dead_link    },
+    { "sources", 0, k_dead_sources },
+    { "tests",   0, k_dead_tests   },
+    { "deps",    1, k_dead_deps    },
+    { "repos",   1, k_dead_repos   },
+    { "plugins", 1, k_dead_plugins },
+    { "inherit", 0, k_dead_inherit },
+    { NULL, 0, NULL }
+};
+
+static void warn_dead_map(const PastaValue *m, const char *const *dead,
+                           const char *section, const char *where) {
+    if (!m || pasta_type(m) != PASTA_MAP) return;
+    for (size_t i = 0; dead[i]; i++) {
+        if (!pasta_map_get(m, dead[i])) continue;
+        fprintf(stderr,
+                "warning: %s: '%s.%s' is parsed but has no effect in this "
+                "build - it is ignored\n", where, section, dead[i]);
+    }
+}
+
+static void warn_dead_nested_keys(const PastaValue *root, const char *path) {
+    if (!root || pasta_type(root) != PASTA_MAP) return;
+    const char *where = path ? path : "now.pasta";
+    for (size_t s = 0; k_dead_nested[s].section; s++) {
+        const PastaValue *sec = pasta_map_get(root, k_dead_nested[s].section);
+        if (!sec) continue;
+        if (k_dead_nested[s].is_array) {
+            if (pasta_type(sec) != PASTA_ARRAY) continue;
+            size_t n = pasta_count(sec);
+            /* One warning per section, not per element — a dep list with
+             * twenty entries carrying `exclude` should say so once. */
+            int said[8] = {0};
+            for (size_t e = 0; e < n; e++) {
+                const PastaValue *el = pasta_array_get(sec, e);
+                if (!el || pasta_type(el) != PASTA_MAP) continue;
+                for (size_t k = 0; k_dead_nested[s].dead[k] && k < 8; k++) {
+                    if (said[k]) continue;
+                    if (!pasta_map_get(el, k_dead_nested[s].dead[k])) continue;
+                    said[k] = 1;
+                    fprintf(stderr,
+                            "warning: %s: '%s[].%s' is parsed but has no "
+                            "effect in this build - it is ignored\n",
+                            where, k_dead_nested[s].section,
+                            k_dead_nested[s].dead[k]);
+                }
+            }
+        } else {
+            warn_dead_map(sec, k_dead_nested[s].dead,
+                          k_dead_nested[s].section, where);
+        }
+    }
 }
 
 static void warn_descriptor_keys(const PastaValue *root, const char *path) {
@@ -919,6 +1010,7 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
     apply_maven_defaults(p);
 
     warn_descriptor_keys(root, path);
+    warn_dead_nested_keys(root, path);
 
     if (result) {
         result->code = NOW_OK;

@@ -1727,10 +1727,16 @@ skip_header:
         now_advisory_db_free(&adb);
 
     } else if (strcmp(phase, "advisory:update") == 0) {
-        /* For v1, advisory:update is a placeholder — db must be manually placed */
-        printf("advisory:update — not yet implemented (requires HTTP client)\n"
-               "Place advisory database at ~/.now/advisories/now-advisory-db.pasta\n");
-        rc = 0;
+        /* Still not implemented — but it used to exit 0, so a CI job with
+         * `now advisory:update` in it recorded a successful advisory
+         * refresh while the database silently went stale. Failing is the
+         * honest answer until this fetches something. */
+        fprintf(stderr,
+                "error: advisory:update is not implemented in this build\n"
+                "       Place the advisory database at "
+                "~/.now/advisories/now-advisory-db.pasta;\n"
+                "       `now advisory:check` reads it from there.\n");
+        rc = 1;
 
     } else if (strcmp(phase, "verify") == 0) {
         /* Verify archive signature against trust store */

@@ -413,8 +413,28 @@ NOW_API int now_resolver_resolve(NowResolver *r, NowLockFile *lf, NowResult *res
         entry.scope    = (char *)scope;
         entry.overridden = has_override;
 
-        /* Version: use floor as the selected version */
-        char *ver_str = now_semver_to_string(&resolved.floor);
+        /* Version selection.
+         *
+         * "lowest" is answerable here: the lowest version satisfying the
+         * range is its floor, no registry needed.
+         *
+         * "highest" is not. The ceiling of `^1.2.0` is `2.0.0`, which is
+         * excluded, and the highest version that actually exists is
+         * whatever the registry happens to hold. Writing the floor here
+         * meant `convergence: "highest"` resolved to the *lowest*
+         * version and did so silently — procure has always known how to
+         * pick the highest from a registry listing, but only when the
+         * version arrives empty, and it never did. Leave it empty and
+         * let procure ask.
+         *
+         * Consequence worth knowing: "highest" now needs a reachable
+         * registry and fails without one, where before it quietly
+         * returned the wrong version. */
+        char *ver_str;
+        if (r->convergence && strcmp(r->convergence, "highest") == 0)
+            ver_str = strdup("");
+        else
+            ver_str = now_semver_to_string(&resolved.floor);
         entry.version = ver_str;
         entry.triple  = strdup("noarch");
 
