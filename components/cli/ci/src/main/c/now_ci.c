@@ -285,8 +285,15 @@ NOW_API int now_ci_run(NowProject *project, const char *basedir,
             now_ci_github_annotation("error", NULL, 0, result->message);
         }
         if (env->format == NOW_OUTPUT_JSON || env->format == NOW_OUTPUT_PASTA) {
+            /* A failed build has counts too — how far it got before it
+             * broke is exactly what a dashboard wants. */
             char *out = now_ci_format_build("build", build_rc, build_ms,
-                                             0, 0, 0, 1, env->format);
+                                             result->build_total,
+                                             result->build_compiled,
+                                             result->build_cached,
+                                             result->build_failed > 0
+                                                 ? result->build_failed : 1,
+                                             env->format);
             if (out) { fprintf(stdout, "%s\n", out); free(out); }
         }
 
@@ -324,10 +331,24 @@ NOW_API int now_ci_run(NowProject *project, const char *basedir,
 
     /* Output structured results */
     if (env->format == NOW_OUTPUT_JSON || env->format == NOW_OUTPUT_PASTA) {
+        /* Real tallies now that NowResult carries them. These were all
+         * hardcoded zeros, so any dashboard reading this JSON recorded
+         * every run as zero files built and zero tests executed. */
         char *bout = now_ci_format_build("build", 0, build_ms,
-                                          0, 0, 0, 0, env->format);
-        char *tout = now_ci_format_test(test_rc, 0, 0,
-                                         test_rc != 0 ? 1 : 0, 0,
+                                          result->build_total,
+                                          result->build_compiled,
+                                          result->build_cached,
+                                          result->build_failed, env->format);
+        /* A test phase that dies before running anything (a link error,
+         * say) has no counts to report, but must not read as "0 failed"
+         * next to status "fail". Fall back to the phase result. */
+        int t_failed = test_result.tests_failed > 0
+                       ? test_result.tests_failed
+                       : (test_rc != 0 ? 1 : 0);
+        char *tout = now_ci_format_test(test_rc,
+                                         test_result.tests_total,
+                                         test_result.tests_passed,
+                                         t_failed, 0,
                                          test_ms, env->format);
         if (bout) { fprintf(stdout, "%s\n", bout); free(bout); }
         if (tout) { fprintf(stdout, "%s\n", tout); free(tout); }

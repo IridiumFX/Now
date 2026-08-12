@@ -57,6 +57,23 @@ typedef struct {
     int      line;
     int      col;
     char     message[512];
+
+    /* Phase counters for structured reporting.
+     *
+     * `now ci --output json` emitted hardcoded zeros for every one of
+     * these because there was nowhere for a count to travel: a dashboard
+     * consuming the JSON saw a build of no files and a test run of no
+     * tests, whatever actually happened. Appended at the end of the
+     * struct and zero by default, so every existing memset-and-pass
+     * caller keeps working unchanged. */
+    int build_total;     /* sources considered */
+    int build_compiled;  /* actually invoked the compiler */
+    int build_cached;    /* served from the object cache */
+    int build_failed;
+
+    int tests_total;
+    int tests_passed;
+    int tests_failed;
 } NowResult;
 
 /* ---- Project Object Model ---- */

@@ -3174,6 +3174,15 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
 
     ctx->last_compile_count = compiled;
 
+    /* Same tallies the human-readable line below reports, handed to the
+     * caller so `now ci --output json` can stop emitting zeros. */
+    if (result) {
+        result->build_compiled = compiled;
+        result->build_cached   = cache_hits + remote_hits;
+        result->build_total    = compiled + cache_hits + remote_hits + skipped;
+        result->build_failed   = errors;
+    }
+
     if (!now_tui_global && (compiled > 0 || skipped > 0 || cache_hits > 0 || remote_hits > 0)) {
         int total_cached = cache_hits + remote_hits;
         if (total_cached > 0 && compiled > 0 && max_jobs > 1) {
@@ -4385,6 +4394,12 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             fprintf(stderr, "  tests: %d passed, %d failed (mode=each)\n",
                     pass, fail);
 
+            if (result) {
+                result->tests_passed = pass;
+                result->tests_failed = fail;
+                result->tests_total  = pass + fail;
+            }
+
             free(test_bin_dir);
             now_filelist_free(&test_objects);
             now_filelist_free(&test_sources);
@@ -4600,6 +4615,15 @@ run_test_bin:
     {
         const char *test_argv[] = { test_bin, NULL };
         rc = now_exec_in_dir(test_argv, ctx->verbose, basedir);
+    }
+
+    /* Single-binary mode: the suite is one process and its internal case
+     * count is its own business, so count the binary, not the cases.
+     * Reporting 0 was worse — a green CI run looked like no tests ran. */
+    if (result) {
+        result->tests_total  = 1;
+        result->tests_passed = (rc == 0) ? 1 : 0;
+        result->tests_failed = (rc == 0) ? 0 : 1;
     }
 
     if (rc != 0) {
