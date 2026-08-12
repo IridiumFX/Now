@@ -239,10 +239,7 @@ NOW_API int now_advisory_db_load_string(NowAdvisoryDB *db, const char *input,
 }
 
 static char *advisory_db_path(void) {
-    const char *home = getenv("HOME");
-#ifdef _WIN32
-    if (!home) home = getenv("USERPROFILE");
-#endif
+    const char *home = now_home_dir();  /* one convention — see now_fs.h */
     if (!home) return NULL;
     char *now_dir = now_path_join(home, ".now");
     if (!now_dir) return NULL;

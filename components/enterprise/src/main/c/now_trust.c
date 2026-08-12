@@ -88,10 +88,7 @@ NOW_API const NowTrustKey *now_trust_find(const NowTrustStore *store,
 /* ---- Trust store persistence ---- */
 
 static char *trust_store_path(void) {
-    const char *home = getenv("HOME");
-#ifdef _WIN32
-    if (!home) home = getenv("USERPROFILE");
-#endif
+    const char *home = now_home_dir();  /* one convention — see now_fs.h */
     if (!home) return NULL;
     char *now_dir = now_path_join(home, ".now");
     if (!now_dir) return NULL;
@@ -184,10 +181,7 @@ NOW_API int now_trust_save(const NowTrustStore *store, NowResult *result) {
     }
 
     /* Ensure ~/.now/ exists */
-    const char *home = getenv("HOME");
-#ifdef _WIN32
-    if (!home) home = getenv("USERPROFILE");
-#endif
+    const char *home = now_home_dir();  /* one convention — see now_fs.h */
     if (home) {
         char *now_dir = now_path_join(home, ".now");
         if (now_dir) { now_mkdir_p(now_dir); free(now_dir); }

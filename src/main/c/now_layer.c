@@ -407,10 +407,7 @@ NOW_API int now_layer_discover(NowLayerStack *stack, const char *basedir,
     snprintf(dir, sizeof(dir), "%s", basedir);
 
     /* Get home directory for stop condition */
-    const char *home = getenv("HOME");
-#ifdef _WIN32
-    if (!home) home = getenv("USERPROFILE");
-#endif
+    const char *home = now_home_dir();  /* one convention — see now_fs.h */
 
     for (int depth = 0; depth < 64; depth++) {
         /* Check for VCS root — stop */

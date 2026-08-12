@@ -18,6 +18,16 @@
   #define NOW_SEP_STR "/"
 #endif
 
+/* The user's home directory — the one `~/.now` hangs off.
+ *
+ * Exists because the codebase had two conventions. Most sites checked
+ * USERPROFILE first on Windows; the trust store, the layer stack and the
+ * advisory database checked HOME first. Under Git Bash both are set and
+ * can differ, so `now trust:add` could write a key into one home while
+ * procure looked for it in the other — signature verification failing
+ * with the key sitting right there. Returns a borrowed pointer or NULL. */
+NOW_API const char *now_home_dir(void);
+
 NOW_API char       *now_path_join(const char *a, const char *b);
 NOW_API const char *now_path_ext(const char *path);
 NOW_API const char *now_path_basename(const char *path);

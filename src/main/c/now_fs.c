@@ -35,6 +35,21 @@
 
 /* ---- Path utilities ---- */
 
+NOW_API const char *now_home_dir(void) {
+    const char *home = NULL;
+#ifdef _WIN32
+    /* USERPROFILE first: it is the native Windows home and the one the
+     * majority of call sites already used. Git Bash also sets HOME, and
+     * when the two disagree the split is invisible until something
+     * written under one home is read from the other. */
+    home = getenv("USERPROFILE");
+    if (!home || !*home) home = getenv("HOME");
+#else
+    home = getenv("HOME");
+#endif
+    return (home && *home) ? home : NULL;
+}
+
 NOW_API char *now_path_join(const char *a, const char *b) {
     if (!a || !*a) return b ? strdup(b) : NULL;
     if (!b || !*b) return strdup(a);
