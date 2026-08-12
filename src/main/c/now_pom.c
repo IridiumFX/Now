@@ -6,6 +6,7 @@
 #include "now_pom.h"
 #include "now.h"
 #include "now_arch.h"
+#include "now_fs.h"   /* now_path_join — machine-level config lookup */
 
 #include "pasta.h"
 
@@ -167,6 +168,58 @@ static void load_strarray(NowStrArray *dst, const PastaValue *arr) {
         if (elem && pasta_type(elem) == PASTA_STRING)
             now_strarray_push(dst, pasta_get_string(elem));
     }
+}
+
+/* Union in the machine-level private groups from ~/.now/config.pasta.
+ *
+ * §25.2 states that both the machine-level and the project-level lists
+ * are checked and a group in either is private. Only the project level
+ * was ever read, so an administrator setting org-wide policy in
+ * config.pasta got a file that `now` opens for audit settings and for
+ * the remote object cache, but never for this — the policy looked
+ * applied and fenced nothing.
+ *
+ * Silent on every failure: no config file, unreadable, or malformed all
+ * mean "no machine-level policy". A missing optional config must not
+ * fail a build, and this runs on every descriptor load. */
+static void load_machine_private_groups(NowStrArray *dst) {
+    const char *home = NULL;
+#ifdef _WIN32
+    home = getenv("USERPROFILE");
+    if (!home) home = getenv("HOME");
+#else
+    home = getenv("HOME");
+#endif
+    if (!home || !*home) return;
+
+    char *dot_now = now_path_join(home, ".now");
+    if (!dot_now) return;
+    char *cfg = now_path_join(dot_now, "config.pasta");
+    free(dot_now);
+    if (!cfg) return;
+
+    FILE *fp = fopen(cfg, "rb");
+    free(cfg);
+    if (!fp) return;
+
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (len <= 0) { fclose(fp); return; }
+
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) { fclose(fp); return; }
+    size_t nread = fread(buf, 1, (size_t)len, fp);
+    buf[nread] = '\0';
+    fclose(fp);
+
+    PastaResult pr;
+    PastaValue *root = pasta_parse(buf, nread, &pr);
+    free(buf);
+    if (!root) return;
+    if (pr.code == PASTA_OK && pasta_type(root) == PASTA_MAP)
+        load_strarray(dst, pasta_map_get(root, "private_groups"));
+    pasta_free(root);
 }
 
 /* ---- Language-aware defaults ----
@@ -415,7 +468,8 @@ static void load_inherit(NowInherit *dst, const PastaValue *src) {
 static const char *const k_known_keys[] = {
     "group", "artifact", "version", "name", "description", "url", "license",
     "lang", "langs", "std", "sources", "tests", "output", "compile", "link",
-    "deps", "depends", "repos", "convergence", "private_groups", "plugins",
+    "deps", "depends", "repos", "convergence", "private_groups", "resolve",
+    "plugins",
     "components", "vendored", "modules", "java", "arch",
     /* Read out-of-band from the raw Pasta tree rather than into
      * NowProject, so they have no struct field to grep for — but they
@@ -825,8 +879,21 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
     /* Plugins (§10) */
     load_plugins(&p->plugins, pasta_map_get(root, "plugins"));
 
-    /* Dep confusion protection (§8) */
+    /* Dep confusion protection (§8, §25.2).
+     *
+     * Two spellings are documented and both must work. §25.2 shows the
+     * project-level form nested under `resolve:`, which was in neither
+     * key list and so warned as an unknown key and was dropped — a
+     * descriptor written straight from the spec got no fence at all.
+     * The flat form is what the implementation has always read. */
     load_strarray(&p->private_groups, pasta_map_get(root, "private_groups"));
+    {
+        const PastaValue *res = pasta_map_get(root, "resolve");
+        if (res && pasta_type(res) == PASTA_MAP)
+            load_strarray(&p->private_groups,
+                          pasta_map_get(res, "private_groups"));
+    }
+    load_machine_private_groups(&p->private_groups);
 
     /* Components (own modules) and vendored (external deps) */
     load_strarray(&p->components, pasta_map_get(root, "components"));
@@ -925,6 +992,17 @@ NOW_API NowProject *now_project_load_string(const char *input, size_t len,
     p->convergence = dup_map_str(root, "convergence");
     load_plugins(&p->plugins, pasta_map_get(root, "plugins"));
     load_strarray(&p->private_groups, pasta_map_get(root, "private_groups"));
+    {
+        /* §25.2's nested spelling — see the note in now_project_load.
+         * The machine-level file is deliberately *not* read here: this
+         * loader parses a descriptor held in memory, and reaching out to
+         * ~/.now would make the same string parse differently depending
+         * on the machine. */
+        const PastaValue *res = pasta_map_get(root, "resolve");
+        if (res && pasta_type(res) == PASTA_MAP)
+            load_strarray(&p->private_groups,
+                          pasta_map_get(res, "private_groups"));
+    }
     load_strarray(&p->components, pasta_map_get(root, "components"));
     load_strarray(&p->vendored, pasta_map_get(root, "vendored"));
     load_strarray(&p->modules, pasta_map_get(root, "modules"));

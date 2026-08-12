@@ -1176,6 +1176,11 @@ skip_header:
 
     if (strcmp(phase, "procure") == 0) {
         NowProcureOpts opts = {0};
+        /* --repo / --offline were parsed and then dropped on the floor:
+         * the struct had no field for the registry, and nothing ever set
+         * offline, so both flags were accepted and silently ignored. */
+        opts.registry_url = repo_url;
+        opts.offline      = flag_offline;
         rc = now_procure(project, &opts, &result);
         if (rc != 0)
             fprintf(stderr, "error: %s\n", result.message);

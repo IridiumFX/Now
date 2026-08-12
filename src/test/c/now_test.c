@@ -3305,6 +3305,90 @@ static void test_private_group_procure_fail(void) {
     PASS();
 }
 
+static void test_registry_is_public(void) {
+    TEST("private_groups: central registry recognised on host, not spelling");
+    if (!now_registry_is_public("https://repo.now.build")) { FAIL("repo.now.build"); return; }
+    if (!now_registry_is_public("https://registry.now.build/central")) { FAIL("registry.now.build w/ path"); return; }
+    /* The fence must not be defeated by scheme, port or trailing path. */
+    if (!now_registry_is_public("http://repo.now.build:8080/x")) { FAIL("scheme/port variant"); return; }
+    if (now_registry_is_public("https://pkg.acme.internal/now")) { FAIL("private host flagged public"); return; }
+    /* Suffix games must not match: evil-repo.now.build.attacker.com */
+    if (now_registry_is_public("https://repo.now.build.attacker.com/")) { FAIL("suffix impersonation"); return; }
+    PASS();
+}
+
+static void test_private_group_fence_stops_at_public(void) {
+    TEST("private_groups: candidates stop before the public registry");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"org.acme\", artifact: \"app\", version: \"1.0.0\","
+        "  lang: \"c\","
+        "  private_groups: [\"org.internal\"],"
+        "  repos: [\"https://pkg.acme.internal/now\","
+        "          \"https://repo.now.build\","
+        "          \"https://late.acme.internal/now\"] }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+
+    const char *out[8];
+    /* Private group: only the repo declared ahead of the public one. */
+    size_t n = now_registry_candidates(p, NULL, "org.internal.svc", out, 8);
+    if (n != 1) { FAIL("private group should get exactly one candidate"); now_project_free(p); return; }
+    if (strstr(out[0], "pkg.acme.internal") == NULL) { FAIL(out[0]); now_project_free(p); return; }
+
+    /* Public group: every declared repo, in order. */
+    n = now_registry_candidates(p, NULL, "com.example", out, 8);
+    if (n != 3) { FAIL("public group should see all repos"); now_project_free(p); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_private_group_repo_override_fenced(void) {
+    TEST("private_groups: --repo cannot unlock a private group");
+    NowResult res;
+    const char *pasta =
+        "{ group: \"org.acme\", artifact: \"app\", version: \"1.0.0\","
+        "  lang: \"c\", private_groups: [\"org.internal\"] }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+
+    const char *out[8];
+    NowProcureOpts opts = {0};
+    opts.registry_url = "https://repo.now.build";
+    /* Pointing --repo at the public registry must not serve a private group. */
+    if (now_registry_candidates(p, &opts, "org.internal.svc", out, 8) != 0) {
+        FAIL("public --repo served a private group"); now_project_free(p); return;
+    }
+    /* A private --repo is honoured, and replaces the declared list. */
+    opts.registry_url = "https://pkg.acme.internal/now";
+    if (now_registry_candidates(p, &opts, "org.internal.svc", out, 8) != 1) {
+        FAIL("private --repo should be honoured"); now_project_free(p); return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
+static void test_private_group_nested_resolve_form(void) {
+    TEST("private_groups: spec's resolve: {} form is honoured");
+    NowResult res;
+    /* §25.2 documents this spelling; it used to warn as an unknown key
+     * and leave the project unfenced. */
+    const char *pasta =
+        "{ group: \"org.acme\", artifact: \"app\", version: \"1.0.0\","
+        "  lang: \"c\","
+        "  resolve: { private_groups: [\"org.internal\"] } }";
+    NowProject *p = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!p) { FAIL(res.message); return; }
+    if (!now_group_is_private(&p->private_groups, "org.internal.svc")) {
+        FAIL("nested resolve.private_groups not applied");
+        now_project_free(p);
+        return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
 /* ---- Layer system ---- */
 
 static void test_layer_stack_init(void) {
@@ -7045,6 +7129,10 @@ int main(void) {
     test_private_group_null_safe();
     test_private_group_pom_load();
     test_private_group_procure_fail();
+    test_registry_is_public();
+    test_private_group_fence_stops_at_public();
+    test_private_group_repo_override_fenced();
+    test_private_group_nested_resolve_form();
 
     printf("\n  Reproducible builds:\n");
     test_repro_init();

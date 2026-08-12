@@ -23,7 +23,34 @@ typedef struct {
     const char *repo_root;   /* override ~/.now/repo (for testing) */
     const char *cache_root;  /* override ~/.now/cache (for testing) */
     int         offline;     /* 1 = skip downloads, use local only */
+    /* --repo: when set, the only registry consulted. `repos:` in the
+     * descriptor is bypassed entirely, which is what a CI job overriding
+     * the registry expects. Still subject to the private-group fence:
+     * pointing --repo at a public registry does not unlock a private
+     * group. */
+    const char *registry_url;
 } NowProcureOpts;
+
+/* Is this URL the public `now` central registry?
+ *
+ * The private-group fence (§25.2) is defined in terms of "before any
+ * public registry", so resolution has to be able to recognise one.
+ * Matched on host, so a path or scheme difference does not smuggle the
+ * central registry past the fence. */
+NOW_API int now_registry_is_public(const char *url);
+
+/* Ordered registries to consult for `group`, most-preferred first.
+ *
+ * Writes at most `max` borrowed URLs into `out` and returns the count.
+ * When the group is private (§25.2) the list stops at the first public
+ * registry and never includes one, so a private group can only ever be
+ * served by a repo declared ahead of the public one. A return of 0 for a
+ * private group means the fence has nothing to offer and the caller must
+ * fail rather than fall back. */
+NOW_API size_t now_registry_candidates(const NowProject *project,
+                                        const NowProcureOpts *opts,
+                                        const char *group,
+                                        const char **out, size_t max);
 
 /* Run the full procure phase for a project:
  * 1. Collect constraints from project deps

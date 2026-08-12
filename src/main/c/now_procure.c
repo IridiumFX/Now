@@ -170,6 +170,136 @@ NOW_API int now_group_is_private(const NowStrArray *private_groups,
     return 0;
 }
 
+NOW_API int now_registry_is_public(const char *url) {
+    if (!url || !*url) return 0;
+
+    /* Compare on host only. The fence has to hold whether the central
+     * registry is written with a path, a trailing slash, http or https,
+     * so anchoring on the scheme or on a whole-string match would be a
+     * way around it. */
+    const char *h = strstr(url, "://");
+    h = h ? h + 3 : url;
+    const char *end = h;
+    while (*end && *end != '/' && *end != ':') end++;
+    size_t hlen = (size_t)(end - h);
+
+    /* Both spellings are in circulation: the built-in layer defaults to
+     * repo.now.build (now_layer.c) while the spec's examples use
+     * registry.now.build. Until they are reconciled, treating only one
+     * as public would leave the other as an unfenced hole. */
+    static const char *const k_public_hosts[] = {
+        "repo.now.build", "registry.now.build", NULL
+    };
+    for (size_t i = 0; k_public_hosts[i]; i++) {
+        size_t plen = strlen(k_public_hosts[i]);
+        if (hlen == plen && strncmp(h, k_public_hosts[i], plen) == 0) return 1;
+    }
+    return 0;
+}
+
+NOW_API size_t now_registry_candidates(const NowProject *project,
+                                        const NowProcureOpts *opts,
+                                        const char *group,
+                                        const char **out, size_t max) {
+    if (!out || max == 0) return 0;
+
+    int is_private = project &&
+                     now_group_is_private(&project->private_groups, group);
+
+    /* --repo replaces the declared list rather than joining it: an
+     * operator naming one registry means that registry. The fence still
+     * applies, so it cannot be used to pull a private group from a
+     * public host. */
+    if (opts && opts->registry_url && *opts->registry_url) {
+        if (is_private && now_registry_is_public(opts->registry_url))
+            return 0;
+        out[0] = opts->registry_url;
+        return 1;
+    }
+
+    size_t n = 0;
+    if (project) {
+        for (size_t i = 0; i < project->repos.count && n < max; i++) {
+            const char *url = project->repos.items[i].url;
+            if (!url || !*url) continue;
+            if (is_private && now_registry_is_public(url)) {
+                /* §25.2: only repos declared *before* any public registry
+                 * are tried. Stop rather than skip — a private repo listed
+                 * after the public one is deliberately out of scope, so
+                 * that declaration order stays the whole policy. */
+                break;
+            }
+            out[n++] = url;
+        }
+    }
+
+    /* No repos declared at all: the historical default. Never for a
+     * private group — that is the case the original check caught, and it
+     * stays caught. */
+    if (n == 0 && !is_private && max > 0) {
+        out[n++] = "http://localhost:8080";
+    }
+    return n;
+}
+
+/* Most registries a single procure run will consult. Declaring more is
+ * not an error — the extras are simply never reached, which beats a
+ * heap allocation on a path that realistically holds two or three. */
+#define NOW_MAX_REGISTRIES 8
+
+typedef struct {
+    const char *url;   /* borrowed */
+    char       *jwt;   /* owned, may be NULL for an anonymous registry */
+    int         tried; /* auth attempted; do not retry per dep */
+} NowRegAuth;
+
+/* Credentials are keyed by registry, so a run that touches more than one
+ * needs a token per registry rather than one token reused everywhere —
+ * presenting registry A's JWT to registry B leaks it and fails anyway. */
+static const char *registry_jwt(NowRegAuth *cache, size_t *n,
+                                 const char *url, int offline,
+                                 NowResult *result) {
+    if (!cache || !n || !url) return NULL;
+    for (size_t i = 0; i < *n; i++)
+        if (cache[i].url && strcmp(cache[i].url, url) == 0)
+            return cache[i].jwt;
+
+    if (*n >= NOW_MAX_REGISTRIES) return NULL;
+    NowRegAuth *slot = &cache[(*n)++];
+    slot->url = url;
+    slot->jwt = NULL;
+    slot->tried = 1;
+    if (offline) return NULL;
+
+    NowCredentials creds;
+    if (now_auth_load(url, &creds) == 0) {
+        if (creds.username) {
+            char *host = NULL, *base_path = NULL;
+            int port = 80, tls = 0;
+            if (pico_http_parse_url_ex(url, &host, &port, &base_path, &tls) == 0) {
+                char *prefix = base_path ? base_path : strdup("");
+                size_t plen = prefix ? strlen(prefix) : 0;
+                while (plen > 0 && prefix[plen - 1] == '/') prefix[--plen] = '\0';
+                now_auth_login(host, port, prefix, &creds, tls, &slot->jwt, result);
+                free(prefix);
+            }
+            free(host);
+        }
+        /* No username: the raw token is the Bearer value. */
+        if (!slot->jwt && creds.token) slot->jwt = strdup(creds.token);
+        now_auth_creds_free(&creds);
+    }
+    return slot->jwt;
+}
+
+static void registry_auth_free(NowRegAuth *cache, size_t n) {
+    if (!cache) return;
+    for (size_t i = 0; i < n; i++) {
+        free(cache[i].jwt);
+        cache[i].jwt = NULL;
+    }
+}
+
 /* ---- Public API ---- */
 
 NOW_API char *now_repo_dep_path(const char *repo_root,
@@ -486,53 +616,43 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         return -1;
     }
 
-    /* Step 2: Determine registry URL and authenticate */
-    const char *registry_url = "http://localhost:8080";
-    if (project->repos.count > 0 && project->repos.items[0].url)
-        registry_url = project->repos.items[0].url;
-
+    /* Step 2: registries are now chosen per dependency, because the
+     * private-group fence depends on the dep's group. Auth follows the
+     * same way — resolved on first use of each registry and cached. */
     int offline = (opts && opts->offline);
-
-    /* Auth: load credentials and exchange for JWT if username is present */
-    NowCredentials creds;
-    char *jwt = NULL;
-    if (!offline && now_auth_load(registry_url, &creds) == 0) {
-        if (creds.username) {
-            char *host = NULL;
-            char *base_path = NULL;
-            int port = 80, tls = 0;
-            if (pico_http_parse_url_ex(registry_url, &host, &port,
-                                        &base_path, &tls) == 0) {
-                /* Strip trailing slash from prefix */
-                char *prefix = base_path ? base_path : strdup("");
-                size_t plen = strlen(prefix);
-                while (plen > 0 && prefix[plen - 1] == '/') prefix[--plen] = '\0';
-                now_auth_login(host, port, prefix, &creds, tls, &jwt, result);
-                free(prefix);
-            }
-            free(host);
-        }
-        /* If no username, use raw token as Bearer (backward compat) */
-        if (!jwt && creds.token)
-            jwt = strdup(creds.token);
-        now_auth_creds_free(&creds);
-    }
+    NowRegAuth reg_auth[NOW_MAX_REGISTRIES];
+    size_t reg_auth_n = 0;
+    memset(reg_auth, 0, sizeof(reg_auth));
 
     /* Step 3: For each resolved dep, ensure it's installed */
     for (size_t i = 0; i < lockfile.count; i++) {
         NowLockEntry *entry = &lockfile.entries[i];
 
-        /* Dep confusion protection: private groups must not resolve
-         * from the default public registry — only from project-declared repos */
+        /* Dependency-confusion fence (§25.2). The registries this dep may
+         * be served by, in declaration order — for a private group the
+         * list stops before any public registry and never contains one.
+         * An empty list is a hard failure: the spec is explicit that
+         * there is no fallback and no "try public anyway" escape. */
         int is_private = now_group_is_private(&project->private_groups,
                                                entry->group);
-        if (is_private && project->repos.count == 0) {
+        const char *cand_urls[NOW_MAX_REGISTRIES];
+        size_t cand_n = now_registry_candidates(project, opts, entry->group,
+                                                 cand_urls, NOW_MAX_REGISTRIES);
+        if (cand_n == 0) {
             if (result) {
                 result->code = NOW_ERR_NOT_FOUND;
-                snprintf(result->message, sizeof(result->message),
-                         "private group '%s' has no declared repositories — "
-                         "add a repos: entry or remove from private_groups",
-                         entry->group);
+                if (is_private)
+                    snprintf(result->message, sizeof(result->message),
+                             "%s:%s is in a private group and no private registry "
+                             "is declared ahead of a public one. The public registry "
+                             "was NOT consulted (private_groups policy). Declare a "
+                             "private repo before any public entry in repos:, or "
+                             "remove the group from private_groups",
+                             entry->group, entry->artifact);
+                else
+                    snprintf(result->message, sizeof(result->message),
+                             "no registry available for %s:%s",
+                             entry->group, entry->artifact);
             }
             now_resolver_free(&resolver);
             now_lock_free(&lockfile);
@@ -540,6 +660,13 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
             free(lock_path);
             return -1;
         }
+
+        /* The registry serving this dep. Provisionally the first
+         * candidate; whichever one proves it has the artifact takes over
+         * and `reg_locked` stops the archive loop searching again. */
+        const char *registry_url = cand_urls[0];
+        const char *jwt = NULL;
+        int reg_locked = 0;
 
         /* Check if already installed locally */
         if (now_repo_is_installed(repo_root, entry->group,
@@ -566,11 +693,28 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
             if (now_coord_parse(project->deps.items[i].id, &coord) != 0)
                 continue;
 
+            /* Ask each permitted registry in turn. The first that knows
+             * the coordinate owns this dep — every later fetch for it
+             * goes to the same one, so a dep is never assembled from a
+             * mixture of registries. */
             NowRegistryVersion *versions = NULL;
-            int vcount = now_registry_resolve(registry_url,
+            int vcount = -1;
+            for (size_t ri = 0; ri < cand_n && vcount <= 0; ri++) {
+                versions = NULL;
+                vcount = now_registry_resolve(cand_urls[ri],
                                               coord.group, coord.artifact,
                                               coord.version,
                                               &versions, result);
+                if (vcount > 0) {
+                    registry_url = cand_urls[ri];
+                    jwt = registry_jwt(reg_auth, &reg_auth_n, registry_url,
+                                       offline, result);
+                    reg_locked = 1;
+                } else if (versions) {
+                    now_registry_versions_free(versions, vcount > 0 ? vcount : 0);
+                    versions = NULL;
+                }
+            }
             free(coord.group);
             free(coord.artifact);
             free(coord.version);
@@ -602,20 +746,10 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
             now_registry_versions_free(versions, vcount);
         }
 
-        /* Download the descriptor (now.pasta) */
         char *dep_dir = now_repo_dep_path(repo_root, entry->group,
                                            entry->artifact, entry->version);
         if (!dep_dir) continue;
         now_mkdir_p(dep_dir);
-
-        char *desc_dest = now_path_join(dep_dir, "now.pasta");
-        if (desc_dest) {
-            now_registry_download(registry_url,
-                                  entry->group, entry->artifact,
-                                  entry->version, "now.pasta",
-                                  desc_dest, jwt, result);
-            free(desc_dest);
-        }
 
         /* `now package` names its output {artifact}-{version}-{triple},
          * and that is what lands in the registry — but procure asked for
@@ -647,19 +781,6 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         snprintf(sha_name, sizeof(sha_name), "%s-%s-%s.sha256",
                  entry->artifact, entry->version, ent_triple);
         char *sha_dest = now_path_join(dep_dir, sha_name);
-        if (sha_dest) {
-            if (now_registry_download(registry_url,
-                                      entry->group, entry->artifact,
-                                      entry->version, sha_name,
-                                      sha_dest, jwt, result) != 0) {
-                snprintf(sha_name, sizeof(sha_name), "%s-%s.sha256",
-                         entry->artifact, entry->version);
-                now_registry_download(registry_url,
-                                      entry->group, entry->artifact,
-                                      entry->version, sha_name,
-                                      sha_dest, jwt, result);
-            }
-        }
 
         /* Download the archive (.basta or legacy .tar.gz) */
         char archive_name[256];
@@ -683,17 +804,61 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                      entry->artifact, entry->version);
             cands[0] = c0; cands[1] = c1; cands[2] = c2;
 
+            /* Two nested searches: which registry has it, and under which
+             * of the three names. If the version query already settled
+             * the registry, only that one is tried — re-searching could
+             * otherwise pull the archive from a different registry than
+             * the metadata came from. */
             int adl = -1;
-            for (int ci = 0; ci < 3 && adl != 0; ci++) {
-                if (ci > 0 && strcmp(cands[ci], cands[ci - 1]) == 0) continue;
-                /* Only the remote name varies; the local file is always
-                 * archive_dest, so archive_name must keep matching it —
-                 * renaming it here made the later signature check look
-                 * for a path that was never written. */
-                adl = now_registry_download(registry_url,
-                                            entry->group, entry->artifact,
-                                            entry->version, cands[ci],
-                                            archive_dest, jwt, result);
+            size_t first_reg = 0, last_reg = cand_n;
+            if (reg_locked) {
+                for (size_t ri = 0; ri < cand_n; ri++)
+                    if (cand_urls[ri] == registry_url) { first_reg = ri; break; }
+                last_reg = first_reg + 1;
+            }
+            for (size_t ri = first_reg; ri < last_reg && adl != 0; ri++) {
+                const char *u = cand_urls[ri];
+                const char *t = registry_jwt(reg_auth, &reg_auth_n, u,
+                                             offline, result);
+                for (int ci = 0; ci < 3 && adl != 0; ci++) {
+                    if (ci > 0 && strcmp(cands[ci], cands[ci - 1]) == 0) continue;
+                    /* Only the remote name varies; the local file is always
+                     * archive_dest, so archive_name must keep matching it —
+                     * renaming it here made the later signature check look
+                     * for a path that was never written. */
+                    adl = now_registry_download(u,
+                                                entry->group, entry->artifact,
+                                                entry->version, cands[ci],
+                                                archive_dest, jwt ? jwt : t,
+                                                result);
+                }
+                if (adl == 0) { registry_url = u; jwt = t; reg_locked = 1; }
+            }
+
+            /* Registry settled. The descriptor and the checksum sidecar
+             * must come from the same one that served the archive. */
+            if (adl == 0) {
+                char *desc_dest = now_path_join(dep_dir, "now.pasta");
+                if (desc_dest) {
+                    now_registry_download(registry_url,
+                                          entry->group, entry->artifact,
+                                          entry->version, "now.pasta",
+                                          desc_dest, jwt, result);
+                    free(desc_dest);
+                }
+                if (sha_dest) {
+                    if (now_registry_download(registry_url,
+                                              entry->group, entry->artifact,
+                                              entry->version, sha_name,
+                                              sha_dest, jwt, result) != 0) {
+                        snprintf(sha_name, sizeof(sha_name), "%s-%s.sha256",
+                                 entry->artifact, entry->version);
+                        now_registry_download(registry_url,
+                                              entry->group, entry->artifact,
+                                              entry->version, sha_name,
+                                              sha_dest, jwt, result);
+                    }
+                }
             }
             if (adl == 0) {
                 /* Verify SHA-256 against sidecar file */
@@ -755,7 +920,7 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                         now_lock_free(&lockfile);
                         free(repo_root);
                         free(lock_path);
-                        free(jwt);
+                        registry_auth_free(reg_auth, reg_auth_n);
                         return -1;
                     }
 
@@ -798,7 +963,7 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                     now_lock_free(&lockfile);
                     free(repo_root);
                     free(lock_path);
-                    free(jwt);
+                    registry_auth_free(reg_auth, reg_auth_n);
                     return -1;
                 }
 
@@ -857,7 +1022,7 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                         now_lock_free(&lockfile);
                         free(repo_root);
                         free(lock_path);
-                        free(jwt);
+                        registry_auth_free(reg_auth, reg_auth_n);
                         return -1;
                     }
                 }
@@ -889,7 +1054,7 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
     now_lock_free(&lockfile);
     free(repo_root);
     free(lock_path);
-    free(jwt);
+    registry_auth_free(reg_auth, reg_auth_n);
     return 0;
 }
 
