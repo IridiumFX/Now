@@ -12,6 +12,9 @@
  */
 
 #include "now_trust.h"
+/* apennines entropy source — wrapped by now_entropy() below so the CLI
+ * never has to link against a vendored symbol directly. */
+#include "apennines/t1/random/entropy.h"
 #include "now_fs.h"
 
 #include <stdint.h>
@@ -779,6 +782,14 @@ static void ge_scalarmult_base(ge *r, const uint8_t scalar[32]) {
  * ================================================================ */
 
 /* Derive a public key from a 32-byte seed */
+NOW_API int now_entropy(unsigned char *out, size_t len) {
+    if (!out) return -1;
+    /* Thin wrapper on purpose: the point is that the symbol crossing the
+     * library boundary is one of ours and carries NOW_API, not that the
+     * entropy source changes. */
+    return entropy_get_system(out, (u64)len) == 0 ? 0 : -1;
+}
+
 NOW_API int now_ed25519_keypair(unsigned char pub[32],
                                  unsigned char priv[64],
                                  const unsigned char seed[32]) {

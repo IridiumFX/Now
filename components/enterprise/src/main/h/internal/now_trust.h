@@ -79,6 +79,18 @@ NOW_API NowTrustLevel now_trust_level(const NowTrustPolicy *policy);
 
 /* ---- Ed25519 digital signatures (native, no external deps) ---- */
 
+/* Fill `out` with `len` bytes from the system entropy source.
+ * Returns 0 on success, non-zero if entropy could not be gathered.
+ *
+ * Exists so the CLI does not have to call the vendored runtime's
+ * `entropy_get_system` directly. That symbol belongs to apennines and
+ * carries no NOW_API export, so in a shared build — which is the CMake
+ * default — it is hidden and `now_cli` fails to link with an undefined
+ * reference. The Windows release build hid the problem because it is
+ * static. Anything the CLI needs has to cross the library boundary
+ * through now's own API. */
+NOW_API int now_entropy(unsigned char *out, size_t len);
+
 /* Generate an Ed25519 keypair from a 32-byte seed.
  * pub receives the 32-byte public key.
  * priv receives the 64-byte private key (seed || public key).

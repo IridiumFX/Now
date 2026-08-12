@@ -29,7 +29,8 @@
 #include "now_remote.h"
 #include "now_sbom.h"
 #include "now_trust.h"
-#include "apennines/t1/random/entropy.h"   /* keygen seed */
+/* keygen entropy comes through now_entropy() in now_trust.h — the CLI
+ * must not link a vendored symbol directly (hidden in shared builds). */
 #include "now_repro.h"
 #include "now_advisory.h"
 #include "now_cache.h"
@@ -880,7 +881,7 @@ skip_header:
         }
 
         unsigned char seed[32], pub[32], priv[64];
-        if (entropy_get_system(seed, sizeof(seed)) != 0) {
+        if (now_entropy(seed, sizeof(seed)) != 0) {
             fprintf(stderr, "error: cannot gather entropy for key generation\n");
             free(key_path);
             return 1;
