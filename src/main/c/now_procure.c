@@ -292,6 +292,39 @@ static const char *registry_jwt(NowRegAuth *cache, size_t *n,
     return slot->jwt;
 }
 
+NOW_API int now_lock_differs(const NowLockFile *before, const NowLockFile *after,
+                              const char **what, const char **which) {
+    if (what) *what = NULL;
+    if (which) *which = NULL;
+    if (!before || !after) return 0;
+
+    for (size_t i = 0; i < after->count; i++) {
+        const NowLockEntry *now_e = &after->entries[i];
+        const NowLockEntry *was = now_lock_find(before, now_e->group,
+                                                 now_e->artifact);
+        if (!was) {
+            if (what) *what = "added";
+            if (which) *which = now_e->artifact;
+            return 1;
+        }
+        if (now_e->version && was->version &&
+            strcmp(now_e->version, was->version) != 0) {
+            if (what) *what = "changed version";
+            if (which) *which = now_e->artifact;
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < before->count; i++) {
+        const NowLockEntry *was = &before->entries[i];
+        if (!now_lock_find(after, was->group, was->artifact)) {
+            if (what) *what = "removed";
+            if (which) *which = was->artifact;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void registry_auth_free(NowRegAuth *cache, size_t n) {
     if (!cache) return;
     for (size_t i = 0; i < n; i++) {
@@ -608,7 +641,17 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         /* ignore error — may not exist yet */
     }
 
+    /* --locked: a second copy of what was on disk, so resolution can be
+     * compared against it afterwards. The flag was parsed and then never
+     * read by procure, so `now procure --locked` happily rewrote the
+     * lockfile — the one thing the flag exists to prevent. */
+    int locked = (opts && opts->locked);
+    NowLockFile lock_before;
+    now_lock_init(&lock_before);
+    if (locked && lock_path) now_lock_load(&lock_before, lock_path);
+
     if (now_resolver_resolve(&resolver, &lockfile, result) != 0) {
+        now_lock_free(&lock_before);
         now_resolver_free(&resolver);
         now_lock_free(&lockfile);
         free(repo_root);
@@ -951,11 +994,27 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                                       sig_dest, jwt, result);
                 if (sig_rc != 0) {
                     if (result) {
+                        /* The download already recorded the HTTP status.
+                         * Overwriting it with "has no .sig file" turned a
+                         * 401 into a missing-file report and sent people
+                         * hunting the publisher instead of their
+                         * credentials — keep what actually happened. */
+                        char why[256];
+                        snprintf(why, sizeof(why), "%s", result->message);
                         result->code = NOW_ERR_AUTH;
-                        snprintf(result->message, sizeof(result->message),
-                                 "require_signatures is set but %s:%s:%s "
-                                 "has no .sig file on registry",
-                                 entry->group, entry->artifact, entry->version);
+                        if (why[0])
+                            snprintf(result->message, sizeof(result->message),
+                                     "require_signatures is set but the "
+                                     "signature for %s:%s:%s could not be "
+                                     "fetched (%s)",
+                                     entry->group, entry->artifact,
+                                     entry->version, why);
+                        else
+                            snprintf(result->message, sizeof(result->message),
+                                     "require_signatures is set but %s:%s:%s "
+                                     "has no .sig file on registry",
+                                     entry->group, entry->artifact,
+                                     entry->version);
                     }
                     free(sig_dest);
                     free(dep_dir);
@@ -1045,13 +1104,35 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         free(dep_dir);
     }
 
-    /* Step 4: Save updated lock file */
-    if (lock_path) {
+    /* Step 4: Save updated lock file — unless --locked, in which case
+     * any difference from the committed one is the error, and the file
+     * is left exactly as it was. */
+    if (locked) {
+        const char *what = NULL, *which = NULL;
+        if (now_lock_differs(&lock_before, &lockfile, &what, &which)) {
+            if (result) {
+                result->code = NOW_ERR_SCHEMA;
+                snprintf(result->message, sizeof(result->message),
+                         "--locked: resolution does not match now.lock.pasta "
+                         "(%s: %s). Run `now procure` without --locked and "
+                         "commit the updated lockfile",
+                         what, which ? which : "?");
+            }
+            now_resolver_free(&resolver);
+            now_lock_free(&lockfile);
+            now_lock_free(&lock_before);
+            free(repo_root);
+            free(lock_path);
+            registry_auth_free(reg_auth, reg_auth_n);
+            return -1;
+        }
+    } else if (lock_path) {
         now_lock_save(&lockfile, lock_path);
     }
 
     now_resolver_free(&resolver);
     now_lock_free(&lockfile);
+    now_lock_free(&lock_before);
     free(repo_root);
     free(lock_path);
     registry_auth_free(reg_auth, reg_auth_n);

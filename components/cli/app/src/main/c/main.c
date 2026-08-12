@@ -1181,6 +1181,7 @@ skip_header:
          * offline, so both flags were accepted and silently ignored. */
         opts.registry_url = repo_url;
         opts.offline      = flag_offline;
+        opts.locked       = flag_locked;
         rc = now_procure(project, &opts, &result);
         if (rc != 0)
             fprintf(stderr, "error: %s\n", result.message);

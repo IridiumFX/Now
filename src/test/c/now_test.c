@@ -3332,6 +3332,63 @@ static void test_private_group_procure_fail(void) {
     PASS();
 }
 
+static void test_lock_differs(void) {
+    TEST("--locked: lockfile drift is detected in all three directions");
+    NowLockFile before, after;
+    now_lock_init(&before);
+    now_lock_init(&after);
+
+    NowLockEntry e;
+    memset(&e, 0, sizeof(e));
+    e.group = (char *)"org.acme"; e.artifact = (char *)"core";
+    e.version = (char *)"1.0.0";  e.scope = (char *)"compile";
+    now_lock_set(&before, &e);
+    now_lock_set(&after,  &e);
+
+    const char *what = NULL, *which = NULL;
+    if (now_lock_differs(&before, &after, &what, &which)) {
+        FAIL("identical lockfiles reported as differing");
+        goto done;
+    }
+
+    /* Version drift — the case --locked exists to catch. */
+    e.version = (char *)"1.1.0";
+    now_lock_set(&after, &e);
+    if (!now_lock_differs(&before, &after, &what, &which) ||
+        strcmp(what, "changed version") != 0) {
+        FAIL("version change not detected");
+        goto done;
+    }
+
+    /* Addition. */
+    now_lock_free(&after); now_lock_init(&after);
+    e.version = (char *)"1.0.0";
+    now_lock_set(&after, &e);
+    e.artifact = (char *)"extra";
+    now_lock_set(&after, &e);
+    if (!now_lock_differs(&before, &after, &what, &which) ||
+        strcmp(what, "added") != 0) {
+        FAIL("addition not detected");
+        goto done;
+    }
+
+    /* Removal. */
+    now_lock_free(&after); now_lock_init(&after);
+    if (!now_lock_differs(&before, &after, &what, &which) ||
+        strcmp(what, "removed") != 0) {
+        FAIL("removal not detected");
+        goto done;
+    }
+
+    now_lock_free(&before);
+    now_lock_free(&after);
+    PASS();
+    return;
+done:
+    now_lock_free(&before);
+    now_lock_free(&after);
+}
+
 static void test_registry_is_public(void) {
     TEST("private_groups: central registry recognised on host, not spelling");
     if (!now_registry_is_public("https://repo.now.build")) { FAIL("repo.now.build"); return; }
@@ -7157,6 +7214,7 @@ int main(void) {
     test_private_group_null_safe();
     test_private_group_pom_load();
     test_private_group_procure_fail();
+    test_lock_differs();
     test_registry_is_public();
     test_private_group_fence_stops_at_public();
     test_private_group_repo_override_fenced();

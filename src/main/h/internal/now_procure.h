@@ -29,7 +29,21 @@ typedef struct {
      * pointing --repo at a public registry does not unlock a private
      * group. */
     const char *registry_url;
+    /* --locked: resolution must reproduce the committed lockfile exactly.
+     * Any addition, removal or version change is an error and the file is
+     * left untouched — the CI contract of "build what was reviewed". */
+    int         locked;
 } NowProcureOpts;
+
+/* Does resolution differ from the committed lockfile?
+ *
+ * Backs --locked. Returns 1 and sets *what ("added" | "removed" |
+ * "changed version") and *which (the artifact) on the first difference
+ * found, 0 when the two agree. Both out-params are optional and the
+ * strings are static or borrowed from `before`/`after`. */
+NOW_API int now_lock_differs(const NowLockFile *before,
+                              const NowLockFile *after,
+                              const char **what, const char **which);
 
 /* Is this URL the public `now` central registry?
  *
