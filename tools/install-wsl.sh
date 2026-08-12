@@ -89,12 +89,38 @@ chmod +x "$DEST/now"
 printf '%s\n' "$REV" > "$DEST/.now-revision"
 say "installed: $DEST/now  (rev $REV)"
 
+# Make it resolve, rather than assume the distro defaults do it.
+#
+# Ubuntu's ~/.profile has a `[ -d ~/.local/bin ] && PATH=...` block, and
+# on this machine it does not take effect even in a login shell — so
+# `now` installed there was not found. Rather than diagnose someone
+# else's profile, put the line somewhere we control, once.
+MARKER='# added by now install-wsl.sh'
+ensure_path_in() {
+    local rc="$1"
+    [ -e "$rc" ] || return 0
+    grep -qF "$MARKER" "$rc" && return 0
+    {
+        printf '\n%s\n' "$MARKER"
+        printf 'case ":$PATH:" in *":%s:"*) ;; *) PATH="%s:$PATH" ;; esac\n' \
+               "$DEST" "$DEST"
+        printf 'export PATH\n'
+    } >> "$rc"
+    say "PATH line added to $rc"
+}
 case ":$PATH:" in
     *":$DEST:"*) say "on PATH: yes" ;;
-    *) echo
-       echo "  NOTE: $DEST is not on PATH in this shell. Add it:"
-       echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc" ;;
+    *)
+        # .bashrc for interactive shells (how a build is actually run),
+        # .profile for login shells. Ubuntu's .bashrc returns early when
+        # non-interactive, so a `bash -c` script still needs the full
+        # path — printed below.
+        ensure_path_in "$HOME/.bashrc"
+        ensure_path_in "$HOME/.profile"
+        say "open a new shell, or: export PATH=\"$DEST:\$PATH\""
+        ;;
 esac
+say "absolute path (for scripts and non-interactive shells): $DEST/now"
 
 echo
 echo "Re-run this after pulling now to stay current. To check what you"
