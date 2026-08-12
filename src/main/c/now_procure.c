@@ -183,12 +183,15 @@ NOW_API int now_registry_is_public(const char *url) {
     while (*end && *end != '/' && *end != ':') end++;
     size_t hlen = (size_t)(end - h);
 
-    /* Both spellings are in circulation: the built-in layer defaults to
-     * repo.now.build (now_layer.c) while the spec's examples use
-     * registry.now.build. Until they are reconciled, treating only one
-     * as public would leave the other as an unfenced hole. */
+    /* registry.now.build is the canonical spelling as of 2026-08-12, and
+     * is what the built-in layer and the spec now both use.
+     * repo.now.build stays recognised **deliberately**: descriptors
+     * written against the older spelling are still out there, and a repo
+     * list naming the old host must remain fenced. Dropping it would
+     * silently convert those into unfenced holes — the one direction
+     * this list must never move. */
     static const char *const k_public_hosts[] = {
-        "repo.now.build", "registry.now.build", NULL
+        "registry.now.build", "repo.now.build", NULL
     };
     for (size_t i = 0; k_public_hosts[i]; i++) {
         size_t plen = strlen(k_public_hosts[i]);

@@ -10471,7 +10471,7 @@ The baseline is a normal Pasta document. Its shipped content:
 @repos {
   _policy: "open",
   registries: [
-    {url: "https://repo.now.build", id: "central", release: true, snapshot: false}
+    {url: "https://registry.now.build", id: "central", release: true, snapshot: false}
   ]
 }
 
@@ -10610,7 +10610,7 @@ metadata, not configuration):
   _description: "All artifacts must come from internal registry first.",
   registries: [
     {url: "https://now.acme.internal", id: "acme-internal", release: true, snapshot: true},
-    {url: "https://repo.now.build",    id: "central",       release: true, snapshot: false}
+    {url: "https://registry.now.build",    id: "central",       release: true, snapshot: false}
   ]
 }
 
@@ -10793,7 +10793,7 @@ Enterprise layer (locked repos, open compile):
   _policy: "locked",
   registries: [
     {id: "acme-internal", url: "https://now.acme.internal", release: true},
-    {id: "central",       url: "https://repo.now.build",    release: true}
+    {id: "central",       url: "https://registry.now.build",    release: true}
   ]
 }
 ```
@@ -11061,7 +11061,7 @@ build on the machine. The following controls apply:
   _policy: "locked",
   registries: [
     {url: "https://now.acme.internal", id: "acme", release: true, snapshot: true},
-    {url: "https://repo.now.build",    id: "central", release: true, snapshot: false}
+    {url: "https://registry.now.build",    id: "central", release: true, snapshot: false}
   ]
 }
 
@@ -11581,11 +11581,11 @@ shorthand) or a **map** with the full set of fields. Both forms are valid:
 
 ```pasta
 ; String shorthand — url only, all other fields at their defaults
-repos: ["https://repo.now.build"]
+repos: ["https://registry.now.build"]
 
 ; Map form — full control
 repos: [
-  {url: "https://repo.now.build", id: "central", release: true, snapshot: false}
+  {url: "https://registry.now.build", id: "central", release: true, snapshot: false}
 ]
 ```
 
@@ -11593,7 +11593,7 @@ A plain string is equivalent to `{url: "<string>", release: true, snapshot: fals
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `url` | `string!` | Registry base URL: `"https://repo.now.build"`. |
+| `url` | `string!` | Registry base URL: `"https://registry.now.build"`. |
 | `id` | `string?` | Short ID for error messages. Defaults to the URL host. |
 | `release` | `bool?` | Whether this repo serves release versions. Default: `true`. |
 | `snapshot` | `bool?` | Whether this repo serves snapshot versions. Default: `false`. |

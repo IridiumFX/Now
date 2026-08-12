@@ -191,7 +191,7 @@ static void init_baseline(NowLayer *layer) {
     PastaValue *repos = pasta_new_map();
     PastaValue *registries = pasta_new_array();
     PastaValue *central = pasta_new_map();
-    pasta_set(central, "url", pasta_new_string("https://repo.now.build"));
+    pasta_set(central, "url", pasta_new_string("https://registry.now.build"));
     pasta_set(central, "id", pasta_new_string("central"));
     pasta_set(central, "release", pasta_new_bool(1));
     pasta_set(central, "snapshot", pasta_new_bool(0));
