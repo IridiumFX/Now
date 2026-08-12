@@ -97,6 +97,6 @@ say "md5:       $B"
 say "reports:   $("$TOOLKIT/now.exe" version)"
 
 echo
-echo "Done. Note this binary is Windows-only: peers that cross-compile"
-echo "(Amy under WSL) build now from source instead — see"
-echo "~/.claude/mailbox/now-for-amy/refresh-now.sh"
+echo "Done. This binary is Windows-only. Peers who cross-compile under"
+echo "WSL cannot use it — a Windows now.exe cannot drive a toolchain that"
+echo "only exists on the Linux side. For them:  tools/install-wsl.sh"

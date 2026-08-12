@@ -60,6 +60,43 @@ CMake + Ninja is the canonical build (CI uses it); `now build` is the
 self-host path. A prebuilt bootstrap sits at `build/static/bin/now.exe`
 for when `target/bin/now.exe` is missing or broken.
 
+**Build both ways before believing a build works.** They disagree
+regularly — CMake uses explicit source lists while `now build` walks the
+tree, so a source added to a vendored lib links fine under one and dies
+on an undefined reference under the other. Four instances in three days.
+
+## Installing
+
+`../toolkit` is on the user PATH, so whatever sits there is the `now`
+every project on this machine gets. Do not copy it by hand:
+
+```
+tools/install-toolkit.sh          # builds static, verifies, installs
+```
+
+It refuses to install if the binary is not self-contained, is missing a
+command, or fails its own suite — a stale toolkit is better than a
+half-updated one.
+
+**Peers who cross-compile cannot use that binary.** Amy builds a RISC-V
+freestanding kernel under WSL; a Windows `now.exe` cannot drive a
+toolchain that does not exist on Windows. For them:
+
+```
+tools/install-wsl.sh              # run inside WSL; installs ~/.local/bin/now
+```
+
+It stamps the source revision into `~/.local/bin/.now-revision`. That
+exists because their `now` used to be a one-time `cp -r` with no way to
+show its age — they sat six days behind and filed a bug that was already
+fixed, and it read as a live defect until someone checked the date.
+
+**CMake defaults `BUILD_SHARED_LIBS` to ON here** (`CMakeLists.txt:8`),
+and the shared build hides vendored symbols. Anything the CLI needs must
+cross the boundary through a `NOW_API` function of ours — `main.c` once
+called apennines' `entropy_get_system` directly and the default Linux
+build would not link.
+
 ## Gotchas
 
 - **The spec runs well ahead of the implementation.** `profiles:` and
