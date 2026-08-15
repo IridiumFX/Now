@@ -6,10 +6,35 @@
 
 This document is the authoritative merged specification for `now`, a
 native-language build tool and package manager. It consolidates all
-working documents into a single implementation reference, with all
-chapter numbering reconciled and v1 scope annotations applied.
+working documents into a single implementation reference.
 
-Cross-references are to chapters and sections within this document.
+### How to read a cross-reference
+
+**Section numbers are the stable identifier — chapter numbers are not.**
+This document was merged from separate working documents, and each kept
+its own section numbering. Chapters are numbered 1–27 in reading order,
+but their sections are not renumbered to match: Chapter 12's sections are
+`§13.x`, Chapter 25's are `§34.x`. The Table of Contents below gives the
+section range for every chapter, which is the way to resolve either form.
+
+Section numbers were made unique on 2026-08-12; before that `§26.1` named
+two different sections in two different chapters, and `§7.8`, `§7.9`,
+`§7.10`, `§6.9`, `§14.10`, `§14.20` and `§31.17` were each used twice.
+They are unique now, so a `§X.Y` citation — including the ~108 of them in
+the source — resolves to exactly one place. Sections were **not**
+renumbered to follow their chapters, because that would invalidate every
+one of those citations to fix a presentation problem.
+
+A handful of `Chapter N` references in the prose predate the merge and
+point at the wrong chapter. Prefer the section number where both are
+given.
+
+**`doc NN §NN.x` is not a reference to this document.** Those cite the
+pre-merge working documents by number — `doc 07 §7.4`, `doc 16 §16.3`,
+`doc 30 §30.9` — and their section numbers are that document's own. The
+sources no longer exist separately, so these are provenance notes, not
+links to follow. Prefixes `12`, `16`, `29`, `30` and `33` appear only in
+this form and name no section of this specification.
 
 ### v1 Scope Summary
 
@@ -27,35 +52,35 @@ in subsequent releases. Do not remove them from this document.
 
 ## Table of Contents
 
-| Chapter | Title | v1? |
-|---------|-------|-----|
-| 1 | Project Descriptor (`now.pasta`) | ✓ |
-| 2 | Lifecycle and Phases | ✓ |
-| 3 | Directory Layout | ✓ |
-| 4 | Source Classification and Language Type System | ✓ (C/C++ only) |
-| 5 | Artifact Model and Installed Layout | ✓ |
-| 6 | Dependency Resolution and Versioning | ✓ |
-| 7 | Toolchain Configuration — GCC / Clang | ✓ |
-| 8 | Toolchain Configuration — MSVC | ✓ |
-| 9 | Testing | ✓ |
-| 10 | Plugins, Tools, Code Generation, and Plugin Protocol | ✓ |
-| 11 | Multi-Architecture and Platform Triples | ✓ (Linux/macOS/Win) |
-| 12 | Offline Mode and Cache | ✓ |
-| 13 | Build Graph, Parallel Execution, and Module Pre-Scan | ✓ |
-| 14 | Packaging and Assembly | ✓ |
-| 15 | Language Directories and Per-Module Language Declaration | ✓ |
-| 16 | CI Integration | ✓ |
-| 17 | Signing and Trust | ✓ |
-| 18 | Module System and Build Order | ✓ |
-| 19 | IDE Integration and `now stay` Daemon | **Post-v1** |
-| 20 | Serialisation: Pasta, JSON, and JSON5 | ✓ |
-| 21 | Dependency Confusion Protection | ✓ |
-| 22 | Glob Pattern Dialect | ✓ |
-| 23 | Embedded and Freestanding Platforms | **Post-v1** |
-| 24 | Reproducible Builds and Security Advisory Integration | ✓ |
-| 25 | Cascading Configuration Layers | ✓ |
-| 26 | Schema Reference | ✓ |
-| 27 | Error Catalogue | ✓ |
+| Chapter | Title | Sections | v1? |
+|---------|-------|----------|-----|
+| 1 | Project Descriptor (`now.pasta`) | §1.1–§1.14 | ✓ |
+| 2 | Lifecycle and Phases | §2.1–§2.8 | ✓ |
+| 3 | Directory Layout | §3.1–§3.5 | ✓ |
+| 4 | Source Classification and Language Type System | §4.0–§4.6 | ✓ (C/C++ only) |
+| 5 | Artifact Model and Installed Layout | §5.1–§5.12 | ✓ |
+| 6 | Dependency Resolution and Versioning | §6.1–§6.16 | ✓ |
+| 7 | Toolchain Configuration — GCC / Clang | §7.1–§7.10 | ✓ |
+| 8 | Toolchain Configuration — MSVC | §7.11–§7.19 | ✓ |
+| 9 | Testing | §8.1–§8.8 | ✓ |
+| 10 | Plugins, Tools, Code Generation, and Plugin Protocol | §10.1–§10.22 | ✓ |
+| 11 | Multi-Architecture and Platform Triples | §11.1–§11.13 | ✓ (Linux/macOS/Win) |
+| 12 | Offline Mode and Cache | §13.1–§13.8 | ✓ |
+| 13 | Build Graph, Parallel Execution, and Module Pre-Scan | §14.1–§14.32 | ✓ |
+| 14 | Packaging and Assembly | §17.1–§17.6 | ✓ |
+| 15 | Language Directories and Per-Module Language Declaration | §18.1–§18.5 | ✓ |
+| 16 | CI Integration | §19.1–§19.6 | ✓ |
+| 17 | Signing and Trust | §20.1–§20.7 | ✓ |
+| 18 | Module System and Build Order | §21.1–§21.8 | ✓ |
+| 19 | IDE Integration and `now stay` Daemon | §22.1–§22.6 | **Post-v1** |
+| 20 | Serialisation: Pasta, JSON, and JSON5 | §23.1–§23.10 | ✓ |
+| 21 | Dependency Confusion Protection | §25.1–§25.5 | ✓ |
+| 22 | Glob Pattern Dialect | §26.1–§26.9 | ✓ |
+| 23 | Embedded and Freestanding Platforms | §27.1–§27.8 | **Post-v1** |
+| 24 | Reproducible Builds and Security Advisory Integration | §24.1–§24.17 | ✓ |
+| 25 | Cascading Configuration Layers | §34.1–§34.14 | ✓ |
+| 26 | Schema Reference | §31.1–§31.22 | ✓ |
+| 27 | Error Catalogue | §32.1–§32.23 | ✓ |
 
 ---
 
@@ -396,7 +421,7 @@ absent → `aggregate`. Override explicitly:
 }
 ```
 
-Relevant for the layer filesystem walk (Chapter 25 §25.13).
+Relevant for the layer filesystem walk (Chapter 25, §34.13).
 
 ---
 
@@ -617,7 +642,7 @@ for each source file S in the resolved source set:
 This handles multi-step transforms: Fortran `.f` → preprocessed `.f90` →
 object; Modula-2 `.m` → symbol table `.sym` + object `.o`; C++ module
 interface units → `.pcm` + object. The build phase also runs the
-module pre-scan sub-phase (Chapter 8 §8.2) for languages that declare it.
+module pre-scan sub-phase (Chapter 13, §14.21) for languages that declare it.
 
 ## 2.4 `link` as a Standalone Phase
 
@@ -2209,7 +2234,7 @@ For persistent overrides during development, use the `overrides` block in
 
 ---
 
-## 6.9 Version Syntax and Ranges
+## 6.8 Version Syntax and Ranges
 
 Version management in `now` follows semantic versioning strictly, uses
 Maven-style range syntax, and adds an explicit **convergence policy** that
@@ -2690,7 +2715,7 @@ In dry-run mode, `now.lock.pasta` is not written or modified.
 
 # Chapter 8 — Toolchain Configuration — MSVC
 
-This document resolves GAP 11. It extends document 07's MSVC stub (§7.4)
+This document resolves GAP 11. It extends doc 07 §7.4 (the MSVC stub)
 into a complete specification covering: the full flag translation surface,
 Program Database (PDB) debug info, DLL export management (`__declspec` and
 `.def` files), response files for long command lines, static runtime vs
@@ -2704,7 +2729,7 @@ manifestation) does MSVC-specific configuration appear.
 
 ---
 
-## 7.8 Full Flag Translation Table
+## 7.11 Full Flag Translation Table
 
 `now` translates all `now.pasta` compile and link flags to MSVC
 equivalents automatically. The table below is the authoritative mapping.
@@ -2764,7 +2789,7 @@ through verbatim (they are MSVC-native and `now` does not translate them).
 |------------------------|-----------------|-------|
 | `-o output` | `/Fe:output.exe` | Executable output |
 | `-shared` | `/DLL` | Build DLL |
-| `-static` | *(n/a — MSVC links statically to CRT via /MT)* | See §7.11 |
+| `-static` | *(n/a — MSVC links statically to CRT via /MT)* | See §7.14 |
 | `-lname` | `name.lib` | Library — added to link inputs |
 | `-Lpath` | `/LIBPATH:path` | Library search path |
 | `-Wl,--subsystem,console` | `/SUBSYSTEM:CONSOLE` | Console application |
@@ -2773,7 +2798,7 @@ through verbatim (they are MSVC-native and `now` does not translate them).
 | `-Wl,--stack,size` | `/STACK:size` | Stack size |
 | `-Wl,--heap,size` | `/HEAP:size` | Heap size |
 | `-Wl,--entry,sym` | `/ENTRY:sym` | Entry point |
-| `-Wl,--version-script` | *(no equivalent — use DEF file)* | See §7.10 |
+| `-Wl,--version-script` | *(no equivalent — use DEF file)* | See §7.13 |
 
 ### Path resolution inside link flags
 
@@ -2793,7 +2818,7 @@ is ignored.
 
 ---
 
-## 7.9 Program Database (PDB) Files
+## 7.12 Program Database (PDB) Files
 
 MSVC debug information is written to a separate `.pdb` file — it is not
 embedded in the object or binary as with DWARF. `now` manages PDB files
@@ -2876,7 +2901,7 @@ PDB is what gets installed and packaged.
 
 ---
 
-## 7.10 DLL Export Management
+## 7.13 DLL Export Management
 
 Windows DLLs require explicit export declarations. GCC/Clang's
 `-fvisibility=hidden` convention (default-hidden, explicitly export) has
@@ -2982,7 +3007,7 @@ Consumer `now.pasta` gets the import library automatically via
 
 ---
 
-## 7.11 Runtime Library Selection (`/MT` vs `/MD`)
+## 7.14 Runtime Library Selection (`/MT` vs `/MD`)
 
 MSVC has two C runtime models:
 
@@ -3041,7 +3066,7 @@ Warning: org.acme:core:4.2.1 (windows-amd64-msvc) was built with
 
 ---
 
-## 7.12 Response Files
+## 7.15 Response Files
 
 Windows has a maximum command line length of approximately 32,767
 characters. Large projects with many source files, include paths, or
@@ -3090,7 +3115,7 @@ print the full contents.
 
 ---
 
-## 7.13 MSVC-Specific `now.pasta` Fields
+## 7.16 MSVC-Specific `now.pasta` Fields
 
 All MSVC-specific configuration lives under the `msvc:` key. It is
 ignored by non-MSVC toolchains.
@@ -3144,7 +3169,7 @@ ignored by non-MSVC toolchains.
 
 ---
 
-## 7.14 MSVC Invocation Sequences
+## 7.17 MSVC Invocation Sequences
 
 ### Complete Compile Invocation
 
@@ -3204,7 +3229,7 @@ lib.exe
 
 ---
 
-## 7.15 Visual Studio Integration
+## 7.18 Visual Studio Integration
 
 `now` does not generate `.vcxproj` or `.sln` files. However, since
 `now compile-db` produces `compile_commands.json` (doc 22), and Visual
@@ -3233,10 +3258,10 @@ plugins: [
 
 ---
 
-## 7.16 Supersession Note
+## 7.19 Supersession Note
 
 This document supersedes doc 07 §7.4 (the MSVC translation stub). The
-full flag translation table in §7.8 is now authoritative. All other
+full flag translation table in §7.11 is now authoritative. All other
 sections of doc 07 remain valid and apply to MSVC where applicable
 (toolchain resolution order, named presets, parallel compilation, verbose
 and dry-run modes).
@@ -5394,7 +5419,7 @@ Build graph statistics:
 
 ---
 
-## 14.10 Parallel Execution and Selective Rebuild
+## 14.8 Parallel Execution and Selective Rebuild
 
 Given the build graph, two capabilities follow naturally: parallel execution of independent nodes, and selective rebuild
 of only those nodes whose inputs have changed. This document defines both,
@@ -5729,7 +5754,7 @@ the same node hash as the cache key.
 ---
 
 
-## 14.20 Module-Aware Pre-Scan Protocol
+## 14.17 Module-Aware Pre-Scan Protocol
 
 *(resolves GAP 6)*
 
@@ -9561,7 +9586,7 @@ story — and the lineage that Nova inherits and extends to grid scale.
 
 ---
 
-## 26.1 What Reproducible Builds Mean in `now`
+## 24.1 What Reproducible Builds Mean in `now`
 
 A **reproducible build** is one where identical inputs produce
 bit-identical outputs regardless of when or where the build runs. "Inputs"
@@ -9582,11 +9607,11 @@ can encourage but not enforce.
 }
 ```
 
-When `reproducible: true`, `now` activates the measures in §26.3.
+When `reproducible: true`, `now` activates the measures in §24.3.
 
 ---
 
-## 26.2 Timebase — Declarative Timestamp Control
+## 24.2 Timebase — Declarative Timestamp Control
 
 Timestamps embedded in build outputs (archive mtimes, `__DATE__` / `__TIME__`
 macros, debug info) are the most common source of non-reproducibility.
@@ -9638,7 +9663,7 @@ outputs:
 | `tar` archives | `--mtime` flag sets all member timestamps |
 | `zip` archives | Entry timestamps set to timebase |
 | Object files | Not directly — compiler flags control embedded timestamps |
-| Debug info (`__DATE__`, `__TIME__`) | Injected as defines (see §26.3) |
+| Debug info (`__DATE__`, `__TIME__`) | Injected as defines (see §24.3) |
 | Linker map file | File mtime set to timebase |
 | Build manifest | Records the timebase used |
 
@@ -9664,7 +9689,7 @@ are not.
 
 ---
 
-## 26.3 Reproducibility Measures
+## 24.3 Reproducibility Measures
 
 When `reproducible: true`, `now` activates the following measures.
 Each can be individually controlled:
@@ -9785,7 +9810,7 @@ verification unless `--force-publish` is specified with an explicit reason.
 
 ---
 
-## 26.4 Security Advisory Database
+## 24.4 Security Advisory Database
 
 `now` maintains a native security advisory database in Pasta format.
 Advisories cover known-vulnerable dep versions and are checked during
@@ -9869,7 +9894,7 @@ tracks the current OWASP Top 10 and flags advisories by category:
 | A02: Cryptographic Failures | Advisory — weak crypto in dep |
 | A03: Injection | Advisory — injection vulns in dep |
 | A04: Insecure Design | Advisory — design flaws in dep |
-| A05: Security Misconfiguration | Config linting (see §26.6) |
+| A05: Security Misconfiguration | Config linting (see §24.6) |
 | A06: Vulnerable and Outdated Components | **Primary advisory target** |
 | A07: Auth Failures | Advisory — auth vulns in dep |
 | A08: Software Integrity Failures | Signing + `private_groups` (docs 20, 25) |
@@ -9881,7 +9906,7 @@ components with known vulnerabilities.
 
 ---
 
-## 26.5 Advisory Checking During `procure`
+## 24.5 Advisory Checking During `procure`
 
 `now procure` checks every resolved dep against the advisory database
 before installation.
@@ -9952,7 +9977,7 @@ malicious code generator, a plugin with a CVE). `now` distinguishes:
 
 ---
 
-## 26.6 Advisory Database Maintenance
+## 24.6 Advisory Database Maintenance
 
 ```sh
 ; Pull latest advisory database
@@ -10020,7 +10045,7 @@ is retained:
 
 ---
 
-## 26.7 Reproducibility and Advisory Interaction
+## 24.7 Reproducibility and Advisory Interaction
 
 ### Reproducing a Build with Known Vulnerabilities
 
@@ -10072,7 +10097,7 @@ state is a point-in-time snapshot, not a permanent guarantee.
 
 ---
 
-## 26.10 Advisory Phase Guards, Forced Builds, and Receipt Trail
+## 24.8 Advisory Phase Guards, Forced Builds, and Receipt Trail
 
 This document defines how security advisories gate lifecycle phases,
 which phases require `--force` to proceed with known-vulnerable deps,
@@ -10082,7 +10107,7 @@ from silently inheriting the risk.
 
 ---
 
-## 26.10 The Shared Trust Boundary
+## 24.9 The Shared Trust Boundary
 
 `now`'s local repository (`~/.now/repo/`) is a shared trust boundary.
 Every project on the machine can reference any artifact installed there.
@@ -10102,7 +10127,7 @@ known-vulnerable artifacts are involved.
 
 ---
 
-## 26.11 Phase Blast Radius and Default Advisory Behaviour
+## 24.11 Phase Blast Radius and Default Advisory Behaviour
 
 Each lifecycle phase has a distinct blast radius — the scope of what
 it can affect beyond the current project's `target/` directory.
@@ -10155,7 +10180,7 @@ vulnerable behaviour use `--force` with explicit justification.
 
 ---
 
-## 26.12 The `--force` Switch
+## 24.12 The `--force` Switch
 
 `--force` unlocks phases that would otherwise be blocked by advisory
 policy. It requires a justification string and always writes a receipt.
@@ -10207,7 +10232,7 @@ that purpose with proper provenance, not a silent bypass.
 
 ---
 
-## 26.13 The Forced Install Receipt
+## 24.13 The Forced Install Receipt
 
 When `--force` causes `now install` to install an artifact with known
 advisories to `~/.now/repo/`, a receipt is written into the installed
@@ -10273,7 +10298,7 @@ installs from becoming permanent silent exceptions.
 
 ---
 
-## 26.14 Cross-Project Receipt Propagation
+## 24.14 Cross-Project Receipt Propagation
 
 When another project's `now procure` would install or reference an
 artifact that has a forced install receipt in the local repo, `now`
@@ -10340,7 +10365,7 @@ reads from it — it is entirely self-contained. Useful for:
 
 ---
 
-## 26.15 Advisory State in the Build Manifest
+## 24.15 Advisory State in the Build Manifest
 
 The build manifest (`target/.now-manifest`) records the advisory state
 for every dep used in the build, regardless of whether advisories were
@@ -10380,9 +10405,9 @@ and whether any forced or allowed exceptions were in effect.
 
 ---
 
-## 26.16 Phase Guard Configuration
+## 24.16 Phase Guard Configuration
 
-The default phase guard table (§26.11) can be adjusted in `now.pasta`
+The default phase guard table (§24.11) can be adjusted in `now.pasta`
 or `~/.now/config.pasta`. Escalating guards (making them stricter) is
 always permitted. Relaxing guards (making them more permissive) requires
 `advisory.relax_guards: true` and produces a workspace-level warning.
@@ -10431,7 +10456,7 @@ the configuration is visible and auditable to anyone reading build output.
 
 ---
 
-## 26.17 `now advisory:audit` — Full Project Audit
+## 24.17 `now advisory:audit` — Full Project Audit
 
 ```sh
 now advisory:audit
@@ -11547,7 +11572,7 @@ now.pasta root  →  map
 | `parent` | `coordinate?` | Inherited organisation descriptor (doc 01c). |
 | `inherit` | `inherit-block?` | Selective inheritance from workspace root (doc 01c). |
 | `volatile` | `bool?` | Marks module as volatile (doc 01c). |
-| `build_options` | `build-options-block?` | Advanced build phase options (see §31.17). |
+| `build_options` | `build-options-block?` | Advanced build phase options (see §31.21). |
 | `languages` | `language-def[]?` | Custom language type definitions (doc 04c). |
 
 Unknown fields at root level: **warn** (code `NOW-W0001`), do not fail.
@@ -11968,7 +11993,7 @@ to flag unknown fields in IDE underlines, but `now` itself only warns
 
 ---
 
-## 31.17 Build Options Block (`build-options-block`)
+## 31.21 Build Options Block (`build-options-block`)
 
 Controls advanced behaviour of the `build` phase. All fields are optional.
 
@@ -11987,7 +12012,7 @@ Controls advanced behaviour of the `build` phase. All fields are optional.
 ---
 
 
-## 31.21 Supersession
+## 31.22 Supersession
 
 This document supersedes the field tables in:
 

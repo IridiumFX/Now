@@ -1,5 +1,5 @@
 /*
- * now_advisory.h — Security advisory database and checking (§26.4-26.6)
+ * now_advisory.h — Security advisory database and checking (§24.4-24.6)
  *
  * Advisory database loading, severity matching, override handling,
  * and build-phase guard enforcement.

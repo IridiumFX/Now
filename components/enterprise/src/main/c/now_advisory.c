@@ -1,5 +1,5 @@
 /*
- * now_advisory.c — Security advisory database and checking (§26.4-26.6)
+ * now_advisory.c — Security advisory database and checking (§24.4-24.6)
  *
  * Advisory database loading from Pasta format, severity-based blocking,
  * override mechanism with mandatory expiry, dep checking.
