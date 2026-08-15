@@ -324,6 +324,14 @@ Organization-wide policies are enforced through configuration layers placed in `
 }
 ```
 
+> **`toolchain:` is not implemented.** It parses and is ignored, in a
+> layer or in a `now.pasta`; `now` warns "recognized but not implemented"
+> on it. Tool selection today is `CC` / `CXX` / `AR` / `AS` from the
+> environment, then a `PATH` lookup — nothing else, including no
+> project-level pinning and no `cross:<triple>` presets. To pin a
+> compiler for a team, set `CC` in the environment your builds run in, or
+> put a wrapper script early on `PATH`.
+
 ### Section Policies
 
 | Policy | Behavior |
@@ -345,15 +353,44 @@ now layers:audit             # report policy violations
 
 Prevent private packages from being resolved from public registries:
 
+Three places are read, and a group listed in any of them is private:
+
 ```pasta
-{
-  private_groups: ["com.acme", "com.acme.internal"]
-}
+; ~/.now/config.pasta — machine-wide policy
+{ private_groups: ["com.acme", "com.acme.internal"] }
+```
+
+```pasta
+; now.pasta — per project, either spelling
+{ private_groups: ["com.acme"] }
+{ resolve: { private_groups: ["com.acme"] } }
 ```
 
 When a dependency's group matches a `private_groups` prefix, `now procure` will **only** resolve it from private registries (not the public central registry). This prevents supply chain attacks where an attacker publishes a package with the same name as your internal dependency.
 
 Matching uses dot-boundary rules: `com.acme` matches `com.acme.sub` but NOT `com.acmetools`.
+
+**Declaration order is the policy.** Only repos declared *before* the
+first public registry are tried for a private group:
+
+```pasta
+repos: [
+  "https://pkg.acme.internal/now",     ; tried for private groups
+  "https://registry.now.build",        ; public — the fence stops here
+  "https://late.acme.internal/now"     ; NOT tried for private groups
+]
+```
+
+If no private repo precedes the public one, procurement of a private
+group is a hard failure — there is no fallback and no override. `--repo`
+replaces the declared list but cannot unlock a private group by pointing
+at a public host.
+
+> Enforced from rc3 (2026-08-12). Earlier builds checked only that
+> *some* repo was declared and then used the first one whatever it was,
+> so a `repos:` list with the public registry first would resolve private
+> groups from it. If you are relying on this control, check your `now`
+> version.
 
 ---
 

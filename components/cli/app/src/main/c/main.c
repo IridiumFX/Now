@@ -305,6 +305,12 @@ int main(int argc, char *argv[]) {
     if (target_str || ptag_count > 0)
         now_build_set_default_target(target_str, ptag_buf, ptag_count);
 
+    /* Same for the procure options. `build` and `test` run procure
+     * implicitly, and that call used a zeroed struct — so `now build
+     * --locked`, which the user guide documents, resolved and rewrote
+     * the lockfile exactly as if the flag were absent. */
+    now_build_set_procure_opts(repo_url, flag_offline, flag_locked);
+
     /* Handle version and help */
     if (strcmp(phase, "version") == 0 || strcmp(phase, "--version") == 0) {
         printf("now %s\n", now_version());

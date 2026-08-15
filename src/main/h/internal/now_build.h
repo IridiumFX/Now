@@ -123,6 +123,21 @@ NOW_API void now_build_set_target(NowBuildCtx *ctx, const NowTriple *target,
  * now_build()/now_compile() without changing their signatures.
  * Pass triple=NULL to fall back to host. tags+tag_count are copied;
  * pass NULL/0 to clear any prior tags. */
+/* Procure options for the procure step that `build`/`test` run implicitly.
+ *
+ * `now build --locked` is documented and was doing nothing: the implicit
+ * procure was called with a zeroed options struct, so --locked, --offline
+ * and --repo reached the standalone `now procure` phase and nowhere else.
+ * Set these once from the CLI before invoking a lifecycle phase.
+ *
+ * `locked` also changes the failure policy. An implicit procure failure is
+ * deliberately non-fatal — a previously-installed dep should still build
+ * when the registry is unreachable — but a lockfile that no longer matches
+ * is a policy violation, not a connectivity problem, and must stop the
+ * build rather than be swallowed. */
+NOW_API void now_build_set_procure_opts(const char *registry_url,
+                                         int offline, int locked);
+
 NOW_API void now_build_set_default_target(const char *triple,
                                            const char *const *tags,
                                            size_t tag_count);

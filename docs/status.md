@@ -1,9 +1,55 @@
 # now — v1.0 Release Candidate
 
-**Version**: 1.0.0-rc2
-**Date**: 2026-05-16
-**Tests**: 315 passing
+**Version**: 1.0.0-rc3
+**Date**: 2026-08-12
+**Tests**: 343 passing
 **Languages**: C (production) · C++ (works) · Rust FFI (works) · Go / Java / asm (experimental) · Julia (not yet implemented)
+
+---
+
+## Recent Changes (2026-08-06 → 2026-08-12)
+
+**Correctness — incremental builds.** Six defects in the staleness
+machinery, all of which reported "up to date" for objects that were not.
+The manifest returned before its header-dependency loop when only an
+mtime moved; cache-restored objects recorded no headers; the link check
+ignored every input but its own objects, and compared second-resolution
+mtimes with `>`; two checkouts with identical sources shared cache
+entries across trees; **the manifest never recorded the compiler**, so
+switching toolchains reused the other compiler's objects; and a build
+served entirely from the cache discarded its own manifest entries and so
+never converged. Reported by Amy against a freestanding RISC-V kernel.
+
+**Supply chain.** The `private_groups` dependency-confusion fence was
+decorative — it only checked that *some* repo was declared, and only
+`repos[0]` was ever consulted, so a private group could resolve from a
+public registry. Resolution now walks the declared repos in order,
+stops before any public registry for a private group, authenticates per
+registry, and fails closed. Both documented spellings work (nested
+`resolve: {}` and machine-level `~/.now/config.pasta`).
+
+**CLI.** `--repo`, `--offline` and `--locked` reach procure — including
+the implicit procure inside `build`/`test`, where they had no effect at
+all. `--locked` fails on any lockfile drift. `convergence: "highest"`
+selects the highest available version instead of silently behaving as
+"lowest" (it now needs a reachable registry). `now ci --output json`
+reports real build and test counts rather than hardcoded zeros.
+`advisory:update` exits non-zero instead of reporting success while
+doing nothing.
+
+**Diagnostics.** Descriptor fields that parse and do nothing now say so,
+including nested ones (`output.dir`, `link.script_body`, `deps[].exclude`
+and others) — previously ignored in complete silence.
+
+**Distribution.** `tools/install-toolkit.sh` and `tools/install-wsl.sh`
+build, verify and install; see the Installing section of `CLAUDE.md`.
+Peers that cross-compile need the WSL build — a Windows `now.exe` cannot
+drive a toolchain that only exists on the Linux side.
+
+**Specification.** Reconciled against the implementation: exit codes,
+the full command set (21 commands were undocumented, `keygen` among
+them), toolchain resolution order, and `vacate` — which does not exist.
+Every section number is now unique and every citation resolves.
 
 ---
 

@@ -271,6 +271,14 @@ When multiple deps require different versions of the same artifact:
 }
 ```
 
+- `lowest` — the lowest version satisfying every constraint. Answerable
+  without a registry, so it works offline.
+- `highest` — the highest version the registry actually publishes.
+  **Requires a reachable registry** and fails without one. Before rc3 it
+  silently behaved as `lowest`.
+- `exact` — every constraint must name an exact version, or resolution
+  fails.
+
 ### Overrides
 
 Force a specific version regardless of other constraints:
@@ -752,10 +760,52 @@ The generated files are standalone and fully functional. They include:
 |------|-------------|
 | `-v`, `--verbose` | Verbose output |
 | `-j N` | Parallel jobs (0 = auto) |
-| `--repo URL` | Registry URL for publish |
+| `--repo URL`, `--registry URL` | Registry to use. Replaces `repos:` rather than adding to it, and is still subject to the `private_groups` fence. |
 | `--output FMT` | Output format: text, json, pasta |
-| `--locked` | Fail if lock file inconsistent |
-| `--offline` | No network access |
+| `--locked` | Fail if resolution differs from `now.lock.pasta` — any added, removed or version-changed dependency. The lockfile is left untouched. |
+| `--offline` | Use only locally installed deps; never reach the network |
 | `--target TRIPLE` | Target platform triple |
+| `--platform-tag TAG` | Extra platform tag for source gating |
+| `--timing` | Print per-phase timings |
+| `--tui` | Interactive progress display |
 | `--no-color` | Disable ANSI colors |
 | `-h`, `--help` | Show help |
+
+`--repo`, `--offline` and `--locked` apply to `procure` and to the
+implicit procure that `build` and `test` run. Under `--locked` a
+procure failure stops the build; without it, a failing procure is
+tolerated so that already-installed deps still build when the registry
+is unreachable.
+
+There is **no `-p` / `--profile` flag** — `profiles:` is accepted in a
+descriptor and does nothing.
+
+### Signing and publishing
+
+`trust: { require_signatures: true }` can only be satisfied by an
+archive that was signed, and signing needs a key:
+
+```sh
+now keygen                     # Ed25519 keypair → ~/.now/signing.key
+                               # prints the public half, base64
+now package                    # signs when a key is present
+now publish --repo <url>       # uploads the archive and its .sig
+```
+
+On the consuming side, add the publisher's public key to the trust
+store, then require signatures:
+
+```sh
+now trust:add <name> <base64-public-key>
+now trust:list
+```
+
+```pasta
+trust: { require_signatures: true }
+```
+
+`now procure` then verifies each downloaded archive against the trust
+store and refuses anything unsigned, untrusted or tampered with. Without
+a trusted key for the publisher this fails closed, which is the intended
+direction — `require_signatures` is unsatisfiable until the key is
+added.

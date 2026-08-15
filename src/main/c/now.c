@@ -100,6 +100,19 @@ NOW_API const char *now_project_convergence(const NowProject *p) {
 
 /* ---- Procure + dep path injection ---- */
 
+/* CLI-supplied procure options for the implicit procure inside a
+ * lifecycle phase. See now_build_set_procure_opts() in now_build.h. */
+static const char *g_procure_registry = NULL;
+static int         g_procure_offline  = 0;
+static int         g_procure_locked   = 0;
+
+NOW_API void now_build_set_procure_opts(const char *registry_url,
+                                         int offline, int locked) {
+    g_procure_registry = (registry_url && *registry_url) ? registry_url : NULL;
+    g_procure_offline  = offline;
+    g_procure_locked   = locked;
+}
+
 /* Run procure phase and populate build context dep paths.
  * Returns 0 on success. If project has no deps, this is a no-op.
  *
@@ -123,9 +136,20 @@ static int procure_and_inject_deps(const NowProject *project,
     if (non_local) {
         /* Run procure (non-fatal — locally-installed deps still work) */
         NowProcureOpts opts = {0};
+        opts.registry_url = g_procure_registry;
+        opts.offline      = g_procure_offline;
+        opts.locked       = g_procure_locked;
         NowResult procure_res;
         memset(&procure_res, 0, sizeof(procure_res));
-        (void)now_procure(project, &opts, &procure_res);
+        int prc = now_procure(project, &opts, &procure_res);
+        /* Under --locked the caller asked for the committed dependency
+         * state exactly. Failing to establish that is not the "registry
+         * is down, use what we have" case this step normally tolerates,
+         * so it stops the build instead of being discarded. */
+        if (prc != 0 && g_procure_locked) {
+            if (result) *result = procure_res;
+            return -1;
+        }
     }
 
     /* Determine repo root */
