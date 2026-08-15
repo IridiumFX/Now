@@ -488,6 +488,18 @@ static const char *const k_inert_keys[] = {
      * rather than "unknown", which is the difference between a user
      * checking their spelling and a user checking the roadmap. */
     "allow_prerelease",
+    /* Documented in the spec's own top-level field table (§1.13) and
+     * implemented by nothing. They were reported as *unknown* keys,
+     * which tells someone who copied the field straight out of the spec
+     * that they misspelled it. "Not implemented" is the true answer.
+     *   build_options — advanced build phase options
+     *   target/targets — per-triple compile overrides (the --target flag
+     *                    and arch: tags exist; the descriptor block does not)
+     *   toolchain     — named presets, incl. cross:<triple>; only the CC/CXX
+     *                   environment variables and PATH lookup are implemented
+     *   parent        — published parent descriptor coordinate
+     */
+    "build_options", "target", "targets", "toolchain", "parent",
     "publish", "assembly", NULL
 };
 

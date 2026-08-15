@@ -425,16 +425,64 @@ acknowledgements, and runs `now version:check`.
 
 ## 1.13 Additional Top-Level Fields
 
+Implemented and honoured by the build:
+
 | Field | Type | Notes |
 |-------|------|-------|
-| `build_options` | map? | Advanced build phase options (Chapter 8 §8.9) |
-| `assembly` | assembly[]? | Multi-artifact packaging (Chapter 13) |
-| `publish` | map? | Registry publication config |
-| `reproducible` | map? | Reproducible build settings (Chapter 22) |
-| `target` / `targets` | map? | Per-triple compile overrides (Chapter 12) |
-| `toolchain` | map? | Toolchain selection and config (Chapter 7) |
-| `private_groups` | string[]? | Private group prefixes (Chapter 24) |
-| `parent` | string? | Published parent descriptor coordinate |
+| `vendored` | string[]? | Paths to vendored external sources. See §1.13.1. |
+| `depends` | dep[]? | Accepted as a synonym for `deps`. See §1.13.2. |
+| `java` | map? | Java toolchain and packaging config, used when `lang`/`langs` includes Java. |
+| `assembly` | assembly[]? | Multi-artifact packaging. |
+| `publish` | map? | Registry publication config. |
+| `reproducible` | map? | Reproducible build settings. |
+| `private_groups` | string[]? | Private group prefixes — see the dependency-confusion chapter (§25.2). |
+
+**Accepted but not implemented.** These parse and are then ignored;
+`now` warns "recognized but not implemented" on each. They are listed
+because they appear in this specification, not because they work:
+
+| Field | Type | Intended | Status |
+|-------|------|----------|--------|
+| `build_options` | map? | Advanced build phase options | Not implemented. |
+| `target` / `targets` | map? | Per-triple compile overrides | Not implemented. The `--target` flag and `arch:` tag gating do work; the descriptor block does not. |
+| `toolchain` | map/string? | Toolchain selection, incl. `cross:<triple>` presets | Not implemented. Only `CC`/`CXX`/`AR`/`AS` environment variables and a PATH lookup are honoured — see §7.1. |
+| `parent` | string? | Published parent descriptor coordinate | Not implemented. |
+| `profiles` | map? | Named build profiles | Not implemented; no `-p` flag exists. |
+| `properties` | map? | User-defined interpolation variables | Not implemented. |
+
+---
+
+## 1.13.1 `vendored`
+
+Paths to external source trees carried inside the project. `now` walks
+each one to discover sources, recursing into any `now.pasta` it finds
+there, and compiles them as part of this artifact rather than resolving
+them as dependencies.
+
+```pasta
+vendored: [ "lib/apennines", "lib/basta" ]
+```
+
+This is how a project absorbs a library it does not want to publish or
+procure — `now` builds itself this way. It differs from the neighbouring
+fields:
+
+- `deps` — resolved from a registry, versioned, installed to `~/.now/repo`
+- `components` — this project's own modules, built and linked together
+- `modules` — workspace members, each a project in its own right (§1.11)
+- `vendored` — foreign sources compiled in place, no coordinates involved
+
+Because discovery walks the tree, **adding a source file to a vendored
+library needs nothing declared**. Build systems that keep an explicit
+source list — CMake, for one — do not get that for free, and the two
+disagree silently until the link fails on a missing symbol.
+
+---
+
+## 1.13.2 `depends`
+
+A synonym for `deps`, accepted wherever `deps` is. `deps` is preferred;
+`depends` is read only when `deps` is absent, never merged with it.
 
 ---
 
@@ -531,12 +579,25 @@ Invoking a phase invokes all prior phases in its lifecycle first.
 clean → vacate
 ```
 
-| Phase | Description |
-|-------|-------------|
-| `clean` | Delete `target/`. Forces full rebuild. |
-| `vacate` | Remove installed dep artifacts from `~/.now/repo/` (and optionally cache). |
+| Phase | Description | Status |
+|-------|-------------|--------|
+| `clean` | Delete `target/`. Forces full rebuild. | Implemented. |
+| `vacate` | Remove installed dep artifacts from `~/.now/repo/` (and optionally cache). | **Not implemented.** |
 
 `vacate` is never run automatically — it must be invoked explicitly.
+
+> **`vacate` does not exist (verified 2026-08-12).** `now vacate` exits 1
+> with "unknown phase", and neither the refcounting policy described in
+> §3.4 nor the `--gc` / `--force` / `--purge` / `--all` flags shown
+> elsewhere in this document are implemented — nothing anywhere removes
+> anything from `~/.now/repo`. **There is currently no supported way to
+> prune the local repo**; it grows without bound and must be pruned by
+> hand.
+>
+> `cache:clean` is not a substitute: it clears the compiled-object cache
+> under `~/.now/cache`, which is a different store. Nor is `yank`, which
+> despite the surface similarity marks a version withdrawn in a *remote
+> registry* and touches nothing locally.
 
 ## 2.3 The `build` Phase in Detail
 
@@ -574,19 +635,63 @@ now procure link        ; re-procure deps then re-link (no rebuild)
 
 ```sh
 now build                       ; procure → generate → build → link
-now build :scheduler            ; named target only
-now build --target linux:*:musl ; fan out across triples (Chapter 12)
+now build --target linux:*:musl ; select a target triple
 now link                        ; link only
 now test                        ; procure → generate → build → link → test
-now test -p debug -p asan       ; with profiles
 now clean build                 ; clean then full build
 now procure                     ; dep resolution only
 now generate                    ; procure → generate
 now publish --repo https://pkg.acme.org/now
-now vacate org.acme:core:1.5.0
-now vacate --all --purge
-now compile-db                  ; emit compile_commands.json (IDE, Chapter 17)
+now compile-db                  ; emit compile_commands.json
 ```
+
+### Full command set
+
+Everything `now` dispatches. Commands marked † were absent from earlier
+revisions of this specification despite working — the omission is why
+`keygen` went unmentioned while `trust: { require_signatures: true }`,
+which nothing else can satisfy, was documented in detail.
+
+| Command | Purpose |
+|---------|---------|
+| `build` · `link` · `test` · `clean` · `compile` | Lifecycle phases. |
+| `procure` | Resolve and install dependencies. |
+| `generate` | Run plugin generate hooks. |
+| `package` · `publish` | Assemble an archive; upload it. Signing happens inside `package`. |
+| `yank` † | Mark a published version yanked in a registry. Not to be confused with `vacate` (§2.2), which is unimplemented. |
+| `install` | Install the built artifact to the local repo. |
+| `ci` | Run the lifecycle with CI-shaped output (`--output json\|pasta`). |
+| `init` · `sketch` · `fmt` | Scaffold a project; scaffold a snippet; format a descriptor. |
+| `compile-db` | Emit `compile_commands.json`. |
+| `watch` | Rebuild on source change. |
+| `sbom` † | Emit a software bill of materials. |
+| `keygen` † | Generate an Ed25519 publisher signing keypair. **Required to satisfy `require_signatures`.** |
+| `verify` | Verify an archive signature against the trust store. |
+| `trust:add` † · `trust:list` † | Manage trusted publisher keys. |
+| `auth:login` † · `auth:logout` † · `auth:status` † | Registry credentials and cached tokens. |
+| `cache:stats` † · `cache:clean` † | Object-cache size; clear it. Clears `~/.now/cache`, **not** `~/.now/repo`. |
+| `cache:mirror` † · `cache:remote-stats` † | Mirror coordinates; report on the remote cache. |
+| `dep:updates` | Report newer versions of declared deps. |
+| `advisory:check` · `advisory:update` | Check deps against the advisory database. `advisory:update` is **not implemented** and exits non-zero. |
+| `audit:show` † | Show the local audit log. |
+| `layers:show` · `layers:audit` | Inspect the layer stack; report locked-section violations (detected, not enforced). |
+| `plugin:list` † · `plugin:info` † · `plugin:search` † · `plugin:install` † | Plugin registry operations. |
+| `export:cmake` † · `export:make` † · `export:meson` † · `export:bazel` † · `export:maven` † | Emit a build file for another system. |
+| `import:cmake` † · `import:maven` † | Derive a `now.pasta` from another system's build file. |
+| `reproducible:check` † | Build twice and compare outputs. |
+| `version` · `help` | — |
+
+### Flags
+
+`-j N` · `-v`/`--verbose` · `-o`/`--output <fmt>` · `--target <triple>` ·
+`--platform-tag <tag>` · `--repo`/`--registry <url>` · `--offline` ·
+`--locked` · `--no-color` · `--tui` · `--timing` · `--effective` ·
+`--sorted` · `--last` · `--poll` · `--event` · `--method` · `--type` ·
+`--lang` · `--group` · `--artifact` · `--reason`
+
+There is **no `-p` / profile flag**: profiles are not implemented, so
+`now test -p debug` — shown in earlier revisions of this section — fails.
+There is likewise no `:target` selector syntax (`now build :scheduler`).
 
 ## 2.6 Incremental Builds
 
@@ -620,18 +725,37 @@ completes.
 
 ## 2.8 Exit Codes
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success. |
-| `1` | One or more errors produced. |
-| `2` | Internal `now` failure (bug). |
-| `3` | Input not found (no `now.pasta`, missing file). |
-| `4` | Network error during `procure`. |
-| `5` | Compiler or tool subprocess failed. |
-| `10` | Test failures (all tests ran, some failed). |
-| `11` | Test execution error (tests could not run). |
+| Code | Constant | Meaning |
+|------|----------|---------|
+| `0` | `NOW_EXIT_OK` | Success. |
+| `1` | `NOW_EXIT_BUILD` | Build error (compile or link). |
+| `2` | `NOW_EXIT_TEST` | Test failure. |
+| `3` | `NOW_EXIT_RESOLVE` | Dependency resolution failure. |
+| `4` | `NOW_EXIT_CONFIG` | Configuration error (`now.pasta` syntax or schema). |
+| `5` | `NOW_EXIT_IO` | I/O error (disk or network). |
+| `6` | `NOW_EXIT_AUTH` | Authentication failure. |
+| `7` | `NOW_EXIT_ADVISORY` | Blocked by a security advisory. |
 
-Full error code catalogue in Chapter 27.
+These are the codes `now` actually returns; the mapping from internal
+error to exit code lives in `now_exit_code()`.
+
+> **Corrected 2026-08-12.** This table previously described a different
+> scheme — `2` as an internal `now` bug, `3` as input-not-found, `4` as a
+> network error, and `10`/`11` for test outcomes. No release ever emitted
+> those. The divergence mattered because CI branches on exit status: a
+> pipeline written against the old table treated a plain test failure
+> (`2`) as an internal tool bug, and waited for a `10` that never came.
+> The implementation was left alone and this table corrected, because
+> anything already keyed on observed behaviour is correct today and
+> changing the codes would break it.
+>
+> One capability the old table described and the current scheme does not:
+> it separated "tests ran and some failed" from "tests could not run at
+> all". Both are `2` today. `now ci --output json` distinguishes them —
+> a phase that never ran reports `tests.total: 0` — but the exit status
+> does not.
+
+Full error code catalogue in the Error Catalogue chapter.
 
 
 
@@ -1691,6 +1815,12 @@ exact version; the repo path is derived from the pinned version.
 
 ## 5.12 Vacate and the Shared Repo
 
+> **None of this section is implemented (verified 2026-08-12).** There is
+> no `vacate` command, no `.refcount` file is ever written or read, and
+> `now procure` does not increment anything. It is retained as the
+> intended design. Today the shared repo is append-only in practice —
+> see the note in §2.2.
+
 Because the repo is shared, `now vacate` must be conservative:
 
 ```
@@ -2360,15 +2490,32 @@ document defines how toolchains are selected, configured, and invoked.
 
 For each tool, `now` resolves the executable in this order:
 
-1. `compile.cc` / `compile.cxx` / etc. in `now.pasta` (project-level)
-2. Active profile overrides to the above
-3. `~/.now/config.pasta` global tool settings
-4. `CC`, `CXX`, `AR`, `AS`, `LD` environment variables
-5. Named toolchain preset (if `toolchain:` is set)
-6. Platform default (`cc`/`c++` on POSIX, `cl.exe` on Windows)
+1. `CC`, `CXX`, `AR`, `AS` environment variables
+2. Platform default (`cc`/`c++` on POSIX, `gcc`/`g++` on Windows/MinGW,
+   `cl.exe` when `CC` names MSVC), looked up on `PATH`
 
-Once resolved, `now` verifies the tool exists and is executable. If not,
-it reports the resolution chain and fails with a clear message.
+**That is the whole of it as implemented.** The following steps are
+specified and do not exist; a descriptor relying on any of them silently
+gets the environment-variable answer instead:
+
+| Step | Status |
+|------|--------|
+| `compile.cc` / `compile.cxx` project-level pinning | Not implemented. There is no way to pin a compiler in the descriptor. |
+| Active profile overrides | Not implemented — profiles do not exist. |
+| `~/.now/config.pasta` global tool settings | Not implemented. That file is read for audit settings and the remote object cache only. |
+| Named toolchain presets, incl. `cross:<triple>` (§7.3) | Not implemented. |
+
+The practical consequence for cross-compilation: set `CC` (and friends)
+in the environment. A wrapper script on `PATH` is the supported way to
+pin a cross toolchain today — `toolchain: "cross:aarch64-linux-gnu"`
+parses and does nothing.
+
+Once resolved, `now` prepends the tool's own directory to `PATH` so its
+helper executables and DLLs are found. `now` does **not** currently
+verify up front that the tool exists and report the resolution chain;
+failure surfaces when the compiler is spawned.
+
+> Corrected 2026-08-12 against the implementation.
 
 ---
 
@@ -11918,16 +12065,19 @@ the conflicting dep that forced a version incompatibility).
 
 ### Exit Codes
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success. |
-| `1` | One or more errors produced. |
-| `2` | Internal `now` failure (bug). |
-| `3` | Input not found (no `now.pasta`, missing file). |
-| `4` | Network error during `procure`. |
-| `5` | Compiler or tool subprocess failed (the compiler's own exit code is in the structured output). |
-| `10` | Test failures (all tests ran, some failed). |
-| `11` | Test execution error (tests could not run). |
+| Code | Constant | Meaning |
+|------|----------|---------|
+| `0` | `NOW_EXIT_OK` | Success. |
+| `1` | `NOW_EXIT_BUILD` | Build error (compile or link). The tool's own exit code is in the structured output. |
+| `2` | `NOW_EXIT_TEST` | Test failure. |
+| `3` | `NOW_EXIT_RESOLVE` | Dependency resolution failure. |
+| `4` | `NOW_EXIT_CONFIG` | Configuration error (`now.pasta` syntax or schema). |
+| `5` | `NOW_EXIT_IO` | I/O error (disk or network). |
+| `6` | `NOW_EXIT_AUTH` | Authentication failure. |
+| `7` | `NOW_EXIT_ADVISORY` | Blocked by a security advisory. |
+
+Corrected 2026-08-12 to match the implementation — see §2.8 for what
+changed and why the codes were not moved instead.
 
 ---
 
