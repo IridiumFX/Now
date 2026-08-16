@@ -849,6 +849,56 @@ unsigned long http_response_parse(http_response *out, const u8 *data, u64 len) {
     /* extract body */
     body_len = len - body_offset;
 
+    /* Transfer-Encoding: chunked takes precedence over Content-Length
+     * (RFC 9112 §6.1). Decode here, in the parser, because this is also
+     * where completeness is decided: a chunked body is only complete
+     * once its terminating zero-length chunk has arrived.
+     *
+     * Without this the parser declared success the moment the headers
+     * landed and handed back whatever happened to have arrived. The two
+     * clients then failed differently for the same reason: http_client
+     * uses a successful parse as its "response complete" signal, so it
+     * stopped reading and truncated the body to nothing; https_client
+     * reads to EOF, so it passed the raw framing through and a 64-byte
+     * payload reached the caller as 75 bytes of "40\r\n...0\r\n\r\n".
+     * Reported by the `now` team as corrupted artifact downloads. */
+    {
+        int chunked = 0;
+        http_headers_is_chunked(&chunked, &out->headers);
+        if (chunked) {
+            http_chunked_decoder *d = NULL;
+            u8  *dec = NULL;
+            u64  dec_len = 0;
+            int  done = 0;
+
+            if (http_chunked_decoder_create(&d) != 0) {
+                http_response_destroy(out);
+                return 5;
+            }
+            if (body_len > 0 &&
+                http_chunked_decoder_feed(d, body_start, body_len) != 0) {
+                http_chunked_decoder_destroy(d);
+                http_response_destroy(out);
+                return 5;
+            }
+            http_chunked_decoder_is_done(&done, d);
+            if (!done) {
+                http_chunked_decoder_destroy(d);
+                http_response_destroy(out);
+                return 6;   /* incomplete — caller keeps reading */
+            }
+            if (http_chunked_decoder_read(&dec, &dec_len, d) != 0) {
+                http_chunked_decoder_destroy(d);
+                http_response_destroy(out);
+                return 5;
+            }
+            http_chunked_decoder_destroy(d);
+            out->body = dec;
+            out->body_len = dec_len;
+            return 0;
+        }
+    }
+
     /* check Content-Length */
     {
         const char *cl_val = NULL;
@@ -1124,6 +1174,77 @@ unsigned long http_chunked_decoder_destroy(http_chunked_decoder *d) {
     free(d->inbuf);
     free(d->outbuf);
     free(d);
+    return 0;
+}
+
+unsigned long http_dechunk(u8 **out, u64 *out_len,
+                           const u8 *data, u64 len) {
+    http_chunked_decoder *d = NULL;
+    u8  *buf  = NULL;
+    u64  blen = 0;
+
+    if (!out)     return 1;
+    if (!out_len) return 2;
+    if (len > 0 && !data) return 3;
+
+    *out = NULL;
+    *out_len = 0;
+    if (len == 0) return 0;
+
+    if (http_chunked_decoder_create(&d) != 0) return 4;
+    if (http_chunked_decoder_feed(d, data, len) != 0) {
+        http_chunked_decoder_destroy(d);
+        return 4;
+    }
+    if (http_chunked_decoder_read(&buf, &blen, d) != 0) {
+        http_chunked_decoder_destroy(d);
+        return 4;
+    }
+    http_chunked_decoder_destroy(d);
+
+    *out = buf;
+    *out_len = blen;
+    return 0;
+}
+
+unsigned long http_headers_is_chunked(int *out, const http_headers *h) {
+    u64 i;
+
+    if (!out) return 1;
+    if (!h)   return 2;
+
+    *out = 0;
+    for (i = 0; i < h->count; ++i) {
+        const char *n = h->items[i].name;
+        const char *v = h->items[i].value;
+        if (!n || !v) continue;
+        if (strlen(n) != 17) continue;
+        {
+            /* case-insensitive "Transfer-Encoding" */
+            u64 k; int same = 1;
+            static const char te[] = "transfer-encoding";
+            for (k = 0; k < 17; ++k) {
+                if (tolower((unsigned char)n[k]) != te[k]) { same = 0; break; }
+            }
+            if (!same) continue;
+        }
+        /* The value may be a coding list such as "gzip, chunked", so
+         * search rather than compare. RFC 9112 requires chunked last. */
+        {
+            const char *p;
+            for (p = v; *p; ++p) {
+                if (tolower((unsigned char)p[0]) == 'c' &&
+                    strlen(p) >= 7) {
+                    static const char ck[] = "chunked";
+                    u64 k; int same = 1;
+                    for (k = 0; k < 7; ++k) {
+                        if (tolower((unsigned char)p[k]) != ck[k]) { same = 0; break; }
+                    }
+                    if (same) { *out = 1; return 0; }
+                }
+            }
+        }
+    }
     return 0;
 }
 

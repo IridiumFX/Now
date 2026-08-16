@@ -169,24 +169,26 @@ PICO_API int pico_http_request(const char *method, const char *url,
         http_url parsed;
         unsigned long urc = http_url_parse(&parsed, url);
         if (urc == 0 && parsed.host && parsed.host[0]) {
-            /* Skip the probe for names the resolver would not answer
-             * for anyway. `localhost` and IP literals come from the
-             * hosts file or need no lookup at all, so a DNS query for
-             * them fails — and failing the probe aborted the request
-             * before a single packet was sent. That silently made
-             * every localhost registry unreachable, including
-             * procure's own default of http://localhost:8080 and any
-             * cookbook started from cookbook_start.bat. */
+            /* Skip the probe for IP literals — there is nothing to
+             * resolve, so a lookup can only cost time or fail.
+             *
+             * `localhost` used to be skipped here too, because the probe
+             * failed for it and a failed probe aborted the request
+             * before a packet was sent, which silently made every
+             * localhost registry unreachable. That was never a resolver
+             * problem: `dns_query` wraps getaddrinfo and reads the hosts
+             * file. The real cause was the connect path taking only the
+             * first address, and `localhost` resolving to `::1` first —
+             * fixed upstream in apennines 000296 (`tcp_conn_create_host`
+             * tries every address). Verified after re-vendoring: a
+             * request to `http://localhost:PORT` reaches an IPv4-only
+             * listener. */
             const char *h = parsed.host;
-            int skip = (strcmp(h, "localhost") == 0);
-            if (!skip) {
-                /* IPv4/IPv6 literal: only hex digits, dots, colons. */
-                skip = 1;
-                for (const char *p = h; *p; p++) {
-                    if (!((*p >= '0' && *p <= '9') || *p == '.' || *p == ':' ||
-                          (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
-                        skip = 0; break;
-                    }
+            int skip = 1;
+            for (const char *p = h; *p; p++) {
+                if (!((*p >= '0' && *p <= '9') || *p == '.' || *p == ':' ||
+                      (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
+                    skip = 0; break;
                 }
             }
             if (!skip) {
@@ -220,52 +222,21 @@ PICO_API int pico_http_request(const char *method, const char *url,
     /* Copy response */
     out->status = (int)resp.status;
 
-    /* De-chunk if the server used Transfer-Encoding: chunked.
+    /* No de-chunking here.
      *
-     * https_client copies the parsed body through verbatim and never
-     * consults Transfer-Encoding, so a chunked response arrives with
-     * its framing still embedded — a 64-byte signature comes back as
-     * 75 bytes beginning "40\r\n". That corrupts every artifact `now`
-     * downloads, and the damage surfaces far away as a SHA-256
-     * mismatch or "invalid signature (expected 64 bytes)", blaming the
-     * artifact for a transport bug. Decode here with apennines' own
-     * public decoder so the semantics match its parser.
+     * `now` used to decode Transfer-Encoding: chunked at this seam,
+     * because apennines' parser sized a body as "everything after the
+     * headers" and handed the framing through — a 64-byte signature
+     * arrived as 75 bytes beginning "40\r\n", corrupting every artifact
+     * downloaded and surfacing far away as a SHA-256 mismatch.
      *
-     * The proper fix belongs in https_client itself; this keeps `now`
-     * correct until that lands upstream. */
-    u8 *dechunked = NULL;
-    u64 dechunked_len = 0;
-    {
-        int is_chunked = 0;
-        for (u64 hi = 0; hi < resp.headers.count; hi++) {
-            const char *hn = resp.headers.items[hi].name;
-            const char *hv = resp.headers.items[hi].value;
-            if (!hn || !hv) continue;
-#ifdef _WIN32
-            if (_stricmp(hn, "Transfer-Encoding") != 0) continue;
-#else
-            if (strcasecmp(hn, "Transfer-Encoding") != 0) continue;
-#endif
-            for (const char *p = hv; *p; p++) {
-                if ((p[0] == 'c' || p[0] == 'C') &&
-                    (strncmp(p + 1, "hunked", 6) == 0 ||
-                     strncmp(p + 1, "HUNKED", 6) == 0)) { is_chunked = 1; break; }
-            }
-            break;
-        }
-
-        if (is_chunked && resp.body && resp.body_len > 0) {
-            http_chunked_decoder *d = NULL;
-            if (http_chunked_decoder_create(&d) == 0) {
-                if (http_chunked_decoder_feed(d, resp.body, resp.body_len) == 0)
-                    http_chunked_decoder_read(&dechunked, &dechunked_len, d);
-                http_chunked_decoder_destroy(d);
-            }
-        }
-    }
-
-    const u8 *body_src = dechunked ? dechunked : resp.body;
-    size_t    body_n   = dechunked ? (size_t)dechunked_len : (size_t)resp.body_len;
+     * Fixed upstream in `http_response_parse` (apennines 000296), which
+     * is the only place that can judge completeness: a chunked body is
+     * done when its terminating zero-length chunk arrives. Decoding here
+     * as well would now double-decode. Removed with the re-vendor to
+     * 34addca — the two changes belong in the same commit. */
+    const u8 *body_src = resp.body;
+    size_t    body_n   = (size_t)resp.body_len;
 
     if (body_src && body_n > 0) {
         out->body = (char *)malloc(body_n + 1);
@@ -275,7 +246,6 @@ PICO_API int pico_http_request(const char *method, const char *url,
         }
         out->body_len = body_n;
     }
-    free(dechunked);
 
     /* Convert headers */
     if (resp.headers.count > 0) {

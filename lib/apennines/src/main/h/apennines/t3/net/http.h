@@ -159,6 +159,21 @@ APENNINES_API unsigned long http_chunked_decoder_is_done(int *out_done,
                                                           http_chunked_decoder *d);
 APENNINES_API unsigned long http_chunked_decoder_destroy(http_chunked_decoder *d);
 
+/* Decode a complete chunked body in one call. On success *out is a
+ * freshly allocated buffer the caller frees; an empty input yields
+ * NULL/0. Convenience over the streaming decoder above, for callers
+ * that already hold the whole body.
+ * Hatches: 1=null out, 2=null out_len, 3=null data with len>0,
+ *          4=decode failed. */
+APENNINES_API unsigned long http_dechunk(u8 **out, u64 *out_len,
+                                          const u8 *data, u64 len);
+
+/* True when a Transfer-Encoding header marks the body as chunked.
+ * Tolerates a coding list ("gzip, chunked") and any casing.
+ * Hatches: 1=null out, 2=null headers. */
+APENNINES_API unsigned long http_headers_is_chunked(int *out,
+                                                     const http_headers *h);
+
 /* ---- Cookie ---- */
 
 typedef struct {

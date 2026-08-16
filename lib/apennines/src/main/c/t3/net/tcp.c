@@ -31,6 +31,18 @@ static int wsa_ensure_init(void) {
 #define INVALID_SOCK (-1)
 #endif
 
+/* Sending on a socket whose peer has already closed raises SIGPIPE on
+ * POSIX, and the default disposition kills the whole process -- a
+ * library has no business doing that to its host. MSG_NOSIGNAL turns it
+ * into an ordinary EPIPE return instead. Windows has no SIGPIPE, and
+ * macOS lacks MSG_NOSIGNAL (it needs the SO_NOSIGPIPE socket option),
+ * so both fall back to 0. */
+#if defined(MSG_NOSIGNAL)
+#define APN_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define APN_SEND_FLAGS 0
+#endif
+
 /* Build a struct sockaddr from a net_sock_addr. Returns sockaddr length or 0 on error. */
 static socklen_t build_sockaddr(struct sockaddr_storage *ss, const net_sock_addr *addr) {
     memset(ss, 0, sizeof(*ss));
@@ -108,8 +120,42 @@ unsigned long tcp_listener_accept(tcp_conn *out, tcp_listener *listener) {
     return 0;
 }
 
+unsigned long tcp_listener_shutdown(tcp_listener *listener) {
+    if (!listener) return 1;
+    if (listener->fd == (socket_t)INVALID_SOCK) return 0;
+
+    /* The two platforms wake a parked accept() by different means, and
+     * neither one works on the other:
+     *
+     *  - POSIX: shutdown() wakes it; close() alone leaves it parked
+     *    forever. So we shutdown here and let the caller close after it
+     *    joins, which keeps the accept thread off a descriptor we have
+     *    already closed (and whose number the OS may have reissued).
+     *
+     *  - Windows: closesocket() wakes it; shutdown() alone does nothing
+     *    and the join hangs. So the wake *is* the close here, and the
+     *    descriptor is retired now rather than after the join.
+     *
+     * Either way the caller's sequence is the same -- shutdown, join,
+     * destroy -- and tcp_listener_destroy tolerates an already-retired
+     * listener. */
+#ifdef _WIN32
+    CLOSE_SOCKET(listener->fd);
+    listener->fd = (socket_t)INVALID_SOCK;
+#else
+    /* Return value ignored on purpose: a listening socket is not
+     * connected, so shutdown() may report ENOTCONN. The wake still
+     * happens, and that is all we need. */
+    (void)shutdown(listener->fd, TCP_SHUTDOWN_BOTH);
+#endif
+    return 0;
+}
+
 unsigned long tcp_listener_destroy(tcp_listener *listener) {
     if (!listener) return 1;
+    /* Idempotent: tcp_listener_shutdown already retires the descriptor on
+     * Windows, and callers legitimately call both. */
+    if (listener->fd == (socket_t)INVALID_SOCK) return 0;
     if (CLOSE_SOCKET(listener->fd) != 0) return 2;
     listener->fd = (socket_t)INVALID_SOCK;
     return 0;
@@ -173,7 +219,7 @@ unsigned long tcp_conn_write(u64 *bytes_written, tcp_conn *conn, const u8 *data,
     if (!conn) return 2;
     if (!data) return 3;
 
-    result = send(conn->fd, (const char *)data, (int)len, 0);
+    result = send(conn->fd, (const char *)data, (int)len, APN_SEND_FLAGS);
     if (result < 0) return 4;
 
     *bytes_written = (u64)result;
@@ -193,7 +239,7 @@ unsigned long tcp_conn_write_all(u64 *bytes_written, tcp_conn *conn, const u8 *d
     if (!data) return 3;
 
     while (total < len) {
-        result = send(conn->fd, (const char *)(data + total), (int)(len - total), 0);
+        result = send(conn->fd, (const char *)(data + total), (int)(len - total), APN_SEND_FLAGS);
         if (result < 0) {
             *bytes_written = total;
             return 4;

@@ -314,8 +314,6 @@ static unsigned long do_single_request(https_response *out,
                                        const http_url *url,
                                        const http_headers *extra_hdrs,
                                        const u8 *body, u64 body_len) {
-    dns_response dns_resp;
-    net_sock_addr addr;
     conn_handle conn;
     http_request req;
     u8 *wire = NULL;
@@ -328,7 +326,6 @@ static unsigned long do_single_request(https_response *out,
     int use_tls;
     char *request_target = NULL;
 
-    memset(&dns_resp, 0, sizeof(dns_resp));
     memset(&conn, 0, sizeof(conn));
     memset(&req, 0, sizeof(req));
     memset(&parsed, 0, sizeof(parsed));
@@ -339,37 +336,11 @@ static unsigned long do_single_request(https_response *out,
     port = url->port;
     if (port == 0) port = use_tls ? 443 : 80;
 
-    /* 1. DNS resolve */
-    rc = dns_query(&dns_resp, url->host);
-    if (rc) return 1;
-    if (dns_resp.count == 0) {
-        dns_response_free(&dns_resp);
-        return 2;
-    }
-
-    /* Build address from first A/AAAA record */
-    {
-        dns_record *rec = &dns_resp.records[0];
-        if (rec->type == DNS_TYPE_A && rec->rdata_len == 4) {
-            memset(&addr, 0, sizeof(addr));
-            addr.family = 4;
-            memcpy(addr.addr.v4.octets, rec->rdata, 4);
-            addr.port = port;
-        } else if (rec->type == DNS_TYPE_AAAA && rec->rdata_len == 16) {
-            memset(&addr, 0, sizeof(addr));
-            addr.family = 6;
-            memcpy(addr.addr.v6.octets, rec->rdata, 16);
-            addr.port = port;
-        } else {
-            dns_response_free(&dns_resp);
-            return 3;
-        }
-    }
-    dns_response_free(&dns_resp);
-
-    /* 2. TCP connect */
-    rc = tcp_conn_create(&conn.tcp, &addr);
-    if (rc) return 4;
+    /* 1+2. DNS resolve and TCP connect, trying every resolved address
+     * rather than only the first — "localhost" resolves to ::1 before
+     * 127.0.0.1 on Windows. */
+    rc = tcp_conn_create_host(&conn.tcp, url->host, port);
+    if (rc) return (rc == 5) ? 4 : 1;   /* 5 = connected to nothing */
     tcp_conn_set_nodelay(&conn.tcp, 1);
 
     c->stat_active++;
@@ -511,6 +482,7 @@ static unsigned long do_single_request(https_response *out,
     out->headers = parsed.headers;
     /* transfer body ownership */
     if (parsed.body && parsed.body_len > 0) {
+        /* Already de-chunked by http_response_parse if it needed to be. */
         out->body = (u8 *)malloc(parsed.body_len);
         if (!out->body) {
             http_response_destroy(&parsed);
@@ -799,8 +771,6 @@ unsigned long https_client_download(https_client *c, const char *url,
                                     https_progress_fn progress,
                                     void *ctx) {
     http_url parsed_url;
-    dns_response dns_resp;
-    net_sock_addr addr;
     conn_handle conn;
     http_request req;
     u8 *wire = NULL;
@@ -829,48 +799,15 @@ unsigned long https_client_download(https_client *c, const char *url,
         return 5;
     }
 
-    /* DNS resolve */
-    memset(&dns_resp, 0, sizeof(dns_resp));
-    rc = dns_query(&dns_resp, parsed_url.host);
-    if (rc) {
-        fclose(fp);
-        http_url_free(&parsed_url);
-        return 6;
-    }
-    if (dns_resp.count == 0) {
-        dns_response_free(&dns_resp);
-        fclose(fp);
-        http_url_free(&parsed_url);
-        return 7;
-    }
-
-    /* build address */
-    {
-        dns_record *rec = &dns_resp.records[0];
-        memset(&addr, 0, sizeof(addr));
-        if (rec->type == DNS_TYPE_A && rec->rdata_len == 4) {
-            addr.family = 4;
-            memcpy(addr.addr.v4.octets, rec->rdata, 4);
-        } else if (rec->type == DNS_TYPE_AAAA && rec->rdata_len == 16) {
-            addr.family = 6;
-            memcpy(addr.addr.v6.octets, rec->rdata, 16);
-        } else {
-            dns_response_free(&dns_resp);
-            fclose(fp);
-            http_url_free(&parsed_url);
-            return 8;
-        }
-        addr.port = port;
-    }
-    dns_response_free(&dns_resp);
-
-    /* TCP connect */
+    /* DNS resolve + TCP connect, trying every resolved address rather
+     * than only the first — "localhost" resolves to ::1 before 127.0.0.1
+     * on Windows. */
     memset(&conn, 0, sizeof(conn));
-    rc = tcp_conn_create(&conn.tcp, &addr);
+    rc = tcp_conn_create_host(&conn.tcp, parsed_url.host, port);
     if (rc) {
         fclose(fp);
         http_url_free(&parsed_url);
-        return 9;
+        return (rc == 5) ? 9 : 6;   /* 5 = connected to nothing */
     }
     tcp_conn_set_nodelay(&conn.tcp, 1);
 

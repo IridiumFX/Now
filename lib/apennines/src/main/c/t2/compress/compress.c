@@ -382,6 +382,20 @@ static u32 deflate_hash(u32 val) {
     return (val * 2654435761u) >> (32 - DEFLATE_HASH_BITS);
 }
 
+/* Read exactly the 3 bytes the deflate hash consumes.
+ *
+ * This used to be lz4_read32(p) & 0xFFFFFF -- a 4-byte load masked back
+ * down to 3. Both call sites only guarantee DEFLATE_MIN_MATCH (3) bytes
+ * remain, so at the last hashable position the load ran one byte past
+ * the end of the caller's buffer. AddressSanitizer caught it as a
+ * stack-buffer-overflow in deflate_compress() on ordinary input.
+ *
+ * The value produced is identical to the old masked little-endian load,
+ * so hashes -- and therefore the compressed output -- do not change. */
+static u32 deflate_read24(const u8 *p) {
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16);
+}
+
 /* ================================================================
  *  Token stream for Huffman encoding
  *
@@ -420,7 +434,7 @@ static unsigned long deflate_tokenize(deflate_token **out_tokens, u64 *out_count
         u64 best_dist = 0;
 
         if (ip + DEFLATE_MIN_MATCH <= len) {
-            u32 h = deflate_hash(lz4_read32((u8 *)data + ip) & 0xFFFFFF);
+            u32 h = deflate_hash(deflate_read24((const u8 *)data + ip));
             u64 raw = hash_table[h];
             hash_table[h] = (u32)(ip + 1);
 
@@ -452,7 +466,7 @@ static unsigned long deflate_tokenize(deflate_token **out_tokens, u64 *out_count
             {
                 u64 j;
                 for (j = 1; j < best_len && ip + j + DEFLATE_MIN_MATCH <= len; j++) {
-                    u32 hh = deflate_hash(lz4_read32((u8 *)data + ip + j) & 0xFFFFFF);
+                    u32 hh = deflate_hash(deflate_read24((const u8 *)data + ip + j));
                     hash_table[hh] = (u32)(ip + j + 1);
                 }
             }

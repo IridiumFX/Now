@@ -93,6 +93,12 @@ add_library(now
 # Apennines HTTPS stack — always compiled (the only HTTPS backend since rc3).
 target_sources(now PRIVATE
     lib/apennines/src/main/c/t3/net/tcp.c
+    # Defines tcp_conn_create_host, which http_client, https_client and
+    # wss_client all call since apennines 000296 — it resolves a name and
+    # tries every address rather than only the first, which is what made
+    # `localhost` (AAAA ::1 first) unreachable. `now build` finds this by
+    # walking the vendored tree; CMake has to be told.
+    lib/apennines/src/main/c/t3/net/tcp_resolve.c
     lib/apennines/src/main/c/t3/net/tls.c
     lib/apennines/src/main/c/t3/net/dns.c
     lib/apennines/src/main/c/t3/net/http.c

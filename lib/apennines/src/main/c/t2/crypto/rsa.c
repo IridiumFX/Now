@@ -184,31 +184,57 @@ static unsigned long rsa_dp_crt(bigint *out, bigint *c, rsa_privkey *key) {
     rc = bigint_modpow(&s2, c, &key->dq, &key->q);
     if (rc) goto crt_cleanup;
 
-    /* h = qinv * (s1 - s2) mod p */
-    /* Handle s1 < s2 by adding p: h = qinv * (s1 - s2 + p) mod p */
+    /* h = qinv * (s1 - s2) mod p
+     *
+     * s2 is reduced mod q, not mod p, so when q > p it can be larger than
+     * p -- and then even s1 + p can be smaller than s2, because s1 < p
+     * gives s1 + p < 2p, which need not exceed s2. A single +p correction
+     * is therefore not sufficient and bigint_sub goes negative.
+     *
+     * This is not hypothetical: keygen does not order the primes, so
+     * about half of all keys have q > p, and within those the condition
+     * s2 > s1 + p hit roughly 1 sign in 400 -- an intermittent signing
+     * failure that looked like flakiness. Reduce s2 into [0,p) first so
+     * one +p correction is always enough. */
     rc = bigint_create(&tmp, 1);
-    if (rc) goto crt_cleanup;
-
-    rc = bigint_compare(&cmp, &s1, &s2);
     if (rc) goto crt_cleanup;
 
     rc = bigint_create(&h, 1);
     if (rc) goto crt_cleanup;
 
-    if (cmp >= 0) {
-        rc = bigint_sub(&tmp, &s1, &s2);
+    {
+        bigint s2_mod_p;
+        memset(&s2_mod_p, 0, sizeof(bigint));
+        rc = bigint_create(&s2_mod_p, 1);
         if (rc) goto crt_cleanup;
-    } else {
-        /* s1 + p - s2 */
-        bigint s1_plus_p;
-        memset(&s1_plus_p, 0, sizeof(bigint));
-        rc = bigint_create(&s1_plus_p, 1);
-        if (rc) goto crt_cleanup;
-        rc = bigint_add(&s1_plus_p, &s1, &key->p);
-        if (rc) { bigint_destroy(&s1_plus_p); goto crt_cleanup; }
-        rc = bigint_sub(&tmp, &s1_plus_p, &s2);
-        bigint_destroy(&s1_plus_p);
-        if (rc) goto crt_cleanup;
+
+        rc = bigint_mod(&s2_mod_p, &s2, &key->p);
+        if (rc) { bigint_destroy(&s2_mod_p); goto crt_cleanup; }
+
+        rc = bigint_compare(&cmp, &s1, &s2_mod_p);
+        if (rc) { bigint_destroy(&s2_mod_p); goto crt_cleanup; }
+
+        if (cmp >= 0) {
+            rc = bigint_sub(&tmp, &s1, &s2_mod_p);
+            if (rc) { bigint_destroy(&s2_mod_p); goto crt_cleanup; }
+        } else {
+            /* s1 + p - (s2 mod p); both operands now in [0,p), so this
+             * is guaranteed non-negative. */
+            bigint s1_plus_p;
+            memset(&s1_plus_p, 0, sizeof(bigint));
+            rc = bigint_create(&s1_plus_p, 1);
+            if (rc) { bigint_destroy(&s2_mod_p); goto crt_cleanup; }
+            rc = bigint_add(&s1_plus_p, &s1, &key->p);
+            if (rc) {
+                bigint_destroy(&s1_plus_p);
+                bigint_destroy(&s2_mod_p);
+                goto crt_cleanup;
+            }
+            rc = bigint_sub(&tmp, &s1_plus_p, &s2_mod_p);
+            bigint_destroy(&s1_plus_p);
+            if (rc) { bigint_destroy(&s2_mod_p); goto crt_cleanup; }
+        }
+        bigint_destroy(&s2_mod_p);
     }
 
     {

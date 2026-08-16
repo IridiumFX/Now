@@ -143,8 +143,6 @@ static unsigned long execute_single_request(http_response *out,
                                             const u8 *body,
                                             u64 body_len) {
     http_url       parsed_url;
-    dns_response   dns_resp;
-    net_sock_addr  addr;
     tcp_conn       conn;
     http_request   req;
     u8            *serial    = NULL;
@@ -161,7 +159,6 @@ static unsigned long execute_single_request(http_response *out,
     u16            port;
 
     memset(&parsed_url, 0, sizeof(parsed_url));
-    memset(&dns_resp, 0, sizeof(dns_resp));
     memset(&conn, 0, sizeof(conn));
     memset(&req, 0, sizeof(req));
     memset(out, 0, sizeof(*out));
@@ -173,46 +170,14 @@ static unsigned long execute_single_request(http_response *out,
     port = parsed_url.port;
     if (port == 0) port = default_port_for_scheme(parsed_url.scheme);
 
-    /* ---- DNS resolve ---- */
-    rc = dns_query(&dns_resp, parsed_url.host);
+    /* ---- DNS resolve + TCP connect ----
+     * tcp_conn_create_host tries every resolved address, not just the
+     * first. That matters for "localhost", which resolves to ::1 before
+     * 127.0.0.1 on Windows. */
+    rc = tcp_conn_create_host(&conn, parsed_url.host, port);
     if (rc != 0) {
         http_url_free(&parsed_url);
-        return 2;
-    }
-
-    /* Pick first A record from dns_response */
-    if (dns_resp.count == 0 || !dns_resp.records) {
-        dns_response_free(&dns_resp);
-        http_url_free(&parsed_url);
-        return 2;
-    }
-
-    /* Build net_sock_addr from the first A record's rdata (4 bytes for IPv4) */
-    {
-        dns_record *rec = &dns_resp.records[0];
-        if (rec->type == DNS_TYPE_A && rec->rdata_len >= 4) {
-            memset(&addr, 0, sizeof(addr));
-            addr.family = 4;
-            memcpy(addr.addr.v4.octets, rec->rdata, 4);
-            addr.port = port;
-        } else if (rec->type == DNS_TYPE_AAAA && rec->rdata_len >= 16) {
-            memset(&addr, 0, sizeof(addr));
-            addr.family = 6;
-            memcpy(addr.addr.v6.octets, rec->rdata, 16);
-            addr.port = port;
-        } else {
-            dns_response_free(&dns_resp);
-            http_url_free(&parsed_url);
-            return 2;
-        }
-    }
-    dns_response_free(&dns_resp);
-
-    /* ---- TCP connect ---- */
-    rc = tcp_conn_create(&conn, &addr);
-    if (rc != 0) {
-        http_url_free(&parsed_url);
-        return 3;
+        return (rc == 5) ? 3 : 2;   /* 5 = connected to nothing */
     }
     /* ---- Build HTTP request ---- */
     target = build_request_target(&parsed_url);
@@ -357,6 +322,8 @@ static unsigned long execute_single_request(http_response *out,
     free(recv_buf);
     if (rc != 0) return 7;
 
+    /* Chunked bodies are decoded by http_response_parse, which is also
+     * where completeness is judged -- do not decode again here. */
     return 0;
 }
 

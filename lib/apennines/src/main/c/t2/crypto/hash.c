@@ -299,6 +299,12 @@ unsigned long sha512_update(sha512_ctx *ctx, const u8 *data, u64 len) {
 
     if (!ctx) return 1;
     if (len > 0 && !data) return 2;
+    /* An empty update is a legal no-op and the guard above deliberately
+     * allows data == NULL for it. Return before the memcpy below, which
+     * would otherwise be memcpy(dst, NULL, 0) -- UB, because memcpy's
+     * pointers are declared nonnull even for a zero count. UBSan flags
+     * it. Skipping is exactly equivalent: count_lo += 0 changes nothing. */
+    if (len == 0) return 0;
 
     buf_used = ctx->count_lo % 128;
 
