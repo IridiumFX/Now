@@ -119,11 +119,14 @@ build would not link.
   parser tolerates them.
 - **`lib/alforno`** is at `078be82`; the descriptor problems that
   pinned it to `e28f82f` were fixed upstream on 2026-08-11.
-- **Changing `struct NowProject`'s layout needs a clean rebuild**
-  (`rm -rf target`). A partial rebuild once left stale objects reading
-  `_pasta_root` at the old offset, segfaulting in
-  `now_repro_from_project`. Header dependency tracking is otherwise
-  sound.
+- **Changing a struct no longer needs a clean rebuild.** This entry used
+  to say it did. That was a bug wearing a rule's clothing: production
+  objects tracked headers, test objects did not, so a struct edit
+  rebuilt half the test binary and left the other half compiled against
+  the old layout — segfault. Fixed 2026-08-16; test objects now have
+  their own manifest at `target/.now-manifest-test`. If you see a
+  layout-shaped crash after a header edit, it is a real regression now,
+  not the tool being like that.
 - **`now test` cannot link now's own suite** — test objects don't
   inherit `compile.defines`, so they miss `NOW_STATIC` and expect
   `__imp_` DLL imports. Pre-existing. gut's tests are unaffected.
