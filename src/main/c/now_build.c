@@ -3963,6 +3963,24 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
     int errors = 0;
     char *test_flags_key = NULL;   /* lazily built; see the sidecar below */
 
+    /* Test objects get the same header-dependency tracking as production
+     * objects, in their own manifest.
+     *
+     * They used to decide freshness from the source's mtime plus a flags
+     * sidecar, and nothing else. So editing a header left every test
+     * object in place: the production objects rebuilt (they do track
+     * headers), the test objects did not, and the two halves of the test
+     * binary were compiled against different declarations. Widening a
+     * struct that way produced a segfault at a plausible-looking place —
+     * this is the defect `CLAUDE.md` had recorded as "changing a struct
+     * needs a clean rebuild", written down as a rule of the tool rather
+     * than the bug it was. */
+    NowManifest tmanifest;
+    char *tmanifest_path = now_path_join(basedir, "target/.now-manifest-test");
+    now_manifest_init(&tmanifest);
+    if (tmanifest_path) now_manifest_load(&tmanifest, tmanifest_path);
+    int tmanifest_dirty = 0;
+
     for (size_t i = 0; i < test_sources.count; i++) {
         const char *src = test_sources.paths[i];
 
@@ -4042,39 +4060,22 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             free(base);
         }
 
-        /* Skip the compile when the .o exists, is newer than the source,
-         * AND was built with the flags we are about to use. Without the
-         * mtime half every `now test` re-ran gcc per TU and re-linked on
-         * no-op runs (vulpes perf finding); without the flags half the
-         * result is worse than slow, it is wrong. */
-        {
-            struct stat src_st, obj_st;
-            char *src_full_check = now_path_join(basedir, src);
-            int flags_match = 0;
-            if (tflags_sidecar && test_flags_key) {
-                FILE *fp = fopen(tflags_sidecar, "rb");
-                if (fp) {
-                    char prev[80];
-                    size_t n = fread(prev, 1, sizeof(prev) - 1, fp);
-                    fclose(fp);
-                    prev[n] = '\0';
-                    while (n > 0 && (prev[n-1] == '\n' || prev[n-1] == '\r'))
-                        prev[--n] = '\0';
-                    flags_match = (strcmp(prev, test_flags_key) == 0);
-                }
-            }
-            if (flags_match && src_full_check && stat(obj, &obj_st) == 0 &&
-                stat(src_full_check, &src_st) == 0 &&
-                (long long)src_st.st_mtime <= (long long)obj_st.st_mtime) {
+        /* Skip the compile when the manifest says nothing this object
+         * depends on has changed — source content, compile flags, or any
+         * header it pulled in. The old check was mtime plus a flags
+         * sidecar, which caught an edited test and an edited flag and
+         * missed an edited header entirely. */
+        if (now_path_exists(obj)) {
+            const NowManifestEntry *tent = now_manifest_find(&tmanifest, src);
+            if (tent && !now_manifest_needs_rebuild(tent, basedir, src,
+                                                     test_flags_key, NULL)) {
                 if (ctx->verbose)
                     fprintf(stderr, "  test compile: %s (up to date)\n", src);
                 now_filelist_push(&test_objects, obj);
                 free(obj);
-                free(src_full_check);
                 free(tflags_sidecar);
                 continue;
             }
-            free(src_full_check);
         }
 
         /* Build argv — MSVC vs GCC/Clang.
@@ -4091,6 +4092,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         if (!argv) { free(obj); continue; }
         int argc = 0;
         char *inc_src = NULL, *inc_hdr = NULL;
+        char *tdepfile = NULL;   /* -MF target; parsed then freed below */
         char *src_full = now_path_join(basedir, src);
 
         if (ctx->toolchain.is_msvc) {
@@ -4231,6 +4233,22 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             for (size_t ii = 0; ii < ctx->dep_includes.count; ii++)
                 argv[argc++] = ctx->dep_includes.paths[ii];
 
+            /* Emit a depfile so the manifest can record which headers
+             * this object was built against — without it the freshness
+             * check has nothing to compare and silently degrades to the
+             * mtime-only behaviour this replaced. */
+            {
+                size_t olen = strlen(obj);
+                tdepfile = (char *)malloc(olen + 3);
+                if (tdepfile) {
+                    memcpy(tdepfile, obj, olen);
+                    memcpy(tdepfile + olen, ".d", 3);
+                    argv[argc++] = "-MD";
+                    argv[argc++] = "-MF";
+                    argv[argc++] = tdepfile;
+                }
+            }
+
             /* Production compile.flags — codegen and ABI must match the
              * objects the test links against (packing, freestanding,
              * reserved registers, and so on). */
@@ -4310,22 +4328,74 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             }
             free(obj);
             free(tflags_sidecar);
+            free(tdepfile);
             errors++;
             continue;
         }
 
-        /* Record the flags this object was built with, so a later run
-         * that changes them recompiles instead of trusting mtime. */
-        if (tflags_sidecar && test_flags_key) {
-            FILE *fp = fopen(tflags_sidecar, "wb");
-            if (fp) { fputs(test_flags_key, fp); fclose(fp); }
+        /* Record source hash, flags and the headers the compiler
+         * reported, so the next run can tell whether any of the three
+         * moved. Writing the entry without deps would be worse than
+         * writing none: the dep loop would iterate zero times and call
+         * the object fresh forever, which is exactly how the production
+         * path used to go stale. */
+        {
+            struct stat tst;
+            long long tmtime = 0;
+            char *tsrc_full = now_path_join(basedir, src);
+            if (tsrc_full && stat(tsrc_full, &tst) == 0)
+                tmtime = (long long)tst.st_mtime;
+            char *tsrc_hash = tsrc_full ? now_sha256_file(tsrc_full) : NULL;
+
+            if (tsrc_hash) {
+                now_manifest_set(&tmanifest, src, obj, tsrc_hash,
+                                 test_flags_key, tmtime);
+                tmanifest_dirty = 1;
+
+                NowDepList tdeps;
+                memset(&tdeps, 0, sizeof(tdeps));
+                if (tdepfile && now_depfile_parse(tdepfile, tsrc_full,
+                                                   &tdeps) == 0 &&
+                    tdeps.count > 0) {
+                    char **thashes = (char **)calloc(tdeps.count,
+                                                      sizeof(char *));
+                    if (thashes) {
+                        size_t good = 0;
+                        for (size_t d = 0; d < tdeps.count; d++) {
+                            thashes[d] = now_sha256_file_memo(tdeps.paths[d],
+                                                               NULL);
+                            if (thashes[d]) good++;
+                        }
+                        if (good == tdeps.count)
+                            now_manifest_set_deps(&tmanifest, src,
+                                                  (const char **)tdeps.paths,
+                                                  (const char **)thashes,
+                                                  tdeps.count);
+                        for (size_t d = 0; d < tdeps.count; d++)
+                            free(thashes[d]);
+                        free(thashes);
+                    }
+                }
+                now_deplist_free(&tdeps);
+                free(tsrc_hash);
+            }
+            free(tsrc_full);
         }
+        free(tdepfile);
         free(tflags_sidecar);
 
         now_filelist_push(&test_objects, obj);
         free(obj);
     }
     free(test_flags_key);
+
+    /* Persist before any early return: entries written for objects that
+     * did compile are still valid when a later one fails, and dropping
+     * them would recompile the whole suite on the next attempt. */
+    if (tmanifest_dirty && tmanifest_path)
+        now_manifest_save(&tmanifest, tmanifest_path);
+    free(tmanifest_path);
+    now_manifest_free(&tmanifest);
 
     if (errors) {
         now_filelist_free(&test_objects);
