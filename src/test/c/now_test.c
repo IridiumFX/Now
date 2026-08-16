@@ -3332,6 +3332,31 @@ static void test_private_group_procure_fail(void) {
     PASS();
 }
 
+static void test_link_inherit_target_parses(void) {
+    TEST("link.inherit_target: parsed, and off unless asked for");
+    NowResult res;
+    const char *off =
+        "{ group: \"t\", artifact: \"a\", version: \"1.0.0\", lang: \"c\","
+        "  link: { flags: [\"-nostdlib\"] } }";
+    NowProject *p = now_project_load_string(off, strlen(off), &res);
+    if (!p) { FAIL(res.message); return; }
+    if (now_project_link_inherit_target(p) != 0) {
+        FAIL("inherit_target defaulted to on"); now_project_free(p); return;
+    }
+    now_project_free(p);
+
+    const char *on =
+        "{ group: \"t\", artifact: \"a\", version: \"1.0.0\", lang: \"c\","
+        "  link: { inherit_target: true } }";
+    p = now_project_load_string(on, strlen(on), &res);
+    if (!p) { FAIL(res.message); return; }
+    if (now_project_link_inherit_target(p) != 1) {
+        FAIL("inherit_target not read"); now_project_free(p); return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
 static void test_lock_differs(void) {
     TEST("--locked: lockfile drift is detected in all three directions");
     NowLockFile before, after;
@@ -7214,6 +7239,7 @@ int main(void) {
     test_private_group_null_safe();
     test_private_group_pom_load();
     test_private_group_procure_fail();
+    test_link_inherit_target_parses();
     test_lock_differs();
     test_registry_is_public();
     test_private_group_fence_stops_at_public();

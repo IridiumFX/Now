@@ -1866,6 +1866,103 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
     return 0;
 }
 
+/* Does this compile flag select the target or its ABI?
+ *
+ * These are the flags a compiler driver reads to choose an output
+ * emulation and a runtime search path, so they have to be on the link
+ * command too or the driver links for the host. Deliberately narrow:
+ * forwarding all of compile.flags would put `-ffreestanding` and friends
+ * on a link line where they range from pointless to harmful. Codegen
+ * tuning that does not change the ABI (`-O2`, `-mtune`) is excluded for
+ * the same reason. */
+static int flag_selects_target(const char *f) {
+    if (!f || !*f) return 0;
+    static const char *const k_prefixes[] = {
+        "--target=",     /* clang */
+        "-march=", "-mabi=", "-mcpu=",
+        "-mfloat-abi=", "-mfpu=",
+        "--sysroot=",    /* changes the library search root */
+        NULL
+    };
+    for (size_t i = 0; k_prefixes[i]; i++)
+        if (strncmp(f, k_prefixes[i], strlen(k_prefixes[i])) == 0) return 1;
+    /* Bare forms that carry no '=' */
+    if (strcmp(f, "-m32") == 0 || strcmp(f, "-m64") == 0 ||
+        strcmp(f, "-mx32") == 0) return 1;
+    /* `-target <triple>` and `--sysroot <dir>` as two tokens: the flag
+     * itself matches here and forward_target_flags() carries its value. */
+    if (strcmp(f, "-target") == 0 || strcmp(f, "--sysroot") == 0) return 1;
+    return 0;
+}
+
+/* Is this the flag half of a two-token form whose value must follow? */
+static int flag_takes_separate_value(const char *f) {
+    return f && (strcmp(f, "-target") == 0 || strcmp(f, "--sysroot") == 0);
+}
+
+/* Does a linker script name its own output architecture?
+ *
+ * `OUTPUT_ARCH` / `OUTPUT_FORMAT` select the emulation just as a driver
+ * target flag does, so a script carrying them is a complete answer and
+ * must not be warned about. This is load-bearing for freestanding
+ * projects whose ROM script has declared its architecture since day one
+ * — the point of checking is that the fact stops being invisible. */
+static int script_declares_arch(const char *basedir, const char *script) {
+    if (!script || !*script) return 0;
+    char *full = now_path_join(basedir, script);
+    if (!full) return 0;
+    FILE *fp = fopen(full, "rb");
+    free(full);
+    if (!fp) return 0;
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    /* Both directives conventionally sit at the top; a 4 KB window is
+     * enough and keeps this off the hot path. */
+    return (strstr(buf, "OUTPUT_ARCH") || strstr(buf, "OUTPUT_FORMAT")) ? 1 : 0;
+}
+
+/* Warn when the compile is cross-targeted and the link is not.
+ *
+ * Objects built for another target linked by a driver with no target is
+ * a real failure, but only a *loud* one when the two architectures
+ * disagree and the linker notices. When they happen to agree — a
+ * workspace whose host and target are the same architecture — it links
+ * clean and produces a binary with the wrong ABI, which is the version
+ * of this that costs a week. So say something whenever the link side
+ * has no target from any source. */
+static void warn_link_target_missing(const NowProject *p, const char *basedir,
+                                      const char *out_type) {
+    if (!p || p->link.inherit_target) return;
+    /* Static archives are not linked — `ar` has no emulation to pick. */
+    if (out_type && strcmp(out_type, "static") == 0) return;
+
+    int compile_has = 0;
+    const char *example = NULL;
+    for (size_t i = 0; i < p->compile.flags.count; i++)
+        if (flag_selects_target(p->compile.flags.items[i])) {
+            compile_has = 1;
+            if (!example) example = p->compile.flags.items[i];
+            break;
+        }
+    if (!compile_has) return;
+
+    for (size_t i = 0; i < p->link.flags.count; i++)
+        if (flag_selects_target(p->link.flags.items[i])) return;
+
+    if (script_declares_arch(basedir, p->link.script)) return;
+
+    fprintf(stderr,
+            "warning: compile.flags select a target (%s) but the link "
+            "command has none —\n"
+            "         the driver will link for the build host. Set "
+            "link.inherit_target: true,\n"
+            "         or give the linker script an OUTPUT_ARCH/OUTPUT_FORMAT.\n",
+            example ? example : "?");
+}
+
 /* Build a hash of the compile flags for a given source file.
  * Used for incremental rebuild detection. */
 static char *link_flags_hash(const NowProject *p);
@@ -3586,6 +3683,9 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
                         + p->link.libdirs.count + ctx->dep_libdirs.count
                         + p->link.archives.count
                         + p->link.libs.count + ctx->dep_libs.count
+                        /* inherit_target forwards a subset of compile.flags;
+                         * size for all of them rather than count twice. */
+                        + p->compile.flags.count
                         + link_repro_nflags + 24;
             const char **argv = (const char **)malloc(need * sizeof(char *));
             if (!argv) {
@@ -3597,6 +3697,22 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
             argv[argc++] = has_cxx ? ctx->toolchain.cxx : ctx->toolchain.cc;
 
             if (is_shared) argv[argc++] = "-shared";
+
+            warn_link_target_missing(p, basedir, p->output.type);
+
+            /* link.inherit_target: carry the target/ABI flags over from
+             * compile.flags. Emitted before link.flags so an explicit
+             * link flag still has the last word. */
+            if (p->link.inherit_target) {
+                for (size_t i = 0; i < p->compile.flags.count; i++) {
+                    const char *f = p->compile.flags.items[i];
+                    if (!flag_selects_target(f)) continue;
+                    argv[argc++] = f;
+                    if (flag_takes_separate_value(f) &&
+                        i + 1 < p->compile.flags.count)
+                        argv[argc++] = p->compile.flags.items[++i];
+                }
+            }
 
             /* Link flags */
             for (size_t i = 0; i < p->link.flags.count; i++)

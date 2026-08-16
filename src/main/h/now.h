@@ -128,6 +128,10 @@ NOW_API const char *now_project_opt(const NowProject *p);
 /* Convergence policy */
 NOW_API const char *now_project_convergence(const NowProject *p);
 
+/* link.inherit_target — forward target/ABI flags from compile.flags to
+ * the link driver. 1 when set, 0 otherwise. */
+NOW_API int now_project_link_inherit_target(const NowProject *p);
+
 /* ---- Build operations ---- */
 
 /* Run the full build lifecycle: discover sources, compile, link.

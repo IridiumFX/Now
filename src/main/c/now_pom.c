@@ -412,6 +412,7 @@ static void load_compile(NowCompile *dst, const PastaValue *src) {
 
 static void load_link(NowLink *dst, const PastaValue *src) {
     if (!src || pasta_type(src) != PASTA_MAP) return;
+    if (get_map_bool(src, "inherit_target", 0)) dst->inherit_target = 1;
     load_strarray(&dst->flags,    pasta_map_get(src, "flags"));
     load_strarray(&dst->libs,     pasta_map_get(src, "libs"));
     load_strarray(&dst->libdirs,  pasta_map_get(src, "libdirs"));

@@ -63,6 +63,14 @@ typedef struct {
     NowStrArray archives;  /* pre-built static archives (.a/.lib) */
     char *script;          /* linker script path */
     char *script_body;     /* inline linker script (multiline) */
+    /* Forward the target/ABI-selecting flags from compile.flags to the
+     * link driver. `now` passes compile.flags to the compiler and not to
+     * the driver, so a cross-compiled module whose triple lives in
+     * compile.flags produced correct objects and then linked with the
+     * host's emulation — `ld.lld: <obj> is incompatible with elf_x86_64`,
+     * a diagnostic that points at the object rather than the missing
+     * flag. Opt-in, so nothing existing changes. */
+    int   inherit_target;
 } NowLink;
 
 /* Output configuration (§1.4) */

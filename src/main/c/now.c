@@ -98,6 +98,10 @@ NOW_API const char *now_project_convergence(const NowProject *p) {
     return p ? p->convergence : NULL;
 }
 
+NOW_API int now_project_link_inherit_target(const NowProject *p) {
+    return p ? p->link.inherit_target : 0;
+}
+
 /* ---- Procure + dep path injection ---- */
 
 /* CLI-supplied procure options for the implicit procure inside a
