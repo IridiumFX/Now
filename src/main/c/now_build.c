@@ -1404,8 +1404,17 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
     }
     free(obj_dir);
 
-    /* Build argument list */
-    const char *tmp_argv[128];
+    /* Build the argument list, sized to the project. Same defect and
+     * same fix as the GCC path below: fixed caps that both dropped
+     * entries silently and failed to keep the writes in bounds. */
+    size_t tmp_cap = p->compile.warnings.count
+                   + p->compile.defines.count
+                   + p->compile.includes.count
+                   + ctx->dep_includes.count
+                   + p->compile.flags.count
+                   + 32;
+    const char **tmp_argv = (const char **)malloc(tmp_cap * sizeof(char *));
+    if (!tmp_argv) return -1;
     int tmp_argc = 0;
 
     tmp_argv[tmp_argc++] = tool;
@@ -1435,9 +1444,10 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
     }
 
     /* Defines: /D */
-    char *def_bufs[64];
+    char **def_bufs = (char **)malloc((p->compile.defines.count + 1) * sizeof(char *));
+    if (!def_bufs) { free(tmp_argv); return -1; }
     size_t ndef = 0;
-    for (size_t i = 0; i < p->compile.defines.count && ndef < 64; i++) {
+    for (size_t i = 0; i < p->compile.defines.count; i++) {
         size_t dlen = strlen(p->compile.defines.items[i]) + 4;
         def_bufs[ndef] = malloc(dlen);
         if (def_bufs[ndef]) {
@@ -1448,7 +1458,8 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
     }
 
     /* Include paths: /I */
-    char *inc_bufs[32];
+    char **inc_bufs = (char **)malloc((p->compile.includes.count + 4) * sizeof(char *));
+    if (!inc_bufs) { free(def_bufs); free(tmp_argv); return -1; }
     size_t ninc = 0;
     if (p->sources.headers) {
         char *hdr_full = now_path_join(basedir, p->sources.headers);
@@ -1463,7 +1474,7 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
             free(hdr_full);
         }
     }
-    if (p->sources.private_headers && ninc < 32) {
+    if (p->sources.private_headers) {
         char *prv_full = now_path_join(basedir, p->sources.private_headers);
         if (prv_full) {
             size_t ilen = strlen(prv_full) + 4;
@@ -1476,7 +1487,7 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
             free(prv_full);
         }
     }
-    for (size_t i = 0; i < p->compile.includes.count && ninc < 32; i++) {
+    for (size_t i = 0; i < p->compile.includes.count; i++) {
         char *inc_full = now_path_join(basedir, p->compile.includes.items[i]);
         if (inc_full) {
             size_t ilen = strlen(inc_full) + 4;
@@ -1543,6 +1554,7 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
         free(obj);
         for (size_t i = 0; i < ndef; i++) free(def_bufs[i]);
         for (size_t i = 0; i < ninc; i++) free(inc_bufs[i]);
+        free(def_bufs); free(inc_bufs); free(tmp_argv);
         return -1;
     }
     for (int i = 0; i < tmp_argc; i++)
@@ -1557,6 +1569,7 @@ static int build_compile_job_msvc(NowBuildCtx *ctx, const char *src_rel,
     free(obj);
     for (size_t i = 0; i < ndef; i++) free(def_bufs[i]);
     for (size_t i = 0; i < ninc; i++) free(inc_bufs[i]);
+    free(def_bufs); free(inc_bufs); free(tmp_argv);
 
     return 0;
 }
@@ -1710,8 +1723,36 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
     }
     free(obj_dir);
 
-    /* Build argument list into a temporary stack array, then copy */
-    const char *tmp_argv[128];
+    /* Build the argument list, sized to what this project actually has.
+     *
+     * This was a fixed `tmp_argv[128]` fed by loops with hard caps — 32
+     * warnings, 64 defines, 32 includes — and two contributors with no
+     * cap at all (`dep_includes`, `compile.flags`). Two separate defects
+     * in one construct:
+     *
+     *   - The caps dropped entries silently. A 65th define did not reach
+     *     the compiler and nothing said so; the build then succeeded
+     *     against the wrong macro world, which is the failure mode that
+     *     produced our own `NOW_STATIC` and `APENNINES_STATIC` link
+     *     walls.
+     *   - The caps were also the only thing keeping the writes in
+     *     bounds, and they do not: 32 + 64 + 32 is already 128 before
+     *     the uncapped ones. Verified — a descriptor with 70 defines and
+     *     60 flags overflows the array and reaches gcc as a corrupted
+     *     command line ("cannot specify '-o' with '-c' ... with multiple
+     *     files").
+     *
+     * There is an allocator here, so there is no reason to guess. Size
+     * to the real counts plus a fixed headroom for the literal flags
+     * added below. */
+    size_t tmp_cap = p->compile.warnings.count
+                   + p->compile.defines.count
+                   + p->compile.includes.count
+                   + ctx->dep_includes.count
+                   + p->compile.flags.count
+                   + 32;   /* tool, -std, -O, -MD/-MF/depfile, -c, -o, src, ... */
+    const char **tmp_argv = (const char **)malloc(tmp_cap * sizeof(char *));
+    if (!tmp_argv) return -1;
     int tmp_argc = 0;
 
     tmp_argv[tmp_argc++] = tool;
@@ -1725,9 +1766,10 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
     }
 
     /* Warnings */
-    char *warn_bufs[32];
+    char **warn_bufs = (char **)malloc((p->compile.warnings.count + 1) * sizeof(char *));
+    if (!warn_bufs) { free(tmp_argv); return -1; }
     size_t nwarn = 0;
-    for (size_t i = 0; i < p->compile.warnings.count && nwarn < 32; i++) {
+    for (size_t i = 0; i < p->compile.warnings.count; i++) {
         const char *w = p->compile.warnings.items[i];
         size_t wlen = strlen(w) + 3;
         warn_bufs[nwarn] = malloc(wlen);
@@ -1749,9 +1791,10 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
 #endif
 
     /* Defines */
-    char *def_bufs[64];
+    char **def_bufs = (char **)malloc((p->compile.defines.count + 1) * sizeof(char *));
+    if (!def_bufs) { free(warn_bufs); free(tmp_argv); return -1; }
     size_t ndef = 0;
-    for (size_t i = 0; i < p->compile.defines.count && ndef < 64; i++) {
+    for (size_t i = 0; i < p->compile.defines.count; i++) {
         size_t dlen = strlen(p->compile.defines.items[i]) + 3;
         def_bufs[ndef] = malloc(dlen);
         if (def_bufs[ndef]) {
@@ -1761,8 +1804,11 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
         }
     }
 
-    /* Include paths */
-    char *inc_bufs[32];
+    /* Include paths. Sized for the descriptor's own includes plus the
+     * two convention dirs (sources.headers, sources.private_headers);
+     * dep_includes arrive pre-formatted and are not buffered here. */
+    char **inc_bufs = (char **)malloc((p->compile.includes.count + 4) * sizeof(char *));
+    if (!inc_bufs) { free(def_bufs); free(warn_bufs); free(tmp_argv); return -1; }
     size_t ninc = 0;
     if (p->sources.headers) {
         char *hdr_full = now_path_join(basedir, p->sources.headers);
@@ -1777,7 +1823,7 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
             free(hdr_full);
         }
     }
-    if (p->sources.private_headers && ninc < 32) {
+    if (p->sources.private_headers) {
         char *prv_full = now_path_join(basedir, p->sources.private_headers);
         if (prv_full) {
             size_t ilen = strlen(prv_full) + 3;
@@ -1790,7 +1836,7 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
             free(prv_full);
         }
     }
-    for (size_t i = 0; i < p->compile.includes.count && ninc < 32; i++) {
+    for (size_t i = 0; i < p->compile.includes.count; i++) {
         char *inc_full = now_path_join(basedir, p->compile.includes.items[i]);
         if (inc_full) {
             size_t ilen = strlen(inc_full) + 3;
@@ -1853,6 +1899,7 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
         for (size_t i = 0; i < nwarn; i++) free(warn_bufs[i]);
         for (size_t i = 0; i < ndef; i++)  free(def_bufs[i]);
         for (size_t i = 0; i < ninc; i++)  free(inc_bufs[i]);
+        free(warn_bufs); free(def_bufs); free(inc_bufs); free(tmp_argv);
         return -1;
     }
     for (int i = 0; i < tmp_argc; i++)
@@ -1871,6 +1918,8 @@ static int build_compile_job(NowBuildCtx *ctx, const char *src_rel,
     for (size_t i = 0; i < nwarn; i++) free(warn_bufs[i]);
     for (size_t i = 0; i < ndef; i++)  free(def_bufs[i]);
     for (size_t i = 0; i < ninc; i++)  free(inc_bufs[i]);
+    /* the arrays themselves are heap now, not stack */
+    free(warn_bufs); free(def_bufs); free(inc_bufs); free(tmp_argv);
 
     return 0;
 }
