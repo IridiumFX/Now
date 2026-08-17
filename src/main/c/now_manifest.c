@@ -330,30 +330,51 @@ NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
                                 const char *source,
                                 const char *flags_hash,
                                 NowStatCache *stat_cache) {
-    if (!entry) return 1;  /* no previous entry → rebuild */
+    return now_manifest_needs_rebuild_ex(entry, basedir, source, flags_hash,
+                                          stat_cache, NULL, 0);
+}
+
+/* Record the deciding reason, when the caller asked for one. */
+#define WHY(...) do { if (reason && reason_cap) \
+    snprintf(reason, reason_cap, __VA_ARGS__); } while (0)
+
+NOW_API int now_manifest_needs_rebuild_ex(const NowManifestEntry *entry,
+                                const char *basedir,
+                                const char *source,
+                                const char *flags_hash,
+                                NowStatCache *stat_cache,
+                                char *reason, size_t reason_cap) {
+    if (reason && reason_cap) reason[0] = '\0';
+    if (!entry) {
+        WHY("no manifest entry — first build, or `now clean` ran");
+        return 1;  /* no previous entry → rebuild */
+    }
 
     /* Check flags changed */
     if (!entry->flags_hash || !flags_hash ||
-        strcmp(entry->flags_hash, flags_hash) != 0)
+        strcmp(entry->flags_hash, flags_hash) != 0) {
+        WHY("compile flags or compiler changed");
         return 1;
+    }
 
     /* Check source mtime changed (fast path) */
     char *full = now_path_join(basedir, source);
-    if (!full) return 1;
+    if (!full) { WHY("cannot resolve source path"); return 1; }
 
     long long cur_mtime = 0;
-    if (!now_stat_cached(stat_cache, full, &cur_mtime)) { free(full); return 1; }
+    if (!now_stat_cached(stat_cache, full, &cur_mtime)) {
+        WHY("source is missing or unreadable"); free(full); return 1; }
 
     if (cur_mtime != entry->mtime) {
         /* mtime differs — hash to confirm */
         char *cur_hash = now_sha256_file(full);
         free(full);
-        if (!cur_hash) return 1;
+        if (!cur_hash) { WHY("source unreadable"); return 1; }
 
         int changed = !entry->source_hash ||
                       strcmp(cur_hash, entry->source_hash) != 0;
         free(cur_hash);
-        if (changed) return 1;
+        if (changed) { WHY("source contents changed"); return 1; }
         /* Content is identical and only the mtime moved — fall through
          * to the header check rather than returning "up to date".
          *
@@ -369,31 +390,38 @@ NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
     }
 
     /* Check object file exists */
-    if (entry->object && !now_path_exists(entry->object))
+    if (entry->object && !now_path_exists(entry->object)) {
+        WHY("object file is missing");
         return 1;
+    }
 
     /* Check header dependencies — memoized stat fast path, then hash.
      * Most headers (stdio.h, project public headers) are included by
      * many sources; the cache amortizes the syscall to one per unique
      * dep across the whole build instead of one per source × deps. */
     for (size_t d = 0; d < entry->dep_count; d++) {
-        if (!entry->deps[d] || !entry->dep_hashes[d])
+        if (!entry->deps[d] || !entry->dep_hashes[d]) {
+            WHY("a recorded header entry is incomplete");
             return 1;
+        }
         long long dep_mtime = 0;
-        if (!now_stat_cached(stat_cache, entry->deps[d], &dep_mtime))
+        if (!now_stat_cached(stat_cache, entry->deps[d], &dep_mtime)) {
+            WHY("header is gone: %s", entry->deps[d]);
             return 1;  /* dep deleted or unreadable */
+        }
         /* Fast path: if dep has mtime stored and it matches, skip hash */
         if (d < entry->dep_mtime_count && entry->dep_mtimes &&
             dep_mtime == entry->dep_mtimes[d])
             continue;
         /* mtime differs or not tracked — hash to confirm */
         char *dh = now_sha256_file(entry->deps[d]);
-        if (!dh) return 1;
+        if (!dh) { WHY("header unreadable: %s", entry->deps[d]); return 1; }
         int changed = strcmp(dh, entry->dep_hashes[d]) != 0;
         free(dh);
-        if (changed) return 1;
+        if (changed) { WHY("header changed: %s", entry->deps[d]); return 1; }
     }
 
+    WHY("source, flags and %zu header(s) all unchanged", entry->dep_count);
     return 0;  /* up to date */
 }
 

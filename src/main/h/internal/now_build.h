@@ -41,6 +41,10 @@ NOW_API int now_cpu_count(void);
  * since the previous mark (or since now_timing_begin()) prefixed with
  * the given label, and resets the running anchor. */
 NOW_API void   now_timing_set(int enabled);
+
+/* --explain: print why each source rebuilt or was skipped, and why the
+ * link ran or did not. Off by default. */
+NOW_API void   now_explain_set(int enabled);
 NOW_API int    now_timing_enabled(void);
 NOW_API double now_clock_secs(void);
 NOW_API void   now_timing_begin(void);

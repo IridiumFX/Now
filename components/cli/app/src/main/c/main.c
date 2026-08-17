@@ -281,6 +281,9 @@ int main(int argc, char *argv[]) {
             flag_tui = 1;
         else if (strcmp(argv[i], "--timing") == 0)
             now_timing_set(1);
+
+        else if (strcmp(argv[i], "--explain") == 0)
+            now_explain_set(1);
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc)
             target_str = argv[++i];
         else if (strcmp(argv[i], "--platform-tag") == 0 && i + 1 < argc) {

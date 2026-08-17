@@ -74,6 +74,21 @@ NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
                                         const char *flags_hash,
                                         NowStatCache *stat_cache);
 
+/* Same, but writes the deciding reason into `reason` — "no manifest
+ * entry", "compile flags changed", "header changed: <path>", and so on.
+ *
+ * Exists so `now build --explain` can say *why*. A team that cannot see
+ * the reasoning does not trust the incremental build, and the way that
+ * distrust shows up is `rm -rf target` at the top of every loop — which
+ * costs far more than the check it is working around. `reason` may be
+ * NULL, which makes this identical to the call above. */
+NOW_API int now_manifest_needs_rebuild_ex(const NowManifestEntry *entry,
+                                           const char *basedir,
+                                           const char *source,
+                                           const char *flags_hash,
+                                           NowStatCache *stat_cache,
+                                           char *reason, size_t reason_cap);
+
 /* Set header dependencies on an existing manifest entry.
  * The deps and hashes arrays are copied. Returns 0 on success. */
 NOW_API int now_manifest_set_deps(NowManifest *m, const char *source,

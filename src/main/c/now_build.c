@@ -63,6 +63,14 @@ NOW_API int now_cpu_count(void) {
 /* ---- Phase timing (--timing flag) ---- */
 
 static int    g_timing_on = 0;
+
+/* --explain: report the reason for every rebuild-or-skip decision.
+ *
+ * A team that cannot see why the build did what it did stops trusting it,
+ * and the way that distrust shows up is `rm -rf target` at the top of
+ * every loop. Being able to ask is what makes an incremental build
+ * usable, not just correct. */
+static int    g_explain = 0;
 static double g_timing_anchor = 0.0;
 static double g_timing_total_start = 0.0;
 
@@ -81,6 +89,7 @@ NOW_API double now_clock_secs(void) {
 
 NOW_API void now_timing_set(int enabled) { g_timing_on = enabled; }
 NOW_API int  now_timing_enabled(void)    { return g_timing_on; }
+NOW_API void now_explain_set(int enabled) { g_explain = enabled; }
 
 NOW_API void now_timing_begin(void) {
     if (!g_timing_on) return;
@@ -2736,7 +2745,15 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
 
         /* Check manifest for incremental skip */
         const NowManifestEntry *entry = now_manifest_find(&manifest, src);
-        if (!now_manifest_needs_rebuild(entry, ctx->basedir, src, fhash, &ctx->stat_cache)) {
+        char why[512];
+        int need = now_manifest_needs_rebuild_ex(entry, ctx->basedir, src, fhash,
+                                                  &ctx->stat_cache,
+                                                  g_explain ? why : NULL,
+                                                  g_explain ? sizeof(why) : 0);
+        if (g_explain)
+            fprintf(stderr, "  %-7s %s\n           %s\n",
+                    need ? "REBUILD" : "skip", src, why);
+        if (!need) {
             if (entry->object)
                 now_filelist_push(&ctx->objects, entry->object);
             skipped++;
