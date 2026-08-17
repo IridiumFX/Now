@@ -350,10 +350,13 @@ int main(int argc, char *argv[]) {
         int fmt_flags = PASTA_PRETTY;
         int sorted = 0;
 
-        /* Collect file arguments and flags */
-        const char *files[64];
+        /* Collect file arguments and flags.
+         * Sized from argc — `now fmt` over more than 64 paths used to
+         * format the first 64 and exit 0, which reads as success. */
+        const char **files = (const char **)malloc((size_t)argc * sizeof(char *));
+        if (!files) return 1;
         int nfiles = 0;
-        for (int i = 2; i < argc && nfiles < 64; i++) {
+        for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--sorted") == 0)
                 sorted = 1;
             else if (argv[i][0] != '-')

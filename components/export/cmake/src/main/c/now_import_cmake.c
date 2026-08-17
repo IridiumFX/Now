@@ -195,12 +195,16 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
     char lang[16] = "c";
     char std[16] = "";        /* CMAKE_C_STANDARD → "c11" etc */
 
-    char libs[64][64];      int nlibs = 0;
-    char defs[64][128];     int ndefs = 0;
-    char incs[32][256];     int nincs = 0;
-    char subdirs[32][256];  int nsubs = 0;
-    char sources[128][256]; int nsources = 0;  /* from target_sources */
-    char depends[64][128];  int ndepends = 0;  /* sibling-like libs */
+    /* Growable, because a converter that silently drops entries emits a
+     * descriptor that looks right and is wrong. These were fixed 2D
+     * arrays — 64 defines, 32 includes, 128 sources — where exceeding
+     * the bound dropped the rest with no diagnostic and an exit status
+     * of 0, and where strncpy also truncated any single entry past the
+     * row width. A real CMakeLists hits both. */
+    NowStrArray libs, defs, incs, subdirs, sources, depends;
+    now_strarray_init(&libs);    now_strarray_init(&defs);
+    now_strarray_init(&incs);    now_strarray_init(&subdirs);
+    now_strarray_init(&sources); now_strarray_init(&depends);
 
     const char *p;
     char arg[512];
@@ -273,13 +277,14 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
                 if (arg[0] == '$') continue; /* unresolved variable */
                 if (looks_like_interface_lib(arg)) continue; /* drop INTERFACE-only */
                 if (looks_like_system_lib(arg)) {
-                    if (nlibs < 64) strncpy(libs[nlibs++], arg, 63);
+                    now_strarray_push(&libs, arg);
                 } else {
                     /* Sibling-style: emit as a depends entry. Without
                      * group context, use a placeholder the user can edit. */
-                    if (ndepends < 64) {
-                        snprintf(depends[ndepends++], sizeof(depends[0]),
-                                 "dev.iridium:%s:*", arg);
+                    {
+                        char dbuf[512];
+                        snprintf(dbuf, sizeof(dbuf), "dev.iridium:%s:*", arg);
+                        now_strarray_push(&depends, dbuf);
                     }
                 }
             }
@@ -303,7 +308,7 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
                 /* Resolve ${VAR} substitutions */
                 resolve_vars(arg, sizeof(arg), vars, nvars);
                 if (arg[0] == '$') continue; /* still unresolved */
-                if (nsources < 128) strncpy(sources[nsources++], arg, 255);
+                now_strarray_push(&sources, arg);
             }
             s = p;
         }
@@ -313,11 +318,11 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
     p = find_cmd(text, "target_compile_definitions");
     if (p) {
         p = next_arg(p, arg, sizeof(arg)); /* skip target */
-        while (p && ndefs < 64) {
+        while (p) {
             p = next_arg(p, arg, sizeof(arg));
             if (!p) break;
             if (strcmp(arg, "PUBLIC") == 0 || strcmp(arg, "PRIVATE") == 0) continue;
-            strncpy(defs[ndefs++], arg, 127);
+            now_strarray_push(&defs, arg);
         }
     }
 
@@ -325,13 +330,13 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
     p = find_cmd(text, "target_include_directories");
     if (p) {
         p = next_arg(p, arg, sizeof(arg)); /* skip target */
-        while (p && nincs < 32) {
+        while (p) {
             p = next_arg(p, arg, sizeof(arg));
             if (!p) break;
             if (strcmp(arg, "PUBLIC") == 0 || strcmp(arg, "PRIVATE") == 0 ||
                 strcmp(arg, "SYSTEM") == 0 || strcmp(arg, "INTERFACE") == 0) continue;
             if (arg[0] == '$') continue;
-            strncpy(incs[nincs++], arg, 255);
+            now_strarray_push(&incs, arg);
         }
     }
 
@@ -343,8 +348,8 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
         while ((p = find_cmd(s, "add_subdirectory")) != NULL) {
             if (next_arg(p, arg, sizeof(arg))) {
                 resolve_vars(arg, sizeof(arg), vars, nvars);
-                if (arg[0] != '$' && nsubs < 32)
-                    strncpy(subdirs[nsubs++], arg, 255);
+                if (arg[0] != 0x24)
+                    now_strarray_push(&subdirs, arg);
             }
             s = p;
         }
@@ -372,11 +377,12 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
                 /* Each item: emit as a sibling-style dep. Skip duplicates
                  * already added via target_link_libraries. */
                 int dup = 0;
-                for (int i = 0; i < ndepends; i++)
-                    if (strstr(depends[i], arg)) { dup = 1; break; }
-                if (!dup && ndepends < 64) {
-                    snprintf(depends[ndepends++], sizeof(depends[0]),
-                             "dev.iridium:%s:*", arg);
+                for (size_t i = 0; i < depends.count; i++)
+                    if (strstr(depends.items[i], arg)) { dup = 1; break; }
+                if (!dup) {
+                    char dbuf[512];
+                    snprintf(dbuf, sizeof(dbuf), "dev.iridium:%s:*", arg);
+                    now_strarray_push(&depends, dbuf);
                 }
             }
             s = p;
@@ -409,15 +415,15 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
 
     /* Sources (from target_sources). When set, `sources.include` lists
      * explicit files; sources.dir stays at the Maven default. */
-    if (nsources > 0) {
+    if (sources.count > 0) {
         fprintf(out, ",\n\n  sources: {\n    dir: \"src/main/c\",\n    headers: \"src/main/h\",\n    include: [");
-        for (int i = 0; i < nsources; i++)
-            fprintf(out, "%s\n      \"%s\"", i ? "," : "", sources[i]);
+        for (size_t i = 0; i < sources.count; i++)
+            fprintf(out, "%s\n      \"%s\"", i ? "," : "", sources.items[i]);
         fprintf(out, "\n    ]\n  }");
     }
 
     /* Compile section */
-    if (ndefs > 0 || nincs > 0 || std[0]) {
+    if (defs.count > 0 || incs.count > 0 || std[0]) {
         fprintf(out, ",\n\n  compile: {\n");
         int first = 1;
         if (std[0]) {
@@ -425,16 +431,16 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
             first = 0;
         }
         fprintf(out, "%s    warnings: [\"Wall\", \"Wextra\"]", first ? "" : ",\n");
-        if (ndefs > 0) {
+        if (defs.count > 0) {
             fprintf(out, ",\n    defines: [");
-            for (int i = 0; i < ndefs; i++)
-                fprintf(out, "%s\"%s\"", i ? ", " : "", defs[i]);
+            for (size_t i = 0; i < defs.count; i++)
+                fprintf(out, "%s\"%s\"", i ? ", " : "", defs.items[i]);
             fprintf(out, "]");
         }
-        if (nincs > 0) {
+        if (incs.count > 0) {
             fprintf(out, ",\n    includes: [");
-            for (int i = 0; i < nincs; i++)
-                fprintf(out, "%s\"%s\"", i ? ", " : "", incs[i]);
+            for (size_t i = 0; i < incs.count; i++)
+                fprintf(out, "%s\"%s\"", i ? ", " : "", incs.items[i]);
             fprintf(out, "]");
         }
         fprintf(out, "\n  }");
@@ -442,32 +448,36 @@ NOW_API int now_import_cmake(const char *cmake_path, const char *out_path,
 
     /* Link section — system libs only (sibling-style names went to
      * `depends` via the classification pass). */
-    if (nlibs > 0) {
+    if (libs.count > 0) {
         fprintf(out, ",\n\n  link: {\n    libs: [");
-        for (int i = 0; i < nlibs; i++)
-            fprintf(out, "%s\"%s\"", i ? ", " : "", libs[i]);
+        for (size_t i = 0; i < libs.count; i++)
+            fprintf(out, "%s\"%s\"", i ? ", " : "", libs.items[i]);
         fprintf(out, "]\n  }");
     }
 
     /* Depends — sibling-target-style references. Group is a guess;
      * caller should fix the coordinates. */
-    if (ndepends > 0) {
+    if (depends.count > 0) {
         fprintf(out, ",\n\n  depends: [");
-        for (int i = 0; i < ndepends; i++)
-            fprintf(out, "%s\n    { id: \"%s\" }", i ? "," : "", depends[i]);
+        for (size_t i = 0; i < depends.count; i++)
+            fprintf(out, "%s\n    { id: \"%s\" }", i ? "," : "", depends.items[i]);
         fprintf(out, "\n  ]");
     }
 
     /* Vendored from add_subdirectory (resolved against set() vars). */
-    if (nsubs > 0) {
+    if (subdirs.count > 0) {
         fprintf(out, ",\n\n  vendored: [");
-        for (int i = 0; i < nsubs; i++)
-            fprintf(out, "%s\n    \"%s\"", i ? "," : "", subdirs[i]);
+        for (size_t i = 0; i < subdirs.count; i++)
+            fprintf(out, "%s\n    \"%s\"", i ? "," : "", subdirs.items[i]);
         fprintf(out, "\n  ]");
     }
 
     fprintf(out, "\n}\n");
     fclose(out);
+
+    now_strarray_free(&libs);    now_strarray_free(&defs);
+    now_strarray_free(&incs);    now_strarray_free(&subdirs);
+    now_strarray_free(&sources); now_strarray_free(&depends);
 
     if (result) { result->code = NOW_OK; result->message[0] = '\0'; }
     return 0;

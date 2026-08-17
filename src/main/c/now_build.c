@@ -428,11 +428,23 @@ static int spawn_captured(const char *const *argv, NowWorkerSlot *slot) {
 static int wait_any_worker(NowWorkerSlot *slots, int nslots,
                            int *exit_code, NowCapturedOutput *captured) {
 #ifdef _WIN32
-    /* Collect active process handles */
-    HANDLE handles[64];
-    int    indices[64];
+    /* Collect active process handles.
+     *
+     * This 64 is a platform fact, not a guess: WaitForMultipleObjects
+     * accepts at most MAXIMUM_WAIT_OBJECTS handles, which is 64. The job
+     * count is clamped to the same number where max_jobs is resolved, so
+     * nslots can never exceed it — the assert below says so out loud
+     * rather than leaving the two places silently coupled. */
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+    int    indices[MAXIMUM_WAIT_OBJECTS];
     int    nactive = 0;
-    for (int i = 0; i < nslots && nactive < 64; i++) {
+    if (nslots > MAXIMUM_WAIT_OBJECTS) {
+        /* Would silently wait on a subset and lose the rest. */
+        fprintf(stderr, "error: %d job slots exceeds the %d this platform "
+                        "can wait on\n", nslots, MAXIMUM_WAIT_OBJECTS);
+        return -1;
+    }
+    for (int i = 0; i < nslots && nactive < MAXIMUM_WAIT_OBJECTS; i++) {
         if (slots[i].active) {
             handles[nactive] = slots[i].hProcess;
             indices[nactive] = i;

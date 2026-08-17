@@ -575,11 +575,17 @@ static void warn_dead_nested_keys(const PastaValue *root, const char *path) {
             size_t n = pasta_count(sec);
             /* One warning per section, not per element — a dep list with
              * twenty entries carrying `exclude` should say so once. */
-            int said[8] = {0};
+            /* One flag per dead key in this section — sized from the
+             * table rather than guessed, so adding a ninth entry cannot
+             * silently stop reporting. */
+            size_t ndead = 0;
+            while (k_dead_nested[s].dead[ndead]) ndead++;
+            int *said = (int *)calloc(ndead ? ndead : 1, sizeof(int));
+            if (!said) continue;
             for (size_t e = 0; e < n; e++) {
                 const PastaValue *el = pasta_array_get(sec, e);
                 if (!el || pasta_type(el) != PASTA_MAP) continue;
-                for (size_t k = 0; k_dead_nested[s].dead[k] && k < 8; k++) {
+                for (size_t k = 0; k < ndead; k++) {
                     if (said[k]) continue;
                     if (!pasta_map_get(el, k_dead_nested[s].dead[k])) continue;
                     said[k] = 1;
@@ -590,6 +596,7 @@ static void warn_dead_nested_keys(const PastaValue *root, const char *path) {
                             k_dead_nested[s].dead[k]);
                 }
             }
+            free(said);
         } else {
             warn_dead_map(sec, k_dead_nested[s].dead,
                           k_dead_nested[s].section, where);

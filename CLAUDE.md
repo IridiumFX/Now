@@ -97,6 +97,39 @@ cross the boundary through a `NOW_API` function of ours — `main.c` once
 called apennines' `entropy_get_system` directly and the default Linux
 build would not link.
 
+## No fixed-size arrays for variable-length data
+
+`now` is a host tool with an allocator. A bound chosen because it looked
+big enough is a guess, and **a guess enforced by producing less is the
+worst failure mode available**: the build succeeds, against the wrong
+inputs, with exit status 0.
+
+We had it in the compile path — `tmp_argv[128]` fed by loops capped at
+32 warnings / 64 defines / 32 includes, plus two contributors with no cap
+at all. Both halves were wrong. The caps dropped flags silently, which is
+how a `-D` goes missing and the objects come out with the wrong macro
+world; and the caps were also the only thing holding the writes in
+bounds, which they did not — 32 + 64 + 32 is already 128. A descriptor
+with 70 defines and 60 flags overflowed the array and reached gcc as a
+corrupted command line. The CMake importer had the same shape and would
+emit a `now.pasta` missing entries that looked perfectly well-formed.
+
+So:
+
+- **Size to the input.** `malloc(count + headroom)`, or use `NowStrArray`
+  / `NowFileList`, which already grow. The allocation is nothing next to
+  spawning a compiler.
+- **A bound from a platform or a format is a fact, and stays.**
+  `MAXIMUM_WAIT_OBJECTS` is 64 because `WaitForMultipleObjects` says so.
+  Keep those, name them, and **report** when input exceeds them — never
+  absorb it.
+- **Never `if (n < CAP) arr[n++] = x;` with no else.** If the bound is
+  real, the else is an error path. If there is no error path, the bound
+  should not be there.
+
+Credit where due: Amy raised this from their own `.sfd` generator, where
+a 40-parameter prototype came out with 24 arguments — and *compiled*.
+
 ## Gotchas
 
 - **The spec runs well ahead of the implementation.** `profiles:` and
