@@ -2695,10 +2695,25 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
     char *fhash = compile_flags_hash(p, &ctx->toolchain);
     if (g_timing_on) now_timing_mark("  .flags_hash");
 
-    /* Determine job count */
+    /* Determine job count.
+     *
+     * The ceiling was a bare `64` applied on every platform. Two things
+     * wrong with that. On Windows the real limit belongs to
+     * WaitForMultipleObjects, which wait_any_worker feeds — deriving the
+     * clamp from MAXIMUM_WAIT_OBJECTS means a platform that raises it
+     * lifts our ceiling on the next rebuild, instead of leaving a stale
+     * literal behind to bottleneck against. On POSIX there is no such
+     * limit at all: waitpid does not care how many children exist, and
+     * the worker slots are heap-allocated from this number, so a 128-core
+     * machine was being held to half its cores for no reason.
+     *
+     * An explicit `-j N` is the caller's decision either way — make and
+     * ninja both honour it — so the only cap left is the platform's. */
     int max_jobs = ctx->jobs > 0 ? ctx->jobs : now_cpu_count();
     if (max_jobs < 1) max_jobs = 1;
-    if (max_jobs > 64) max_jobs = 64;
+#ifdef _WIN32
+    if (max_jobs > MAXIMUM_WAIT_OBJECTS) max_jobs = MAXIMUM_WAIT_OBJECTS;
+#endif
 
     /* Prefill hash memo in parallel — amortizes SHA-256 across cores so the
      * per-source cache-probe loop becomes pure memo lookup. Skip sources
