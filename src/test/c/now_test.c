@@ -6943,6 +6943,107 @@ static void test_cache_restore_ex_dep_deleted(void) {
     PASS();
 }
 
+/* A cache-restored object never ran the compiler, so its headers come
+ * from the .deps sidecar — where they are stored portably as
+ * "${PROJ}/rel" so an object built in a sibling checkout cannot
+ * validate against this one. The manifest stats its dep paths
+ * verbatim, so handing that spelling straight through made every
+ * restored translation unit report "header is gone" and rebuild
+ * forever, while the object was served from the cache anyway.
+ *
+ * Amy measured 74 of 125 TUs stuck this way on a tree where every
+ * named header was present on disk. The unit suite missed it because
+ * every other cache test passes basedir = NULL, and the ${PROJ}
+ * rewrite only engages when there is a project root to be relative
+ * to. This one uses a real one. */
+static void test_cache_deps_for_key_resolves_proj_token(void) {
+    TEST("cache: restored deps come back resolvable, not ${PROJ}-spelled");
+    now_mkdir_p("target/_projdep/include");
+
+    char cwd[1024];
+#ifdef _WIN32
+    if (!_getcwd(cwd, sizeof cwd)) { FAIL("cannot getcwd"); return; }
+#else
+    if (!getcwd(cwd, sizeof cwd)) { FAIL("cannot getcwd"); return; }
+#endif
+
+    /* Absolute, because that is what a compiler depfile yields and what
+     * the portable-path rewrite keys on. */
+    char basedir[1200], hdr[1400], srcfile[1400], objfile[1400];
+    snprintf(basedir, sizeof basedir, "%s/target/_projdep", cwd);
+    snprintf(hdr,     sizeof hdr,     "%s/include/cfg.h", basedir);
+    snprintf(srcfile, sizeof srcfile, "%s/mod.c", basedir);
+    snprintf(objfile, sizeof objfile, "%s/mod.o", basedir);
+
+    FILE *f = fopen(hdr, "w");
+    if (!f) { FAIL("cannot create header"); return; }
+    fprintf(f, "#define CFG 1\n");
+    fclose(f);
+
+    f = fopen(srcfile, "w");
+    if (!f) { FAIL("cannot create source"); remove(hdr); return; }
+    fprintf(f, "#include \"include/cfg.h\"\n");
+    fclose(f);
+
+    f = fopen(objfile, "wb");
+    if (!f) { FAIL("cannot create object"); remove(hdr); remove(srcfile); return; }
+    fwrite("obj", 1, 3, f);
+    fclose(f);
+
+    char *skey = now_cache_key("projdep_src", "projdep_flags", "/gcc");
+    ASSERT_NOT_NULL(skey);
+
+    NowDepList deps = {0};
+    deps.paths = (char **)malloc(sizeof(char *));
+    deps.paths[0] = strdup(hdr);
+    deps.count = 1;
+    deps.capacity = 1;
+
+    ASSERT_EQ(now_cache_store_ex(skey, objfile, ".o", &deps, basedir), 0);
+
+    char **dpaths = NULL, **dhashes = NULL;
+    size_t dn = 0;
+    ASSERT_EQ(now_cache_deps_for_key(skey, basedir, &dpaths, &dhashes, &dn), 0);
+    ASSERT_EQ((int)dn, 1);
+    ASSERT_NOT_NULL(dpaths[0]);
+
+    /* The manifest will stat this string as-is. */
+    ASSERT_EQ(now_path_exists(dpaths[0]), 1);
+
+    /* And the end state that was actually reported: an entry written
+     * from a restore must converge on the very next build. */
+    NowManifest m;
+    now_manifest_init(&m);
+    char *src_hash = now_sha256_file(srcfile);
+    ASSERT_NOT_NULL(src_hash);
+    struct stat st;
+    stat(srcfile, &st);
+    now_manifest_set(&m, "mod.c", objfile, src_hash, "fh",
+                     (long long)st.st_mtime);
+    now_manifest_set_deps(&m, "mod.c", (const char **)dpaths,
+                          (const char **)dhashes, dn);
+
+    const NowManifestEntry *e = now_manifest_find(&m, "mod.c");
+    ASSERT_NOT_NULL(e);
+    char reason[512];
+    reason[0] = '\0';
+    int rebuild = now_manifest_needs_rebuild_ex(e, basedir, "mod.c", "fh",
+                                                NULL, reason, sizeof reason);
+    if (rebuild != 0)
+        printf("    (reason: %s)\n", reason);
+    ASSERT_EQ(rebuild, 0);
+
+    now_manifest_free(&m);
+    free(src_hash);
+    now_cache_deps_free(dpaths, dhashes, dn);
+    now_deplist_free(&deps);
+    free(skey);
+    remove(objfile);
+    remove(srcfile);
+    remove(hdr);
+    PASS();
+}
+
 /* ---- Manifest dep tracking ---- */
 
 static void test_manifest_set_deps(void) {
@@ -7419,6 +7520,7 @@ int main(void) {
     test_cache_restore_ex_no_deps();
     test_cache_store_restore_ex_with_deps();
     test_cache_restore_ex_dep_deleted();
+    test_cache_deps_for_key_resolves_proj_token();
 
     printf("\n  Manifest deps:\n");
     test_manifest_set_deps();
