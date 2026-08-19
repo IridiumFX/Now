@@ -873,6 +873,7 @@ NOW_API int now_cache_print_stats(void) {
 /* ---- Dep sidecar accessor (see now_cache.h) ---- */
 
 NOW_API int now_cache_deps_for_key(const char *source_key,
+                                    const char *basedir,
                                     char ***dep_paths,
                                     char ***dep_hashes,
                                     size_t *dep_count) {
@@ -895,6 +896,25 @@ NOW_API int now_cache_deps_for_key(const char *source_key,
         *dep_hashes = NULL;
         *dep_count = 0;
         return -1;
+    }
+
+    /* Resolve out of the storage spelling before the paths leave this
+     * module. The sidecar holds "${PROJ}/rel" so a cached object cannot
+     * validate against a sibling checkout; every consumer of this list
+     * wants a path it can stat, and the manifest stats them verbatim.
+     * Leaving the token in place was worth 74 of 125 translation units
+     * rebuilding forever on Amy's tree with every header present. */
+    for (size_t i = 0; i < *dep_count; i++) {
+        char *real = dep_path_resolve((*dep_paths)[i], basedir);
+        if (!real) {
+            now_cache_deps_free(*dep_paths, *dep_hashes, *dep_count);
+            *dep_paths = NULL;
+            *dep_hashes = NULL;
+            *dep_count = 0;
+            return -1;
+        }
+        free((*dep_paths)[i]);
+        (*dep_paths)[i] = real;
     }
     return 0;
 }

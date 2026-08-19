@@ -2893,7 +2893,8 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                         char **dpaths = NULL, **dhashes = NULL;
                         size_t dn = 0;
                         int have_deps =
-                            (now_cache_deps_for_key(ckey, &dpaths, &dhashes, &dn) == 0);
+                            (now_cache_deps_for_key(ckey, ctx->basedir,
+                                                    &dpaths, &dhashes, &dn) == 0);
 
                         if (have_deps) {
                             struct stat cst;

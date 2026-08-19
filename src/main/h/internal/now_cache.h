@@ -93,10 +93,20 @@ NOW_API int now_cache_store_ex(const char *source_key,
  * and was reported "up to date" forever, whatever happened to its
  * headers.
  *
+ * Paths come back resolved against `basedir`, not in the "${PROJ}/rel"
+ * spelling the sidecar stores. That spelling exists so an object built
+ * in a sibling checkout cannot validate against this one, and it is
+ * private to this module: the manifest stats its dep paths verbatim, so
+ * handing the token through made every restored translation unit report
+ * "header is gone" and rebuild forever. Pass the same basedir used for
+ * the matching now_cache_store_ex(); NULL is accepted and leaves paths
+ * as stored, which is only correct when nothing was made relative.
+ *
  * On success the caller owns both arrays and every string; free with
  * now_cache_deps_free(). Returns 0 on success, -1 if there is no
  * sidecar (in which case *count is 0 and the arrays are NULL). */
 NOW_API int now_cache_deps_for_key(const char *source_key,
+                                    const char *basedir,
                                     char ***dep_paths,
                                     char ***dep_hashes,
                                     size_t *dep_count);
