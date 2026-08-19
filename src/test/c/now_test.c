@@ -1561,6 +1561,91 @@ static void test_build_pattern_filter(void) {
     PASS();
 }
 
+/* Omitting `sources.dir` has to mean "there may not be one".
+ *
+ * The loader fills the key in, so by build time an omitted `dir` is
+ * indistinguishable from a named one — and a module whose entire source
+ * list is `sources.include`, naming files owned by other modules, failed
+ * on the absence of a directory it never mentioned. Amy hit it on their
+ * twentieth module and has carried a stub `src/main/c` holding a single
+ * `extern` declaration ever since.
+ *
+ * Both boundaries are asserted, because the fix is only correct if it
+ * keeps the failure that is worth having: a directory the author NAMED
+ * and got wrong must still be an error. */
+static void test_build_include_only_module(void) {
+    TEST("build: no sources.dir is legal when include: supplies the files");
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/include_only_proj", NOW_TEST_RESOURCES);
+
+    char csrc[512], vend[512], p[512];
+    snprintf(csrc, sizeof(csrc), "%s/src/main/c", root);
+    rmtree_best_effort(csrc);                 /* the point: it must NOT exist */
+    snprintf(vend, sizeof(vend), "%s/vendor", root);
+    now_mkdir_p(vend);
+    snprintf(p, sizeof(p), "%s/vendor/only.c", root);
+    write_empty(p);
+
+    /* No `dir` key at all, and one include. */
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"inconly\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"inconly\" },"
+        "  sources: { include: [\"vendor/only.c\"] } }";
+
+    NowResult res;
+    NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+
+    NowBuildCtx ctx;
+    int rc = now_build_init(&ctx, prj, root, &res);
+    if (rc != 0) { FAIL(res.message); now_project_free(prj); return; }
+
+    int has_only = 0;
+    for (size_t i = 0; i < ctx.sources.count; i++)
+        if (strstr(ctx.sources.paths[i], "only.c")) has_only = 1;
+    ASSERT_EQ(has_only, 1);
+
+    now_build_free(&ctx);
+    now_project_free(prj);
+
+    /* A directory the descriptor NAMES and that is missing stays an
+     * error — that is a typo, and building quietly around it would
+     * produce something other than what was asked for. */
+    const char *named =
+        "{ group: \"org.test\", artifact: \"typo\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"typo\" },"
+        "  sources: { dir: \"src/typo/c\", include: [\"vendor/only.c\"] } }";
+
+    NowProject *prj2 = now_project_load_string(named, strlen(named), &res);
+    ASSERT_NOT_NULL(prj2);
+    NowBuildCtx ctx2;
+    int rc2 = now_build_init(&ctx2, prj2, root, &res);
+    ASSERT_EQ(rc2 != 0, 1);
+    if (rc2 == 0) now_build_free(&ctx2);
+    now_project_free(prj2);
+
+    /* And a module with neither a directory nor any includes is still
+     * an error rather than an empty build. */
+    const char *bare =
+        "{ group: \"org.test\", artifact: \"bare\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"bare\" } }";
+
+    NowProject *prj3 = now_project_load_string(bare, strlen(bare), &res);
+    ASSERT_NOT_NULL(prj3);
+    NowBuildCtx ctx3;
+    int rc3 = now_build_init(&ctx3, prj3, root, &res);
+    ASSERT_EQ(rc3 != 0, 1);
+    if (rc3 == 0) now_build_free(&ctx3);
+    now_project_free(prj3);
+
+    rmtree_best_effort(vend);
+    PASS();
+}
+
 static void test_build_java_hello(void) {
     TEST("build: compile and package Java project");
 
@@ -7611,6 +7696,7 @@ int main(void) {
     test_build_hello();
     test_build_exclude_glob();
     test_build_pattern_filter();
+    test_build_include_only_module();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 

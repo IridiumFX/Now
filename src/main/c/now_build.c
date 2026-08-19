@@ -1256,13 +1256,32 @@ NOW_API int now_build_init(NowBuildCtx *ctx, const NowProject *project,
                                              &ctx->sources);
 
     if (rc != 0 && !is_header_only) {
-        free(exts);
-        if (result) {
-            result->code = NOW_ERR_IO;
-            snprintf(result->message, sizeof(result->message),
-                     "cannot scan source directory: %s", src_dir);
+        /* An unscannable source directory only matters when it was going
+         * to be the module's only supply of sources.
+         *
+         * The loader defaults `sources.dir`, so by this point omitting
+         * the key looks exactly like naming it — and a module whose
+         * entire list is `sources.include`, pointing at files owned by
+         * other modules, was failing on the absence of a directory it
+         * never mentioned. Amy hit this on their twentieth module and
+         * carried a stub `src/main/c` containing one `extern`
+         * declaration to satisfy it.
+         *
+         * A directory the author named and got wrong is still an error;
+         * silence there would build something other than what was
+         * asked for. */
+        int has_other_sources = project->sources.include.count > 0 ||
+                                project->components.count > 0 ||
+                                project->vendored.count > 0;
+        if (!project->sources.dir_is_default || !has_other_sources) {
+            free(exts);
+            if (result) {
+                result->code = NOW_ERR_IO;
+                snprintf(result->message, sizeof(result->message),
+                         "cannot scan source directory: %s", src_dir);
+            }
+            return -1;
         }
-        return -1;
     }
 
     /* Apply sources.pattern (glob, rooted at sources.dir) to the

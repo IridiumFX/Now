@@ -24,6 +24,11 @@ NOW_API void now_strarray_free(NowStrArray *a);
 /* Sources configuration (§1.3) */
 typedef struct {
     char *dir;             /* source directory */
+    /* Set when `dir` was filled in by the loader rather than named in the
+     * descriptor. Omitting the key has to mean "there may not be one",
+     * not "the default one, and it had better exist" — a module whose
+     * whole source list is `include:` has no directory of its own. */
+    int   dir_is_default;
     char *headers;         /* public headers directory */
     char *private_headers; /* private headers directory */
     char *pattern;         /* glob pattern */

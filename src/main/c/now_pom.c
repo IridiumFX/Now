@@ -243,6 +243,11 @@ static void apply_maven_defaults(NowProject *p) {
     int is_go   = (strcmp(primary, "go")   == 0);
 
     if (!p->sources.dir) {
+        /* Remembered, because after this point the descriptor no longer
+         * says whether the author chose this path or we did. A missing
+         * directory the author named is a typo worth failing on; a
+         * missing directory we invented is not. */
+        p->sources.dir_is_default = 1;
         if      (is_cpp)  p->sources.dir = strdup("src/main/cpp");
         else if (is_java) p->sources.dir = strdup("src/main/java");
         else if (is_rust) p->sources.dir = strdup("src/main/rust");
