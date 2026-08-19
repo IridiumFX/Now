@@ -17,7 +17,7 @@
 #include <string.h>
 
 NOW_API const char *now_version(void) {
-    return "1.0.0-rc4";
+    return "1.0.0-rc5";
 }
 
 /* ---- Project accessors ---- */
