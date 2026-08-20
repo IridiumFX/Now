@@ -23,6 +23,11 @@ set -uo pipefail
 SRC="${NOW_SRC:-/mnt/c/Users/Iridium/Projects/Infra/now}"
 WORK="${NOW_WSL_BUILD:-$HOME/now-build}"
 DEST="${NOW_WSL_PREFIX:-$HOME/.local/bin}"
+# The installed filename. Defaults to `now` for a peer installing it for
+# their own use; the release publisher overrides it so a Linux binary can
+# sit beside a Windows one in a shared directory without either shadowing
+# the other.
+NAME="${NOW_WSL_NAME:-now}"
 
 say() { printf '  %s\n' "$*"; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
@@ -84,10 +89,10 @@ say "commands present"
 
 echo "== install =="
 mkdir -p "$DEST" || die "cannot create $DEST"
-cp "$BIN" "$DEST/now" || die "install failed"
-chmod +x "$DEST/now"
-printf '%s\n' "$REV" > "$DEST/.now-revision"
-say "installed: $DEST/now  (rev $REV)"
+cp "$BIN" "$DEST/$NAME" || die "install failed"
+chmod +x "$DEST/$NAME"
+printf '%s\n' "$REV" > "$DEST/.${NAME}-revision"
+say "installed: $DEST/$NAME  (rev $REV)"
 
 # Make it resolve, rather than assume the distro defaults do it.
 #
@@ -108,6 +113,9 @@ ensure_path_in() {
     } >> "$rc"
     say "PATH line added to $rc"
 }
+if [ -n "${NOW_WSL_NO_PATH:-}" ]; then
+    say "PATH: left alone (NOW_WSL_NO_PATH set)"
+else
 case ":$PATH:" in
     *":$DEST:"*) say "on PATH: yes" ;;
     *)
@@ -120,8 +128,9 @@ case ":$PATH:" in
         say "open a new shell, or: export PATH=\"$DEST:\$PATH\""
         ;;
 esac
-say "absolute path (for scripts and non-interactive shells): $DEST/now"
+fi
+say "absolute path (for scripts and non-interactive shells): $DEST/$NAME"
 
 echo
 echo "Re-run this after pulling now to stay current. To check what you"
-echo "have:  cat $DEST/.now-revision"
+echo "have:  cat $DEST/.${NAME}-revision"
