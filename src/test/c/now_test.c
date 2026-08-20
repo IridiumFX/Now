@@ -1646,6 +1646,98 @@ static void test_build_include_only_module(void) {
     PASS();
 }
 
+/* Warning flags have to reach the TEST compile, not only the module
+ * compile.
+ *
+ * Reported by Amy 2026-08-20 with a measurement: five tests added, the
+ * `RUN()` lines forgotten, and the suite reported "13 tests, 1818
+ * checks, 0 failures" — a suite that grew by nothing. `-Wall` names
+ * exactly that case, because an unregistered test is an unused static
+ * function, and running the same compiler by hand printed the warning.
+ * `now test` did not, because `compile.warnings` was never added to the
+ * test argv: the warning was never GENERATED, not generated and
+ * dropped. Default-on warnings such as -Wpointer-sign did appear, which
+ * is why it looked like output being lost for some modules only.
+ *
+ * Asserted through `Werror` rather than by capturing stderr: with the
+ * flags reaching the compiler an unused static is a hard error, so the
+ * property is visible in the return code. */
+static void test_build_warnings_reach_test_compile(void) {
+    TEST("build: compile.warnings reach the test compile");
+
+    char root[512], d[512], p[512];
+    snprintf(root, sizeof(root), "%s/testwarn_proj", NOW_TEST_RESOURCES);
+    /* Start from nothing. A test object left by an earlier run is judged
+     * fresh by source content and a flags key derived from the
+     * DESCRIPTOR, so a change to the argv that `now` itself builds is
+     * invisible to it — which is how this test passed against the very
+     * binary it was written to catch. */
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+    snprintf(d, sizeof(d), "%s/src/test/c", root); now_mkdir_p(d);
+
+    FILE *fp;
+    snprintf(p, sizeof(p), "%s/src/main/c/lib.c", root);
+    fp = fopen(p, "wb");
+    if (!fp) { FAIL("cannot write lib.c"); return; }
+    fputs("int lib_val(void) { return 7; }\n", fp);
+    fclose(fp);
+
+    snprintf(p, sizeof(p), "%s/src/test/c/t.c", root);
+    fp = fopen(p, "wb");
+    if (!fp) { FAIL("cannot write t.c"); return; }
+    fputs("int lib_val(void);\n"
+          "int main(void) { return lib_val() == 7 ? 0 : 1; }\n"
+          "/* defined, never registered: -Wall names this */\n"
+          "static void never_registered(void) { }\n", fp);
+    fclose(fp);
+
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"tw\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"tw\" },"
+        "  compile: { warnings: [\"Wall\", \"Werror\"] },"
+        "  tests: { dir: \"src/test/c\" } }";
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+
+    NowBuildCtx ctx;
+    int rc = now_build_init(&ctx, prj, root, &res);
+    if (rc != 0) { FAIL(res.message); now_project_free(prj); return; }
+
+    /* Build the library first, so that if the test stage does succeed
+     * it succeeds completely. Without this the link fails for want of a
+     * library and the failure is ambiguous — it was, on the first run. */
+    if (now_build_compile(&ctx, &res) != 0) {
+        FAIL(res.message); now_build_free(&ctx); now_project_free(prj); return;
+    }
+    if (now_build_link(&ctx, &res) != 0) {
+        FAIL(res.message); now_build_free(&ctx); now_project_free(prj); return;
+    }
+
+    /* With the flags reaching it, the unused static is an error and the
+     * test stage must refuse to build. Without them it compiles clean
+     * and this returns 0 — which is the defect. */
+    int trc = now_build_test(&ctx, &res);
+    ASSERT_EQ(trc != 0, 1);
+    if (trc != 0 && !strstr(res.message, "test compile")) {
+        FAIL(res.message);   /* failed, but not where we meant */
+        now_build_free(&ctx);
+        now_project_free(prj);
+        return;
+    }
+
+    now_build_free(&ctx);
+    now_project_free(prj);
+
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    PASS();
+}
+
 static void test_build_java_hello(void) {
     TEST("build: compile and package Java project");
 
@@ -7697,6 +7789,7 @@ int main(void) {
     test_build_exclude_glob();
     test_build_pattern_filter();
     test_build_include_only_module();
+    test_build_warnings_reach_test_compile();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 

@@ -4200,11 +4200,17 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                          + ctx->dep_includes.count
                          + p->compile.defines.count
                          + p->compile.flags.count
+                         + p->compile.warnings.count
                          + p->tests.defines.count;
         const char **argv = (const char **)malloc(argv_need * sizeof(char *));
         if (!argv) { free(obj); continue; }
         int argc = 0;
         char *inc_src = NULL, *inc_hdr = NULL;
+        /* Owned separately from the generic -I/-D cleanup below, which
+         * matches on the flag letter: widening it to 'W' would try to
+         * free MSVC's "/W4" and "/WX" string literals. */
+        char **twarn_bufs = NULL;
+        size_t ntwarn = 0;
         char *tdepfile = NULL;   /* -MF target; parsed then freed below */
         char *src_full = now_path_join(basedir, src);
 
@@ -4291,6 +4297,16 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                     argv[argc++] = d;
                 }
                 free(exp);
+            }
+
+            /* Same mapping the module compile uses. */
+            for (size_t ii = 0; ii < p->compile.warnings.count; ii++) {
+                const char *w = p->compile.warnings.items[ii];
+                if (strcmp(w, "Wall") == 0 || strcmp(w, "Wextra") == 0 ||
+                    strcmp(w, "Wpedantic") == 0)
+                    argv[argc++] = "/W4";
+                else if (strcmp(w, "Werror") == 0)
+                    argv[argc++] = "/WX";
             }
 
             argv[argc++] = "/c";
@@ -4397,6 +4413,36 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                 free(exp);
             }
 
+            /* Production warning flags.
+             *
+             * Without these a test object was compiled at the compiler's
+             * defaults, so every warning that is not on by default was
+             * never GENERATED — not captured and dropped, never produced.
+             * `-Wunused-function` is one of them, and it is the warning
+             * that names a test which was defined and never registered:
+             * Amy added five tests, forgot the RUN() lines, and got
+             * "13 tests, 1818 checks, 0 failures" — a suite that grew by
+             * nothing, with no other reading available.
+             *
+             * The confusing part from outside was that some modules did
+             * print test-stage warnings. Those were default-on ones like
+             * -Wpointer-sign, which need no flag; it looked like output
+             * being dropped for some modules and not others. */
+            if (p->compile.warnings.count > 0) {
+                twarn_bufs = (char **)malloc(
+                    p->compile.warnings.count * sizeof(char *));
+                for (size_t ii = 0; twarn_bufs &&
+                                    ii < p->compile.warnings.count; ii++) {
+                    const char *w = p->compile.warnings.items[ii];
+                    size_t wlen = strlen(w) + 3;
+                    char *wb = (char *)malloc(wlen);
+                    if (!wb) continue;
+                    snprintf(wb, wlen, "-%s", w);
+                    twarn_bufs[ntwarn++] = wb;
+                    argv[argc++] = wb;
+                }
+            }
+
             argv[argc++] = "-c";
             argv[argc++] = src_full;
             argv[argc++] = "-o";
@@ -4428,6 +4474,8 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             }
             if (!borrowed) free((char *)argv[a]);
         }
+        for (size_t ii = 0; ii < ntwarn; ii++) free(twarn_bufs[ii]);
+        free(twarn_bufs);
         free(inc_src);
         free(inc_hdr);
         free(src_full);
