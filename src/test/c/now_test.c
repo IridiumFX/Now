@@ -6760,6 +6760,82 @@ static void test_ed25519_verify_wrong_msg(void) {
     PASS();
 }
 
+/* The suite verified signatures produced elsewhere and round-tripped its
+ * own through the same code, so a signer that was wrong on roughly one
+ * message in seven passed everything: a round trip cancels a matching
+ * error on both sides, and the two RFC vectors it did carry are
+ * verify-only. Nothing ever compared a signature *now produced* against
+ * a known-correct one. These do. */
+static void test_ed25519_sign_rfc8032_1(void) {
+    TEST("ed25519: sign matches RFC 8032 test vector 1");
+    unsigned char seed[32], pub[32], priv[64], sig[64], expected[64];
+    hex_to_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+                 seed, 32);
+    hex_to_bytes("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+                 expected, 64);
+    if (now_ed25519_keypair(pub, priv, seed) != 0) { FAIL("keypair failed"); return; }
+    if (now_ed25519_sign(sig, (const unsigned char *)"", 0, priv) != 0) {
+        FAIL("sign failed"); return;
+    }
+    if (memcmp(sig, expected, 64) != 0) { FAIL("signature bytes differ from RFC"); return; }
+    PASS();
+}
+
+static void test_ed25519_sign_rfc8032_3(void) {
+    TEST("ed25519: sign matches RFC 8032 test vector 3");
+    unsigned char seed[32], pub[32], priv[64], sig[64], expected[64];
+    hex_to_bytes("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+                 seed, 32);
+    hex_to_bytes("6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+                 expected, 64);
+    unsigned char msg[2] = { 0xaf, 0x82 };
+    if (now_ed25519_keypair(pub, priv, seed) != 0) { FAIL("keypair failed"); return; }
+    if (now_ed25519_sign(sig, msg, sizeof(msg), priv) != 0) { FAIL("sign failed"); return; }
+    if (memcmp(sig, expected, 64) != 0) { FAIL("signature bytes differ from RFC"); return; }
+    PASS();
+}
+
+/* Nine bytes is the shortest message of this shape that the dropped
+ * carry in sc_reduce/sc_muladd got wrong; the expected bytes come from
+ * an independent RFC 8032 implementation, not from ours. */
+static void test_ed25519_sign_known_answer_9(void) {
+    TEST("ed25519: sign matches a known answer for a 9-byte message");
+    unsigned char seed[32], pub[32], priv[64], sig[64], expected[64];
+    hex_to_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+                 seed, 32);
+    hex_to_bytes("18c80fa06772c5c6b8c8cbc83311ed06722777661be057d85d258e4ec310743d"
+                 "781645ea6e1ba53f486f88fe016faa739f541efc600337b8221256a67e30d40f",
+                 expected, 64);
+    unsigned char msg[9];
+    for (int i = 0; i < 9; i++) msg[i] = (unsigned char)i;
+    if (now_ed25519_keypair(pub, priv, seed) != 0) { FAIL("keypair failed"); return; }
+    if (now_ed25519_sign(sig, msg, sizeof(msg), priv) != 0) { FAIL("sign failed"); return; }
+    if (memcmp(sig, expected, 64) != 0) { FAIL("signature bytes differ"); return; }
+    if (now_ed25519_verify(sig, msg, sizeof(msg), pub) != 0) {
+        FAIL("own signature does not verify"); return;
+    }
+    PASS();
+}
+
+/* One message length proves nothing about a defect that shows up on a
+ * fraction of inputs — the old round-trip test used a single empty
+ * message and never saw this. */
+static void test_ed25519_sign_verify_lengths(void) {
+    TEST("ed25519: sign and verify agree across message lengths");
+    unsigned char seed[32], pub[32], priv[64], sig[64], msg[256];
+    hex_to_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+                 seed, 32);
+    if (now_ed25519_keypair(pub, priv, seed) != 0) { FAIL("keypair failed"); return; }
+    for (size_t len = 1; len <= sizeof(msg); len++) {
+        for (size_t i = 0; i < len; i++) msg[i] = (unsigned char)(i & 0xff);
+        if (now_ed25519_sign(sig, msg, len, priv) != 0) { FAIL("sign failed"); return; }
+        if (now_ed25519_verify(sig, msg, len, pub) != 0) {
+            FAIL("own signature does not verify"); return;
+        }
+    }
+    PASS();
+}
+
 static void test_ed25519_null_safety(void) {
     TEST("ed25519: null safety");
     if (now_ed25519_verify(NULL, NULL, 0, NULL) == 0) { FAIL("should reject NULL"); return; }
@@ -7561,6 +7637,10 @@ int main(void) {
     test_ed25519_verify_rfc8032_2();
     test_ed25519_verify_bad_sig();
     test_ed25519_verify_wrong_msg();
+    test_ed25519_sign_rfc8032_1();
+    test_ed25519_sign_rfc8032_3();
+    test_ed25519_sign_known_answer_9();
+    test_ed25519_sign_verify_lengths();
     test_ed25519_null_safety();
 
     printf("\n  Advisory guards:\n");

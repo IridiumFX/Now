@@ -698,8 +698,15 @@ static void sc_reduce(uint8_t out[32], const uint8_t in[64]) {
             x[j] -= carry * (int64_t)L[j];
     }
 
-    for (int i = 0; i < 32; i++)
+    /* The carry pass is not optional. The loops above leave x[] holding
+     * values outside [0,255], so masking each byte without carrying into
+     * the next one drops exactly those carries — a scalar short by a
+     * scattering of 1s in different byte positions. It reduces mod L
+     * correctly and then throws part of the answer away. */
+    for (int i = 0; i < 32; i++) {
+        x[i + 1] += x[i] >> 8;
         out[i] = (uint8_t)(x[i] & 255);
+    }
 }
 
 /* sc_muladd: out = a*b + c (mod L), all 32-byte scalars */
@@ -741,8 +748,11 @@ static void sc_muladd(uint8_t out[32], const uint8_t a[32],
             x[j] -= carry * (int64_t)L[j];
     }
 
-    for (int i = 0; i < 32; i++)
+    /* Same carry pass as sc_reduce, and missing for the same reason. */
+    for (int i = 0; i < 32; i++) {
+        x[i + 1] += x[i] >> 8;
         out[i] = (uint8_t)(x[i] & 255);
+    }
 }
 
 /* ================================================================
