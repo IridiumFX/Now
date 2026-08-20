@@ -166,6 +166,19 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   imports; `now_build.c:4138` now builds them with production flags plus
   the test-only defines, so they get it. A false gotcha is worse than an
   absent one — it stops people running the self-host suite at all.
+- **The unit suite cannot see the registry leg.** Every component on it
+  is tested and the seams between them were not: on 2026-08-20, 352
+  green tests coexisted with an Ed25519 that got 14% of signatures
+  wrong, a `require_signatures` that no publish could satisfy, and a
+  `procure` that never unpacked what it downloaded — so **nobody had
+  ever compiled against a fetched dependency**. Run
+  `tools/registry-roundtrip.sh <artifact-name>` against a live cookbook
+  before believing anything about publish/procure. Fresh name per run:
+  a re-published coordinate keeps the old artifact and each run makes a
+  new signing key, which reads exactly like a signature defect.
+- **Crypto comes from apennines.** `now_ed25519.c` is a thin surface
+  over `t2/crypto/ec.c`. Do not reintroduce a second implementation of a
+  primitive — the one nobody cross-checks is the one that is wrong.
 - **Two loaders duplicate the parsing**: `now_project_load()` and
   `now_project_load_string()`. Only the former parses the workspace
   inheritance fields.
