@@ -1109,6 +1109,169 @@ NOW_API int now_publish(const NowProject *project, const char *basedir,
     return 0;
 }
 
+NOW_API int now_keys_register(const char *registry_url, const char *group,
+                               const char *key_id, const char *comment,
+                               int verbose, NowResult *result) {
+    if (!registry_url || !group) {
+        if (result) {
+            result->code = NOW_ERR_SCHEMA;
+            snprintf(result->message, sizeof(result->message),
+                     "keys:register requires a registry URL and a group");
+        }
+        return -1;
+    }
+
+    /* The public half is bytes 32..63 of the key file, but derive it
+     * from the seed instead: signing does the same, so a hand-edited
+     * file cannot register one key and sign with another. */
+    unsigned char priv[64], seed[32], pub[32];
+    if (now_signing_key_load(priv) != 0) {
+        if (result) {
+            result->code = NOW_ERR_NOT_FOUND;
+            snprintf(result->message, sizeof(result->message),
+                     "no signing key — run 'now keygen' first");
+        }
+        return -1;
+    }
+    memcpy(seed, priv, sizeof(seed));
+    if (now_ed25519_keypair(pub, priv, seed) != 0) {
+        memset(priv, 0, sizeof(priv));
+        memset(seed, 0, sizeof(seed));
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "signing key is malformed");
+        }
+        return -1;
+    }
+    memset(priv, 0, sizeof(priv));
+    memset(seed, 0, sizeof(seed));
+
+    char *pub_b64 = now_b64_encode(pub, sizeof(pub));
+    if (!pub_b64) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "cannot encode public key");
+        }
+        return -1;
+    }
+
+    /* Default key id: the first 16 hex digits of the key. Unique per
+     * key, stable across re-registration, and recognisable next to the
+     * key itself in a listing. */
+    char kid[64];
+    if (key_id && *key_id) {
+        snprintf(kid, sizeof(kid), "%s", key_id);
+    } else {
+        for (int i = 0; i < 8; i++)
+            snprintf(kid + i * 2, 3, "%02x", pub[i]);
+        kid[16] = '\0';
+    }
+
+    char *host = NULL;
+    int   port = 0;
+    char *path = NULL;
+    int   tls  = 0;
+
+    int rc = pico_http_parse_url_ex(registry_url, &host, &port, &path, &tls);
+    if (rc != 0 || !host) {
+        if (result) {
+            result->code = NOW_ERR_SCHEMA;
+            snprintf(result->message, sizeof(result->message),
+                     "invalid registry URL: %s", registry_url);
+        }
+        free(pub_b64); free(host); free(path);
+        return -1;
+    }
+
+    char *prefix = path ? path : strdup("");
+    size_t plen = strlen(prefix);
+    while (plen > 0 && prefix[plen - 1] == '/') prefix[--plen] = '\0';
+
+    char *token = auth_for_registry(registry_url, host, port, prefix, tls,
+                                    result);
+
+    char keys_path[1024];
+    snprintf(keys_path, sizeof(keys_path), "%s/keys", prefix);
+
+    char body[1024];
+    int body_len = snprintf(body, sizeof(body),
+        "{\"key_id\":\"%s\",\"group_id\":\"%s\",\"public_key\":\"%s\""
+        ",\"comment\":\"%s\"}",
+        kid, group, pub_b64,
+        (comment && *comment) ? comment : "registered by now keys:register");
+
+    PicoHttpHeader headers[2];
+    int nhdr = 0;
+    char auth_buf[1024];
+    if (token && *token) {
+        snprintf(auth_buf, sizeof(auth_buf), "Bearer %s", token);
+        headers[nhdr].name  = "Authorization";
+        headers[nhdr].value = auth_buf;
+        nhdr++;
+    }
+
+    PicoHttpOptions opts = {0};
+    opts.headers = headers;
+    opts.header_count = (size_t)nhdr;
+    opts.max_redirects = -1;
+    opts.tls = tls ? 1 : -1;
+
+    PicoHttpResponse res;
+    memset(&res, 0, sizeof(res));
+
+    if (verbose)
+        fprintf(stderr, "  POST %s:%d%s\n", host, port, keys_path);
+
+    rc = pico_http_post(host, port, keys_path, "application/json",
+                        body, (size_t)body_len, &opts, &res);
+
+    free(host); free(prefix); free(token);
+
+    if (rc != PICO_OK) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            snprintf(result->message, sizeof(result->message),
+                     "POST /keys failed: %s", pico_http_strerror(rc));
+        }
+        free(pub_b64);
+        return -1;
+    }
+
+    if (res.status < 200 || res.status >= 300) {
+        if (result) {
+            result->code = NOW_ERR_IO;
+            /* Carry the registry's own words through. It distinguishes
+             * an unknown group from a duplicate key id, and guessing
+             * between them from the status code alone is what sent
+             * people renaming a key that was fine. */
+            snprintf(result->message, sizeof(result->message),
+                     "registry returned HTTP %d on POST /keys%s%.*s",
+                     res.status,
+                     res.body_len ? ": " : "",
+                     (int)(res.body_len > 200 ? 200 : res.body_len),
+                     res.body ? res.body : "");
+        }
+        pico_http_response_free(&res);
+        free(pub_b64);
+        return -1;
+    }
+
+    pico_http_response_free(&res);
+
+    if (verbose || 1)
+        fprintf(stderr, "  registered key %s for %s\n", kid, group);
+
+    free(pub_b64);
+
+    if (result) {
+        result->code = NOW_OK;
+        result->message[0] = '\0';
+    }
+    return 0;
+}
+
 NOW_API int now_publish_yank(const char *registry_url,
                               const char *group, const char *artifact,
                               const char *version, const char *reason,
