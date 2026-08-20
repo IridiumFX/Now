@@ -310,7 +310,12 @@ NOW_API int now_lock_differs(const NowLockFile *before, const NowLockFile *after
             if (which) *which = now_e->artifact;
             return 1;
         }
+        /* An empty version means the registry has not settled it yet.
+         * At step 4 every version is resolved so this never triggers
+         * there; it makes the same function safe to call *before* the
+         * network work, where a range still reads as "". */
         if (now_e->version && was->version &&
+            now_e->version[0] && was->version[0] &&
             strcmp(now_e->version, was->version) != 0) {
             if (what) *what = "changed version";
             if (which) *which = now_e->artifact;
@@ -363,14 +368,32 @@ NOW_API int now_repo_is_installed(const char *repo_root,
     char *dep_path = now_repo_dep_path(repo_root, group, artifact, version);
     if (!dep_path) return 0;
 
-    /* Check for now.pasta inside the dep directory */
+    /* The descriptor alone is not evidence of an install.
+     *
+     * It is downloaded before the checksum and the signature are
+     * checked, and it survived a rejection — so a *second* `now procure`
+     * after one that refused a tampered artifact saw now.pasta, decided
+     * the dependency was already installed, skipped the download, the
+     * checksum, the signature and the unpack, and printed "procure:
+     * done" with exit 0 while nothing was installed. A retry turned a
+     * hard supply-chain failure into a silent success.
+     *
+     * Require what the compile path actually consumes: the unpacked
+     * layout. `now install` and `now_repo_install` both write it, and a
+     * rejected fetch never gets that far. */
     char *descriptor = now_path_join(dep_path, "now.pasta");
-    free(dep_path);
-    if (!descriptor) return 0;
-
-    int exists = now_path_exists(descriptor);
+    int ok = 0;
+    if (descriptor && now_path_exists(descriptor)) {
+        static const char *const payload[] = { "h", "lib", "bin", NULL };
+        for (int i = 0; payload[i] && !ok; i++) {
+            char *d = now_path_join(dep_path, payload[i]);
+            if (d && now_path_exists(d)) ok = 1;
+            free(d);
+        }
+    }
     free(descriptor);
-    return exists;
+    free(dep_path);
+    return ok;
 }
 
 NOW_API int now_registry_resolve(const char *registry_url,
@@ -662,6 +685,35 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         return -1;
     }
 
+    /* --locked refuses *before* doing any work.
+     *
+     * The comparison used to run only at step 4, after every archive had
+     * been fetched, checksummed and signature-checked — so `--locked`
+     * against a drifted descriptor went to the network, downloaded a
+     * dependency the lock file does not name, and then declined to write
+     * the lock. In CI the whole point of the flag is that a disagreement
+     * does nothing at all. Versions the registry has still to settle are
+     * skipped here and caught at step 4. */
+    if (locked) {
+        const char *what = NULL, *which = NULL;
+        if (now_lock_differs(&lock_before, &lockfile, &what, &which)) {
+            if (result) {
+                result->code = NOW_ERR_SCHEMA;
+                snprintf(result->message, sizeof(result->message),
+                         "--locked: resolution does not match now.lock.pasta "
+                         "(%s: %s). Run `now procure` without --locked and "
+                         "commit the updated lock file.",
+                         what ? what : "differs", which ? which : "?");
+            }
+            now_lock_free(&lock_before);
+            now_resolver_free(&resolver);
+            now_lock_free(&lockfile);
+            free(repo_root);
+            free(lock_path);
+            return -1;
+        }
+    }
+
     /* Step 2: registries are now chosen per dependency, because the
      * private-group fence depends on the dep's group. Auth follows the
      * same way — resolved on first use of each registry and cached. */
@@ -832,6 +884,14 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         char archive_name[256];
         snprintf(archive_name, sizeof(archive_name), "%s-%s-%s.basta",
                  entry->artifact, entry->version, ent_triple);
+        /* Which of the candidate names the registry actually served. The
+         * sidecar and the signature belong to *that* file, so they have
+         * to be asked for under the same stem — asking under a different
+         * one is how require_signatures became unsatisfiable against
+         * anything `now publish` uploads. Empty until the archive
+         * resolves. */
+        char served_stem[256];
+        served_stem[0] = '\0';
         char *archive_dest = now_path_join(dep_dir, archive_name);
         if (archive_dest) {
             /* Try, in order: the triple the lock/registry recorded, the
@@ -877,6 +937,13 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                                                 entry->version, cands[ci],
                                                 archive_dest, jwt ? jwt : t,
                                                 result);
+                    if (adl == 0) {
+                        /* Remember the stem without the .basta suffix. */
+                        snprintf(served_stem, sizeof(served_stem), "%s",
+                                 cands[ci]);
+                        char *dot = strrchr(served_stem, '.');
+                        if (dot) *dot = '\0';
+                    }
                 }
                 if (adl == 0) { registry_url = u; jwt = t; reg_locked = 1; }
             }
@@ -893,6 +960,14 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
                     free(desc_dest);
                 }
                 if (sha_dest) {
+                    /* Ask under the stem that served the archive first;
+                     * the recorded triple is often "noarch" for a
+                     * platform build, so the old first guess named a
+                     * file no publisher wrote and the bare fallback
+                     * missed the host-triple form entirely. */
+                    if (served_stem[0])
+                        snprintf(sha_name, sizeof(sha_name), "%s.sha256",
+                                 served_stem);
                     if (now_registry_download(registry_url,
                                               entry->group, entry->artifact,
                                               entry->version, sha_name,
@@ -986,14 +1061,33 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         /* Download .sig if require_signatures is set */
         NowTrustPolicy trust_policy = now_trust_policy_from_project(project);
         if (trust_policy.require_signatures) {
+            /* `now package` writes {artifact}-{version}-{triple}.sig and
+             * `now publish` uploads exactly that. Asking only for the
+             * bare {artifact}-{version}.sig meant require_signatures
+             * could never be satisfied by anything this tool publishes:
+             * a 404, reported as a hard failure, on every dependency.
+             * Ask under the stem that served the archive — the signature
+             * covers that file — and keep the bare name as a fallback
+             * for registries populated by hand. */
             char sig_name[256];
-            snprintf(sig_name, sizeof(sig_name), "%s-%s.sig",
+            char sig_alt[256];
+            if (served_stem[0])
+                snprintf(sig_name, sizeof(sig_name), "%s.sig", served_stem);
+            else
+                snprintf(sig_name, sizeof(sig_name), "%s-%s.sig",
+                         entry->artifact, entry->version);
+            snprintf(sig_alt, sizeof(sig_alt), "%s-%s.sig",
                      entry->artifact, entry->version);
             char *sig_dest = now_path_join(dep_dir, sig_name);
             if (sig_dest) {
                 int sig_rc = now_registry_download(registry_url,
                                       entry->group, entry->artifact,
                                       entry->version, sig_name,
+                                      sig_dest, jwt, result);
+                if (sig_rc != 0 && strcmp(sig_name, sig_alt) != 0)
+                    sig_rc = now_registry_download(registry_url,
+                                      entry->group, entry->artifact,
+                                      entry->version, sig_alt,
                                       sig_dest, jwt, result);
                 if (sig_rc != 0) {
                     if (result) {
@@ -1092,13 +1186,65 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
             }
         }
 
-        /* Build the URL for the lock file */
+        /* Unpack it.
+         *
+         * `now_repo_install()` extracts the .basta into the layout the
+         * compile path reads — <dep>/h for -I and <dep>/lib/<triple> for
+         * -L — and it had no callers at all. So procure downloaded a
+         * dependency, checksummed it, verified its signature, and left
+         * it sitting in the repo as an opaque archive: every registry
+         * dependency compiled with no include path and linked with no
+         * library. Only `now install` (the local, publisher-side path)
+         * ever produced that layout, which is why nobody hit it.
+         *
+         * After verification, never before — unpacking bytes we have not
+         * checked is the one ordering that must not slip. */
+        {
+            char *installed = now_path_join(dep_dir, archive_name);
+            if (installed && now_path_exists(installed)) {
+                NowResult ir;
+                memset(&ir, 0, sizeof(ir));
+                if (now_repo_install(repo_root, entry->group, entry->artifact,
+                                     entry->version, installed, &ir) != 0) {
+                    if (result) {
+                        result->code = NOW_ERR_IO;
+                        snprintf(result->message, sizeof(result->message),
+                                 "cannot unpack %s:%s:%s — %s",
+                                 entry->group, entry->artifact,
+                                 entry->version,
+                                 ir.message[0] ? ir.message : "unknown");
+                    }
+                    free(installed);
+                    free(dep_dir);
+                    now_resolver_free(&resolver);
+                    now_lock_free(&lockfile);
+                    free(repo_root);
+                    free(lock_path);
+                    registry_auth_free(reg_auth, reg_auth_n);
+                    return -1;
+                }
+            }
+            free(installed);
+        }
+
+        /* Build the URL for the lock file.
+         *
+         * It has to name the remote file that was actually served, not
+         * the local one we saved it as — those differ whenever the
+         * recorded triple is not the served triple, and the lock was
+         * recording a URL that 404s. */
         if (!entry->url) {
             char *gpath = group_to_path(entry->group);
             char url_buf[1024];
+            char remote_name[256];
+            if (served_stem[0])
+                snprintf(remote_name, sizeof(remote_name), "%s.basta",
+                         served_stem);
+            else
+                snprintf(remote_name, sizeof(remote_name), "%s", archive_name);
             snprintf(url_buf, sizeof(url_buf), "%s/artifact/%s/%s/%s/%s",
                      registry_url, gpath, entry->artifact,
-                     entry->version, archive_name);
+                     entry->version, remote_name);
             free(gpath);
             entry->url = (char *)malloc(strlen(url_buf) + 1);
             if (entry->url) strcpy(entry->url, url_buf);

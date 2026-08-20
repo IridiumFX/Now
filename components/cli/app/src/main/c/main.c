@@ -1835,5 +1835,11 @@ skip_header:
     }
 
     now_project_free(project);
-    return rc;
+    /* Internal failures are -1, and returning that gives the shell 255
+     * (bash reports 127). A signature that does not verify then exits
+     * with a status CI reads as "the tool is missing", not "the artifact
+     * is forged". Negative means failure and failure is 1; deliberate
+     * positive codes (counts) are left alone. Same normalisation `now
+     * verify` already got. */
+    return rc < 0 ? 1 : rc;
 }
