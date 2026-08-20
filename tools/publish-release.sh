@@ -87,7 +87,7 @@ else
     # exactly who that difference bites.
     LIN_DEPS="$(MSYS_NO_PATHCONV=1 wsl.exe -- \
         ldd /mnt/c/Users/Iridium/Projects/toolkit/now-linux-x64 2>&1 \
-        | sed 's/^[[:space:]]*//; s/ (0x[0-9a-f]*)//' | paste -sd'; ' -)"
+        | sed 's/^[[:space:]]*//; s/ (0x[0-9a-f]*)//' | paste -sd, - | sed 's/,/, /g')"
 fi
 
 echo
@@ -101,7 +101,7 @@ STAMP="$TOOLKIT/now-RELEASE.md"
     printf '|---|---|---|---|\n'
     printf '| Windows x64 | `now.exe` | %s | %s |\n' \
            "$WIN_VER" "$(date -u '+%Y-%m-%d %H:%M UTC')"
-    printf '| Linux x64 (static) | `now-linux-x64` | %s | %s |\n\n' \
+    printf '| Linux x64 | `now-linux-x64` | %s | %s |\n\n' \
            "$LIN_VER" "$(date -u '+%Y-%m-%d %H:%M UTC')"
     printf 'Source revision: `%s`\n\n' "$REV"
     printf -- '- `now.exe` is on the user PATH, so every Windows project on this\n'
