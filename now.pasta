@@ -1,7 +1,7 @@
 {
   group:    "dev.iridium",
   artifact: "now",
-  version:  "1.0.0-rc5",
+  version:  "1.0.0-rc6",
   langs:    ["c"],
   std:      "c11",
   output:   { type: "executable", name: "now" },

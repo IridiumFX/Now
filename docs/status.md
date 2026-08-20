@@ -1,6 +1,6 @@
 # now — v1.0 Release Candidate
 
-**Version**: 1.0.0-rc5
+**Version**: 1.0.0-rc6
 **Date**: 2026-08-12
 **Tests**: 343 passing
 **Languages**: C (production) · C++ (works) · Rust FFI (works) · Go / Java / asm (experimental) · Julia (not yet implemented)
