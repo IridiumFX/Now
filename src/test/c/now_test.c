@@ -3621,6 +3621,19 @@ static void test_lock_differs(void) {
         goto done;
     }
 
+    /* An unresolved version is not drift. The check now runs before the
+     * network as well as after it, and a range still reads as "" at that
+     * point — reporting it would refuse every `--locked` run that uses
+     * one. */
+    now_lock_free(&after); now_lock_init(&after);
+    e.artifact = (char *)"core";
+    e.version  = (char *)"";
+    now_lock_set(&after, &e);
+    if (now_lock_differs(&before, &after, &what, &which)) {
+        FAIL("unresolved version reported as drift");
+        goto done;
+    }
+
     now_lock_free(&before);
     now_lock_free(&after);
     PASS();

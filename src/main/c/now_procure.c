@@ -310,7 +310,12 @@ NOW_API int now_lock_differs(const NowLockFile *before, const NowLockFile *after
             if (which) *which = now_e->artifact;
             return 1;
         }
+        /* An empty version means the registry has not settled it yet.
+         * At step 4 every version is resolved so this never triggers
+         * there; it makes the same function safe to call *before* the
+         * network work, where a range still reads as "". */
         if (now_e->version && was->version &&
+            now_e->version[0] && was->version[0] &&
             strcmp(now_e->version, was->version) != 0) {
             if (what) *what = "changed version";
             if (which) *which = now_e->artifact;
@@ -678,6 +683,35 @@ NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
         free(repo_root);
         free(lock_path);
         return -1;
+    }
+
+    /* --locked refuses *before* doing any work.
+     *
+     * The comparison used to run only at step 4, after every archive had
+     * been fetched, checksummed and signature-checked — so `--locked`
+     * against a drifted descriptor went to the network, downloaded a
+     * dependency the lock file does not name, and then declined to write
+     * the lock. In CI the whole point of the flag is that a disagreement
+     * does nothing at all. Versions the registry has still to settle are
+     * skipped here and caught at step 4. */
+    if (locked) {
+        const char *what = NULL, *which = NULL;
+        if (now_lock_differs(&lock_before, &lockfile, &what, &which)) {
+            if (result) {
+                result->code = NOW_ERR_SCHEMA;
+                snprintf(result->message, sizeof(result->message),
+                         "--locked: resolution does not match now.lock.pasta "
+                         "(%s: %s). Run `now procure` without --locked and "
+                         "commit the updated lock file.",
+                         what ? what : "differs", which ? which : "?");
+            }
+            now_lock_free(&lock_before);
+            now_resolver_free(&resolver);
+            now_lock_free(&lockfile);
+            free(repo_root);
+            free(lock_path);
+            return -1;
+        }
     }
 
     /* Step 2: registries are now chosen per dependency, because the
