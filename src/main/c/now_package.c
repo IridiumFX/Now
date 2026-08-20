@@ -293,7 +293,23 @@ NOW_API int now_package(const NowProject *project, const char *basedir,
         char out_file[256];
         if (strcmp(out_type, "static") == 0) {
 #ifdef _WIN32
-            snprintf(out_file, sizeof(out_file), "%s.lib", out_name);
+            /* "Windows" is not "MSVC". The bundled toolchain is MinGW
+             * gcc/ar and links lib<name>.a, so naming the artifact
+             * <name>.lib asked for a file the linker never wrote — and
+             * the whole @files section came out empty while `now
+             * package` still reported success. Take whichever the
+             * toolchain actually produced. */
+            snprintf(out_file, sizeof(out_file), "lib%s.a", out_name);
+            {
+                char *probe_dir = now_path_join(basedir, "target/bin");
+                if (probe_dir) {
+                    char *probe = now_path_join(probe_dir, out_file);
+                    if (probe && !now_path_exists(probe))
+                        snprintf(out_file, sizeof(out_file), "%s.lib", out_name);
+                    free(probe);
+                    free(probe_dir);
+                }
+            }
 #else
             snprintf(out_file, sizeof(out_file), "lib%s.a", out_name);
 #endif
@@ -319,6 +335,24 @@ NOW_API int now_package(const NowProject *project, const char *basedir,
         if (bin_dir) {
             char *out_path = now_path_join(bin_dir, out_file);
             if (out_path) {
+                /* add_file_blob skips a file it cannot read, so a wrong
+                 * name produced an archive with no binary in it and a
+                 * "packaged" line on stdout. Anything but header-only
+                 * has to carry its output or the package is not one. */
+                if (!is_header_only && !now_path_exists(out_path)) {
+                    if (result) {
+                        result->code = NOW_ERR_IO;
+                        snprintf(result->message, sizeof(result->message),
+                                 "build output %s not found in target/bin "
+                                 "— nothing to package for output type '%s'",
+                                 out_file, out_type);
+                    }
+                    free(out_path);
+                    free(bin_dir);
+                    basta_free(files);
+                    basta_free(root);
+                    return -1;
+                }
                 add_file_blob(files, out_file, out_path);
                 free(out_path);
             }
@@ -1026,6 +1060,34 @@ NOW_API int now_publish(const NowProject *project, const char *basedir,
             }
         }
         free(sig_path);
+    }
+
+    /* 4. PUT the .sha256 sidecar.
+     *
+     * `now package` has always written one and publish never uploaded
+     * it, so procure's sidecar check found nothing to compare against on
+     * every fetch and silently passed. An integrity check that is
+     * skipped whenever the file is absent needs the file to be there. */
+    if (errors == 0) {
+        char sha_name[512];
+        snprintf(sha_name, sizeof(sha_name), "%s-%s-%s.sha256",
+                 artifact, version, arch_str);
+        char *sha_path = now_path_join(pkg_dir, sha_name);
+        if (sha_path && now_path_exists(sha_path)) {
+            size_t sha_len;
+            char *sha_data = pkg_read_file(sha_path, &sha_len);
+            if (sha_data) {
+                char rel[512];
+                snprintf(rel, sizeof(rel), "%s/%s/%s/%s",
+                         group_path, artifact, version, sha_name);
+                rc = publish_put(host, port, prefix, rel,
+                                 sha_data, sha_len, "text/plain",
+                                 token, tls, verbose, result);
+                free(sha_data);
+                if (rc != 0) errors++;
+            }
+        }
+        free(sha_path);
     }
 
     free(basta_path);

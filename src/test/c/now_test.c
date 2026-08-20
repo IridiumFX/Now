@@ -2588,6 +2588,45 @@ static void test_repo_dep_path(void) {
     PASS();
 }
 
+/* A rejected fetch leaves the descriptor behind — it is downloaded
+ * before the checksum and the signature are checked. If that alone
+ * counted as installed, the next `procure` skipped every check and
+ * reported success with nothing installed. */
+static void test_repo_is_installed_needs_payload(void) {
+    TEST("procure: descriptor alone is not an install");
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo_installed", NOW_TEST_RESOURCES);
+    rmtree_best_effort(root);
+
+    char *dep = now_repo_dep_path(root, "org.acme", "core", "1.5.0");
+    if (!dep) { FAIL("dep path"); return; }
+    now_mkdir_p(dep);
+
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/now.pasta", dep);
+    FILE *f = fopen(p, "w");
+    if (!f) { FAIL("setup now.pasta"); free(dep); return; }
+    fputs("{ group: \"org.acme\", artifact: \"core\", version: \"1.5.0\" }\n", f);
+    fclose(f);
+
+    if (now_repo_is_installed(root, "org.acme", "core", "1.5.0")) {
+        FAIL("descriptor without payload counted as installed");
+        free(dep); return;
+    }
+
+    /* Unpacked headers are what the compile path consumes. */
+    snprintf(p, sizeof(p), "%s/h", dep);
+    now_mkdir_p(p);
+    if (!now_repo_is_installed(root, "org.acme", "core", "1.5.0")) {
+        FAIL("descriptor plus h/ should count as installed");
+        free(dep); return;
+    }
+
+    free(dep);
+    rmtree_best_effort(root);
+    PASS();
+}
+
 static void test_procure_no_deps(void) {
     TEST("procure: no deps returns success");
     /* A project with no dependencies should succeed immediately */
@@ -6836,6 +6875,39 @@ static void test_ed25519_sign_verify_lengths(void) {
     PASS();
 }
 
+/* S + L passes the group equation exactly as S does, so a verifier that
+ * skips the canonicality check gives one message two valid signatures. */
+static void test_ed25519_reject_non_canonical_s(void) {
+    TEST("ed25519: reject non-canonical S (S + L)");
+    /* Group order L, little-endian, same constant the verifier compares
+     * against. */
+    static const unsigned char order[32] = {
+        0xed,0xd3,0xf5,0x5c,0x1a,0x63,0x12,0x58,
+        0xd6,0x9c,0xf7,0xa2,0xde,0xf9,0xde,0x14,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x10 };
+    unsigned char pub[32], sig[64];
+    hex_to_bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+                 pub, 32);
+    hex_to_bytes("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+                 sig, 64);
+    /* Sanity: the untouched signature is the valid one. */
+    if (now_ed25519_verify(sig, (const unsigned char *)"", 0, pub) != 0) {
+        FAIL("baseline signature should verify"); return;
+    }
+    /* S := S + L, little-endian, carrying by hand. */
+    unsigned int carry = 0;
+    for (int i = 0; i < 32; i++) {
+        carry += (unsigned int)sig[32 + i] + order[i];
+        sig[32 + i] = (unsigned char)(carry & 0xff);
+        carry >>= 8;
+    }
+    if (now_ed25519_verify(sig, (const unsigned char *)"", 0, pub) == 0) {
+        FAIL("should reject S >= L"); return;
+    }
+    PASS();
+}
+
 static void test_ed25519_null_safety(void) {
     TEST("ed25519: null safety");
     if (now_ed25519_verify(NULL, NULL, 0, NULL) == 0) { FAIL("should reject NULL"); return; }
@@ -7529,6 +7601,7 @@ int main(void) {
 
     printf("\n  Procure:\n");
     test_repo_dep_path();
+    test_repo_is_installed_needs_payload();
     test_procure_no_deps();
 
     printf("\n  Parallel build:\n");
@@ -7641,6 +7714,7 @@ int main(void) {
     test_ed25519_sign_rfc8032_3();
     test_ed25519_sign_known_answer_9();
     test_ed25519_sign_verify_lengths();
+    test_ed25519_reject_non_canonical_s();
     test_ed25519_null_safety();
 
     printf("\n  Advisory guards:\n");

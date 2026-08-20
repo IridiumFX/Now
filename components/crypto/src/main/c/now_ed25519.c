@@ -885,6 +885,20 @@ NOW_API int now_ed25519_verify(const unsigned char *sig,
                                 const unsigned char *pub_key) {
     if (!sig || !msg || !pub_key) return -1;
 
+    /* RFC 8032 §5.1.7: reject S >= L before doing any group arithmetic.
+     * S + L satisfies the same verification equation as S, so without
+     * this check one message has many valid 64-byte signatures — and a
+     * registry that keys anything off the signature bytes (dedup, an
+     * audit trail, a revocation list) can be handed two spellings of
+     * one publish. */
+    {
+        int below = 0;
+        for (int i = 31; i >= 0; i--) {
+            if (sig[32 + i] != L[i]) { below = sig[32 + i] < L[i]; break; }
+        }
+        if (!below) return -1;
+    }
+
     /* Decode the public key point A */
     ge A;
     if (ge_frombytes(&A, pub_key) != 0) return -1;
