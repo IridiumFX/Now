@@ -15,8 +15,9 @@
 #
 #   toolkit/now.exe          Windows x64, on the user PATH — what every
 #                            Windows project here gets by default
-#   toolkit/now-linux-x64    Linux x64, static — copy it wherever you
-#                            want it; it depends on nothing
+#   toolkit/now-linux-x64    Linux x64 — copy it wherever you want it.
+#                            Links no project or vendored library; needs
+#                            a glibc, and the script records which.
 #   toolkit/now-RELEASE.md   what the two are, and when
 #
 # Publishing is deliberately NOT installing into anyone's environment.
@@ -66,6 +67,7 @@ if ! command -v wsl.exe >/dev/null 2>&1; then
     say "wsl.exe not found — skipping the Linux binary"
     say "the Windows binary above is published; re-run where WSL exists"
     LIN_VER="(not built: no WSL on this host)"
+    LIN_DEPS="(not built)"
 else
     # NOW_WSL_NAME keeps it from colliding with now.exe; NOW_WSL_NO_PATH
     # stops the peer-install script from putting a publication directory
@@ -79,6 +81,13 @@ else
     [ -f "$TOOLKIT/now-linux-x64" ] || die "no now-linux-x64 in $TOOLKIT"
     LIN_VER="$(MSYS_NO_PATHCONV=1 wsl.exe -- \
         /mnt/c/Users/Iridium/Projects/toolkit/now-linux-x64 version 2>&1)"
+    # Record what it actually links against instead of asserting it. The
+    # first version of this file claimed "static, depends on nothing";
+    # `ldd` says glibc, and a peer copying it onto an older distro is
+    # exactly who that difference bites.
+    LIN_DEPS="$(MSYS_NO_PATHCONV=1 wsl.exe -- \
+        ldd /mnt/c/Users/Iridium/Projects/toolkit/now-linux-x64 2>&1 \
+        | sed 's/^[[:space:]]*//; s/ (0x[0-9a-f]*)//' | paste -sd'; ' -)"
 fi
 
 echo
@@ -98,8 +107,11 @@ STAMP="$TOOLKIT/now-RELEASE.md"
     printf -- '- `now.exe` is on the user PATH, so every Windows project on this\n'
     printf -- '  machine picks it up with no action. If you depend on that, the\n'
     printf -- '  version above is what you now have.\n'
-    printf -- '- `now-linux-x64` is static and depends on nothing. Copy it where\n'
-    printf -- '  you want it; nothing here installs into your environment.\n'
+    printf -- '- `now-linux-x64` links no project or vendored library — copy the\n'
+    printf -- '  one file. It is not fully static: it needs a glibc. Measured on\n'
+    printf -- '  the build host: `%s`\n' "$LIN_DEPS"
+    printf -- '- Nothing here installs into your environment. Take it when it\n'
+    printf -- '  suits you, not when we happen to build it.\n'
     printf -- '- A Windows `now.exe` cannot drive a toolchain that only exists on\n'
     printf -- '  the Linux side. If you cross-compile under WSL, the Linux binary\n'
     printf -- '  is the one you need.\n'
