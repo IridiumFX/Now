@@ -57,13 +57,34 @@ now test  -j 32
 ```
 
 CMake + Ninja is the canonical build (CI uses it); `now build` is the
-self-host path. A prebuilt bootstrap sits at `build/static/bin/now.exe`
-for when `target/bin/now.exe` is missing or broken.
+self-host path. The presets build into `build/{presetName}`, so it is
+`--build --preset`, not `--build build`:
+
+```
+cmake --preset default && cmake --build --preset default -j 32
+./build/default/bin/now_test.exe
+```
+
+`cmake --build build` targeted a pre-relocation cache at `build/` and
+failed with *"CMakeCache.txt directory is different"*, which reads like
+a corrupted checkout. That cache is gone, along with the ones under
+`build/clang`, `build/winci`, `build/apennines` and `build/static`.
+
+A prebuilt bootstrap sits at `build/static/bin/now.exe` for when
+`target/bin/now.exe` is missing or broken — **use it to build, never to
+`now test`.** It is from May and predates rc6, so it passes neither
+`compile.defines` nor `compile.warnings` to the test compile: the suite
+then builds `now_test.c` without `NOW_STATIC` and the link dies on a
+page of `__imp_` thunks that has nothing to do with whatever you just
+changed. Build with the bootstrap because `now` cannot relink the binary
+it is running; test with `target/bin/now.exe`.
 
 **Build both ways before believing a build works.** They disagree
 regularly — CMake uses explicit source lists while `now build` walks the
 tree, so a source added to a vendored lib links fine under one and dies
-on an undefined reference under the other. Four instances in three days.
+on an undefined reference under the other. Five instances now: cookbook
+had been missing the vendored `tcp_resolve.c` from its CMake list since
+the file appeared.
 
 ## Installing
 
@@ -176,6 +197,14 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   before believing anything about publish/procure. Fresh name per run:
   a re-published coordinate keeps the old artifact and each run makes a
   new signing key, which reads exactly like a signature defect.
+- **Register the publisher key before publishing, not after.** cookbook
+  verifies a `.sig` against the keys registered for its group, so the
+  moment *any* key exists for a group, a publisher whose key it has
+  never seen is refused. `now keys:register [--registry URL] [--group G]`
+  sends it; both flags default to the `now.pasta` in the directory. This
+  is not hypothetical — the round trip registered a key at step 11 and
+  the next run's step 3 started failing, because the registry remembered
+  and the new run had a new key.
 - **Crypto comes from apennines.** `now_ed25519.c` is a thin surface
   over `t2/crypto/ec.c`. Do not reintroduce a second implementation of a
   primitive — the one nobody cross-checks is the one that is wrong.

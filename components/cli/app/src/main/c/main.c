@@ -195,6 +195,7 @@ static void usage(void) {
         "  keygen       Generate a publisher signing keypair\n"
         "  trust:list   List trusted keys\n"
         "  trust:add    Add key: trust:add <scope> <key> [comment]\n"
+        "  keys:register Register your signing key with a registry\n"
         "  verify       Verify archive signature\n"
         "  reproducible:check  Build twice and compare output hashes\n"
         "  advisory:check      Check deps against advisory database\n"
@@ -934,9 +935,13 @@ skip_header:
         char *pub_b64 = now_b64_encode(pub, sizeof(pub));
         printf("signing key written to %s\n", key_path);
         printf("public key: %s\n", pub_b64 ? pub_b64 : "(encode failed)");
-        printf("\nPublishers keep the private key. Consumers add the public\n"
-               "half to their trust store:\n\n");
-        printf("  now trust:add \"<group>\" %s \"publisher key\"\n",
+        printf("\nPublishers keep the private key. Two places want the\n"
+               "public half, and they are not the same place:\n\n");
+        printf("  now keys:register --registry URL --group <group>\n"
+               "      tells the registry which key signs for that group,\n"
+               "      so it can refuse a signature that does not match\n\n");
+        printf("  now trust:add \"<group>\" %s \"publisher key\"\n"
+               "      tells a CONSUMER to trust it, so procure can verify\n",
                pub_b64 ? pub_b64 : "<pubkey>");
         free(pub_b64);
         free(key_path);
@@ -1165,6 +1170,62 @@ skip_header:
         now_project_free(imported);
         free(pom_path);
         return rc;
+    }
+
+    /* keys:register wants a project for its defaults but does not need
+     * one, so it sits between the project-free commands and the ones
+     * that fail without a descriptor. */
+    if (strcmp(phase, "keys:register") == 0) {
+        /* Registering the public key is what makes a publisher
+         * signature checkable at all: the registry verifies a .sig
+         * against the keys registered for its group, and until this
+         * existed there was no way to get one there short of writing
+         * the JSON by hand — so the table was empty everywhere and
+         * every signature stored was one nobody could check. */
+        const char *reg = repo_url;
+        const char *grp = NULL, *kid = NULL, *note = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--registry") == 0 && i + 1 < argc)
+                reg = argv[++i];
+            else if (strcmp(argv[i], "--group") == 0 && i + 1 < argc)
+                grp = argv[++i];
+            else if (strcmp(argv[i], "--key-id") == 0 && i + 1 < argc)
+                kid = argv[++i];
+            else if (strcmp(argv[i], "--comment") == 0 && i + 1 < argc)
+                note = argv[++i];
+        }
+
+        NowProject *kproj = NULL;
+        char *kdesc = now_path_join(cwd, "now.pasta");
+        if (kdesc && now_path_exists(kdesc)) {
+            NowResult lr;
+            memset(&lr, 0, sizeof(lr));
+            kproj = now_project_load(kdesc, &lr);
+        }
+        free(kdesc);
+        if (kproj) {
+            if (!grp) grp = kproj->group;
+            if (!reg && kproj->repos.count > 0)
+                reg = kproj->repos.items[0].url;
+        }
+
+        if (!reg || !grp) {
+            fprintf(stderr,
+                "error: keys:register needs a registry and a group\n"
+                "usage: now keys:register [--registry URL] [--group GROUP]\n"
+                "                         [--key-id ID] [--comment TEXT]\n"
+                "       both default to the now.pasta in this directory\n");
+            now_project_free(kproj);
+            return 1;
+        }
+
+        NowResult kres;
+        memset(&kres, 0, sizeof(kres));
+        int krc = now_keys_register(reg, grp, kid, note, verbose, &kres);
+        if (krc != 0)
+            fprintf(stderr, "error: %s\n", kres.message);
+        now_project_free(kproj);
+        return krc == 0 ? 0 : 1;
     }
 
     /* Find now.pasta in current directory */

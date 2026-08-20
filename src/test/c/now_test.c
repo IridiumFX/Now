@@ -1738,6 +1738,102 @@ static void test_build_warnings_reach_test_compile(void) {
     PASS();
 }
 
+/* In mode=each, the per-file binary must be named after the source that
+ * produced it — not after whatever sits at the same index in the
+ * unfiltered source list.
+ *
+ * Found in cookbook, which excludes one stress driver that sorts before
+ * its unit tests: `now test` compiled cookbook_test.c, wrote the binary
+ * as target/test/bin/cookbook_stress.exe, and reported the failure
+ * against a file it had never compiled. Two test sources with an
+ * exclusion on the one that sorts first is the smallest reproduction. */
+static void test_build_each_names_binaries_by_source(void) {
+    TEST("build: mode=each names each binary after its own source");
+
+    char root[512], d[512], p[512];
+    snprintf(root, sizeof(root), "%s/eachname_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+    snprintf(d, sizeof(d), "%s/src/test/c", root); now_mkdir_p(d);
+
+    FILE *fp;
+    snprintf(p, sizeof(p), "%s/src/main/c/lib.c", root);
+    fp = fopen(p, "wb");
+    if (!fp) { FAIL("cannot write lib.c"); return; }
+    fputs("int lib_val(void) { return 7; }\n", fp);
+    fclose(fp);
+
+    /* Sorts first and is excluded. The #error makes the exclusion
+     * two-sided: if it were ever compiled the build would fail here
+     * rather than quietly producing a misnamed binary. */
+    snprintf(p, sizeof(p), "%s/src/test/c/aaa_driver.c", root);
+    fp = fopen(p, "wb");
+    if (!fp) { FAIL("cannot write aaa_driver.c"); return; }
+    fputs("#error this driver should have been excluded\n", fp);
+    fclose(fp);
+
+    snprintf(p, sizeof(p), "%s/src/test/c/zzz_unit.c", root);
+    fp = fopen(p, "wb");
+    if (!fp) { FAIL("cannot write zzz_unit.c"); return; }
+    fputs("int lib_val(void);\n"
+          "int main(void) { return lib_val() == 7 ? 0 : 1; }\n", fp);
+    fclose(fp);
+
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"en\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"en\" },"
+        "  tests: { dir: \"src/test/c\", mode: \"each\","
+        "           exclude: [\"aaa_driver.c\"] } }";
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+    NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+
+    NowBuildCtx ctx;
+    if (now_build_init(&ctx, prj, root, &res) != 0) {
+        FAIL(res.message); now_project_free(prj); return;
+    }
+    if (now_build_compile(&ctx, &res) != 0) {
+        FAIL(res.message); now_build_free(&ctx); now_project_free(prj); return;
+    }
+    if (now_build_link(&ctx, &res) != 0) {
+        FAIL(res.message); now_build_free(&ctx); now_project_free(prj); return;
+    }
+    int trc = now_build_test(&ctx, &res);
+    now_build_free(&ctx);
+    now_project_free(prj);
+
+    if (trc != 0) { FAIL(res.message); return; }
+
+#ifdef _WIN32
+    const char *xsuf = ".exe";
+#else
+    const char *xsuf = "";
+#endif
+    char kept[512], ghost[512];
+    snprintf(kept,  sizeof(kept),  "%s/target/test/bin/zzz_unit%s",   root, xsuf);
+    snprintf(ghost, sizeof(ghost), "%s/target/test/bin/aaa_driver%s", root, xsuf);
+
+    int kept_ok  = now_path_exists(kept);
+    int ghost_no = !now_path_exists(ghost);
+
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+
+    if (!kept_ok) {
+        FAIL("binary for zzz_unit.c was not written under its own name");
+        return;
+    }
+    if (!ghost_no) {
+        FAIL("a binary was named after the excluded source");
+        return;
+    }
+    PASS();
+}
+
 static void test_build_java_hello(void) {
     TEST("build: compile and package Java project");
 
@@ -7957,6 +8053,7 @@ int main(void) {
     test_build_pattern_filter();
     test_build_include_only_module();
     test_build_warnings_reach_test_compile();
+    test_build_each_names_binaries_by_source();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 

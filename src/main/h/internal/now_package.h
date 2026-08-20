@@ -42,6 +42,22 @@ NOW_API int now_install(const NowProject *project, const char *basedir,
 NOW_API int now_publish(const NowProject *project, const char *basedir,
                         const char *repo_url, int verbose, NowResult *result);
 
+/* Register this machine's publisher public key with a registry.
+ *
+ * POSTs {key_id, group_id, public_key, comment} to /keys. The key is
+ * the public half of ~/.now/signing.key (or $NOW_SIGNING_KEY), base64
+ * as `now keygen` prints it. key_id and comment may be NULL — key_id
+ * then defaults to the first 16 hex digits of the key itself, which is
+ * unique per key and says what it is.
+ *
+ * Without this there was no way to get a key to a registry short of
+ * hand-writing the JSON, so cookbook's publisher_keys table was empty
+ * everywhere and every signature it stored was unverifiable.
+ * Returns 0 on success. */
+NOW_API int now_keys_register(const char *registry_url, const char *group,
+                               const char *key_id, const char *comment,
+                               int verbose, NowResult *result);
+
 /* Yank a published artifact version.
  * POSTs to /artifact/{g}/{a}/{v}/{file}/yank with optional reason.
  * Returns 0 on success. */

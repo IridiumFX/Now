@@ -4073,6 +4073,17 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
     /* Compile test sources */
     NowFileList test_objects;
     now_filelist_init(&test_objects);
+    /* The source each object came from, pushed in lockstep with it.
+     *
+     * mode=each used to name the per-file binary from
+     * test_sources.paths[t] while t indexed test_objects — and the two
+     * lists diverge the moment anything is skipped, whether by
+     * tests.exclude or by a file the language classifier does not claim.
+     * cookbook, with one excluded stress driver, built its unit tests
+     * into target/test/bin/cookbook_stress.exe and reported the failure
+     * against a file that had never been compiled. */
+    NowFileList test_object_srcs;
+    now_filelist_init(&test_object_srcs);
     int errors = 0;
     char *test_flags_key = NULL;   /* lazily built; see the sidecar below */
 
@@ -4185,6 +4196,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                 if (ctx->verbose)
                     fprintf(stderr, "  test compile: %s (up to date)\n", src);
                 now_filelist_push(&test_objects, obj);
+                now_filelist_push(&test_object_srcs, src);
                 free(obj);
                 free(tflags_sidecar);
                 continue;
@@ -4546,6 +4558,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         free(tflags_sidecar);
 
         now_filelist_push(&test_objects, obj);
+        now_filelist_push(&test_object_srcs, src);
         free(obj);
     }
     free(test_flags_key);
@@ -4560,12 +4573,14 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
 
     if (errors) {
         now_filelist_free(&test_objects);
+        now_filelist_free(&test_object_srcs);
         now_filelist_free(&test_sources);
         return -1;
     }
 
     if (test_objects.count == 0) {
         now_filelist_free(&test_objects);
+        now_filelist_free(&test_object_srcs);
         now_filelist_free(&test_sources);
         if (result) {
             result->code = NOW_OK;
@@ -4599,8 +4614,10 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
             int pass = 0, fail = 0;
 
             for (size_t t = 0; t < test_objects.count; t++) {
-                /* Derive test name from the source filename basename. */
-                const char *src = test_sources.paths[t];
+                /* Derive the test name from the source that produced
+                 * THIS object, not from test_sources[t] — see the
+                 * comment on test_object_srcs. */
+                const char *src = test_object_srcs.paths[t];
                 const char *base = strrchr(src, '/');
                 if (!base) base = strrchr(src, '\\');
                 base = base ? base + 1 : src;
@@ -4749,6 +4766,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
 
             free(test_bin_dir);
             now_filelist_free(&test_objects);
+            now_filelist_free(&test_object_srcs);
             now_filelist_free(&test_sources);
 
             if (fail > 0) {
@@ -4767,6 +4785,7 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
     /* Single-binary mode (default): link everything together, run once.
      * test_sources is no longer needed past this point. */
     now_filelist_free(&test_sources);
+    now_filelist_free(&test_object_srcs);
 
     /* Link test binary: test objects + production objects */
     char *test_bin_dir = now_path_join(basedir, "target/bin");
