@@ -116,6 +116,15 @@ STAMP="$TOOLKIT/now-RELEASE.md"
     printf -- '  the Linux side. If you cross-compile under WSL, the Linux binary\n'
     printf -- '  is the one you need.\n'
     printf -- '- Announcements go to `~/.claude/mailbox/topic-infra-releases.md`.\n'
+    printf -- '\n'
+    printf -- '## After you upgrade\n'
+    printf -- '\n'
+    printf -- '**The first build still reports the old rebuild count. Do not read\n'
+    printf -- 'it as a failure.** Every release self-heals in one build — the\n'
+    printf -- 'manifest is rewritten as it goes — and the *second* build is the one\n'
+    printf -- 'that tells you the truth. Amy asked for this line in writing after\n'
+    printf -- 'watching the natural response be to reach for `rm -rf target`, which\n'
+    printf -- 'is exactly the habit the incremental work exists to remove.\n'
 } > "$STAMP"
 say "wrote $STAMP"
 
