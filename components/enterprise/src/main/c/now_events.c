@@ -110,6 +110,20 @@ static size_t json_escape(char *out, size_t cap, const char *in) {
     return o;
 }
 
+/* Back a byte offset off any UTF-8 continuation bytes, so shortening
+ * `detail` cannot cut a character in half.
+ *
+ * Not reachable on the Pasta path today — the """ form escapes nothing,
+ * so a 767-byte detail plus the envelope stays under the datagram limit
+ * and the shortening loop never runs. It is reachable on the JSON path,
+ * where escape-heavy content expands past the limit, and a half
+ * character on the wire is the kind of thing that is discovered by a
+ * consumer six months later rather than by us. */
+static size_t utf8_back_off(const char *s, size_t n) {
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    return n;
+}
+
 /* One attempt at the whole object with `detail` already cut to
  * detail_len bytes. Returns bytes written, 0 if it does not fit. */
 static size_t encode_attempt(char *out, size_t cap, const NowEvent *ev,
@@ -125,6 +139,7 @@ static size_t encode_attempt(char *out, size_t cap, const NowEvent *ev,
 
     if (ev->detail[0]) {
         if (detail_len >= sizeof(cut)) detail_len = sizeof(cut) - 1;
+        detail_len = utf8_back_off(ev->detail, detail_len);
         memcpy(cut, ev->detail, detail_len);
         cut[detail_len] = '\0';
         if (json_escape(esc_detail, sizeof(esc_detail), cut) == (size_t)-1)
@@ -467,6 +482,7 @@ static size_t encode_pasta_attempt(char *out, size_t cap, const NowEvent *ev,
 
     if (ev->detail[0]) {
         if (detail_len >= sizeof(cut)) detail_len = sizeof(cut) - 1;
+        detail_len = utf8_back_off(ev->detail, detail_len);
         memcpy(cut, ev->detail, detail_len);
         cut[detail_len] = '\0';
         if (pasta_escape_free_text(det, sizeof(det), cut, &lossy) == (size_t)-1)
