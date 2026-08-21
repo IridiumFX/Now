@@ -2390,6 +2390,129 @@ static void test_pasta_writer_output_always_reparses(void) {
     PASS();
 }
 
+/* Does `hay` contain `needle` anywhere in its bytes? Archives store
+ * member names as plain text in the member headers, so this is enough to
+ * ask what is in one without shelling out to `ar t`. */
+static int file_contains_bytes(const char *path, const char *needle) {
+    FILE *fp = fopen(path, "rb");
+    char *buf;
+    long sz;
+    int found = 0;
+    size_t n;
+
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return 0; }
+    buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(fp); return -1; }
+    n = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    {
+        size_t nlen = strlen(needle), i;
+        for (i = 0; i + nlen <= n; i++)
+            if (memcmp(buf + i, needle, nlen) == 0) { found = 1; break; }
+    }
+    free(buf);
+    return found;
+}
+
+/* A source that goes away must not leave its object in the archive.
+ *
+ * Amy, 2026-08-21: `git mv` a source to another module and the old
+ * module's archive was relinked around the orphaned object, so the final
+ * link died on duplicate symbols for functions that exist in exactly one
+ * file on disk.
+ *
+ * The cause was `ar r`, which inserts or replaces the members it is
+ * given and leaves the rest — so the archive accumulated rather than
+ * being a product of the current object list. Note what this test does
+ * NOT need: no header changes, no stale timestamps, nothing about the
+ * object is out of date. That is why the dependency graph could not see
+ * it, and why this needs a test of its own. */
+static void test_build_archive_drops_a_removed_source(void) {
+    TEST("build: a source that goes away leaves the archive");
+
+    char root[512], d[512], p[512], lib[512];
+    snprintf(root, sizeof(root), "%s/stale_obj_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+
+    FILE *fp;
+    snprintf(p, sizeof(p), "%s/src/main/c/keep.c", root);
+    fp = fopen(p, "wb");
+    if (!fp) { FAIL("cannot write keep.c"); return; }
+    fputs("int keep_me(void) { return 1; }\n", fp);
+    fclose(fp);
+
+    char mover[512];
+    snprintf(mover, sizeof(mover), "%s/src/main/c/mover.c", root);
+    fp = fopen(mover, "wb");
+    if (!fp) { FAIL("cannot write mover.c"); return; }
+    fputs("int moves_away(void) { return 2; }\n", fp);
+    fclose(fp);
+
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"stale\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"stale\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    /* First build: both objects, both archived. */
+    {
+        NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+        ASSERT_NOT_NULL(prj);
+        if (now_build(prj, root, 0, 0, &res) != 0) {
+            FAIL(res.message); now_project_free(prj); return;
+        }
+        now_project_free(prj);
+    }
+
+#ifdef _WIN32
+    snprintf(lib, sizeof(lib), "%s/target/bin/libstale.a", root);
+#else
+    snprintf(lib, sizeof(lib), "%s/target/bin/libstale.a", root);
+#endif
+    if (file_contains_bytes(lib, "mover") != 1) {
+        FAIL("setup: mover.c.o was not in the first archive");
+        return;
+    }
+
+    /* The source moves away. Nothing else changes — no header edits, no
+     * touched timestamps. */
+    remove(mover);
+
+    {
+        NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+        ASSERT_NOT_NULL(prj);
+        if (now_build(prj, root, 0, 0, &res) != 0) {
+            FAIL(res.message); now_project_free(prj); return;
+        }
+        now_project_free(prj);
+    }
+
+    {
+        int still_there = file_contains_bytes(lib, "mover");
+        int keep_there  = file_contains_bytes(lib, "keep");
+
+        snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+        snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+
+        if (keep_there != 1) { FAIL("the surviving object left the archive too"); return; }
+        if (still_there != 0) {
+            FAIL("the removed source's object is still in the archive");
+            return;
+        }
+    }
+    PASS();
+}
+
 static void test_build_java_hello(void) {
     TEST("build: compile and package Java project");
 
@@ -8679,6 +8802,7 @@ int main(void) {
     test_build_include_only_module();
     test_build_warnings_reach_test_compile();
     test_build_each_names_binaries_by_source();
+    test_build_archive_drops_a_removed_source();
     test_events_encode_decode_roundtrip();
     test_events_detail_survives_escaping();
     test_events_oversize_detail_is_truncated_not_dropped();

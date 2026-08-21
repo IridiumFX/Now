@@ -3694,7 +3694,18 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
     if (ctx->toolchain.is_msvc) {
         /* ---- MSVC link path ---- */
         if (is_static) {
-            /* Static library: lib.exe /OUT:file obj... */
+            /* Static library: lib.exe /OUT:file obj...
+             *
+             * `lib.exe /OUT:` is documented to create a new library
+             * rather than update one, so this should already be safe —
+             * but there is no MSVC on the machine this was found on, and
+             * the same accumulation bug on the `ar` path was invisible
+             * until someone moved a file. Deleting first costs nothing
+             * and makes the guarantee the same on both toolchains
+             * instead of resting on a manual page nobody here can
+             * exercise. */
+            remove(out_file);
+
             size_t need = ctx->objects.count + 8;
             const char **argv = (const char **)malloc(need * sizeof(char *));
             if (!argv) return -1;
@@ -3817,7 +3828,26 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
         }
 
         if (is_static) {
-            /* Static library: ar rcs */
+            /* Static library: ar rcs
+             *
+             * Delete it first. `ar r` INSERTS OR REPLACES the members it
+             * is given and leaves every other member alone, so an
+             * archive is not a product of the current object list — it
+             * accumulates. Move a source to another module and its
+             * object stays in the old archive for ever, and the build
+             * fails at the final link with duplicate symbols naming two
+             * archives, for a function that exists in exactly one file
+             * on disk. Reported by Amy 2026-08-21 after a `git mv`.
+             *
+             * Measured: with the archive deleted first, the same tree
+             * produces an archive containing only the current objects —
+             * so `ctx->objects` was right all along and the archive was
+             * the thing holding the past. This is also the one failure
+             * in this family a header-dependency graph cannot catch:
+             * nothing about that object is stale, it simply should not
+             * be in the list. */
+            remove(out_file);
+
             size_t need = ctx->objects.count + 8;
             const char **argv = (const char **)malloc(need * sizeof(char *));
             if (!argv) return -1;
