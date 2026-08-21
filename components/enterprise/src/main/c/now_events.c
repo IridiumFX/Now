@@ -113,12 +113,16 @@ static size_t json_escape(char *out, size_t cap, const char *in) {
 /* Back a byte offset off any UTF-8 continuation bytes, so shortening
  * `detail` cannot cut a character in half.
  *
- * Not reachable on the Pasta path today — the """ form escapes nothing,
- * so a 767-byte detail plus the envelope stays under the datagram limit
- * and the shortening loop never runs. It is reachable on the JSON path,
- * where escape-heavy content expands past the limit, and a half
+ * Reachable on both paths: a full-length detail plus a full-length
+ * module and project overruns the datagram on the Basta path, and
+ * escape-heavy content does it on its own on the JSON path. A half
  * character on the wire is the kind of thing that is discovered by a
- * consumer six months later rather than by us. */
+ * consumer six months later rather than by us.
+ *
+ * On the Basta path this is a courtesy rather than a requirement — a
+ * blob has a byte count and would carry half a character without
+ * complaint. It is whoever renders the bytes who would see a broken
+ * one. */
 static size_t utf8_back_off(const char *s, size_t n) {
     while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
     return n;
@@ -358,10 +362,10 @@ NOW_API int now_event_decode_json(NowEvent *ev, const char *json, size_t len) {
 }
 
 NOW_API int now_event_decode(NowEvent *ev, const char *buf, size_t len) {
-    /* Pasta first, because it is the default on the wire. The two are
+    /* Basta first, because it is the default on the wire. The two are
      * mutually exclusive by construction — a bare first key versus a
      * quoted one — so this is a dispatch, not a guess. */
-    if (now_event_decode_pasta(ev, buf, len) == 0) return 0;
+    if (now_event_decode_basta(ev, buf, len) == 0) return 0;
     return now_event_decode_json(ev, buf, len);
 }
 
@@ -370,12 +374,18 @@ NOW_API int now_event_decode(NowEvent *ev, const char *buf, size_t len) {
 NOW_API size_t now_event_render(char *out, size_t out_cap,
                                 const NowEvent *ev, const char *fmt) {
     if (!out || !ev || out_cap == 0) return 0;
-    if (!fmt) fmt = "pasta";
+    if (!fmt) fmt = "basta";
 
     if (strcmp(fmt, "json") == 0)
         return now_event_encode_json(out, out_cap, ev);
-    if (strcmp(fmt, "pasta") == 0)
-        return now_event_encode_pasta(out, out_cap, ev);
+    /* "pasta" is accepted as the name this format was published under
+     * in the spec's first draft. It is answered with Basta, which is a
+     * superset: an event with no detail is identical either way, and one
+     * with a detail is only representable as Basta. Falling through to
+     * `text` for a name someone read in the spec would be a silent
+     * format change, which is worse than a lenient alias. */
+    if (strcmp(fmt, "basta") == 0 || strcmp(fmt, "pasta") == 0)
+        return now_event_encode_basta(out, out_cap, ev);
 
     /* text */
     {
@@ -400,66 +410,85 @@ NOW_API size_t now_event_render(char *out, size_t out_cap,
     }
 }
 
-/* ==== Pasta ====
+/* ==== Basta ====
  *
- * Pasta is the wire default: a stricter grammar than JSON with one
- * implementation behind it, so there is far less room for two readers to
- * disagree about the same bytes.
+ * Basta is the wire default: Pasta's grammar — stricter than JSON with
+ * one implementation behind it, so far less room for two readers to
+ * disagree about the same bytes — plus the one production this stream
+ * needs, the blob.
  *
- * It is hand-written rather than built through basta_new_map() +
- * basta_write(), and that is not a preference. Measured 2026-08-21,
- * basta_writer.c's write_string() only reaches for the """ form when a
- * string contains a newline, so it emits unparseable output for three
- * ordinary cases:
+ * `detail` is a blob, and that is the whole reason the wire form is
+ * Basta rather than Pasta. A detail is captured process output: bytes
+ * that left the text domain the moment a compiler wrote them. A
+ * compiler echoing a Java text block or a Rust raw string quotes `"""`
+ * straight back at us, and one running under a non-UTF-8 locale emits
+ * bytes that are not text at all. No string form in any text format
+ * carries both — a fence can be escalated for the first and can do
+ * nothing about the second. A blob carries an explicit byte count and
+ * has no delimiter to collide with, so there is no content it can
+ * refuse.
  *
- *   error: unknown type name "u64"   ->  {detail: "error: ... "u64""}
- *   a string ending in a quote        ->  closing delimiter merges
- *   a string containing """           ->  terminates early
+ * That last property is the requirement rather than a nicety. Refusing
+ * to write a value is the honest answer for a config file a human will
+ * fix; here it is a dropped event, and a watcher that never learns what
+ * broke is the failure this design exists to avoid.
  *
- * pasta_write() returns those happily; only re-parsing catches them. A
- * compiler diagnostic containing a double quote is the most ordinary
- * payload an event has, so the writer cannot be used here until that is
- * fixed. Reported to the format owner. Meanwhile the rules below are
- * explicit and the round trip is tested.
+ * Confirmed with the format owner on 2026-08-21 rather than assumed: a
+ * blob is "a binary escape from the text domain", which is precisely
+ * what a diagnostic is, and alforno treats one as an opaque atomic
+ * leaf — never scanned for {variable}, never examined for @link — so a
+ * diagnostic containing either cannot be interpreted by accident.
+ *
+ * Short fields — ids, names, paths — stay plain strings. They are our
+ * own bytes rather than somebody else's, and keeping them as text is
+ * what lets a person still read a tailed datagram.
+ *
+ * Written here rather than through basta_new_map() + basta_write()
+ * because the datagram has a hard size limit, so encoding is a
+ * shorten-and-retry loop over a fixed buffer rather than one pass over
+ * a value tree. The standing check that this writer and the library
+ * lexer agree about the text part is the round-trip invariant test: a
+ * writer and a lexer that ship together are not thereby in agreement.
  */
 
-/* Free-text fields go out as """...""" so quotes need no escaping. Two
- * things still cannot appear inside that form: the delimiter itself, and
- * a trailing quote (which would merge with it). Both are altered and
- * flagged rather than silently mangled. */
-static size_t pasta_escape_free_text(char *out, size_t cap, const char *in,
-                                     int *lossy) {
-    size_t o = 0;
-    const char *p = in;
+/* Write `n` bytes as a Basta blob: the 0x00 sentinel, an 8-byte
+ * big-endian length, then the bytes themselves.
+ *
+ * 0x00 is illegal in every other position in the format — not in a
+ * label, not in a string, not in any token — which is what lets a
+ * reader step over a blob without parsing anything around it. */
+static size_t basta_write_blob(char *out, size_t cap, const char *in,
+                               size_t n) {
+    unsigned long long v = (unsigned long long)n;
+    size_t i;
 
-    while (*p) {
-        if (p[0] == '"' && p[1] == '"' && p[2] == '"') {
-            /* Break the delimiter with a space; the text stays readable
-             * and the reader is told it is not byte-exact. */
-            if (o + 4 >= cap) return (size_t)-1;
-            out[o++] = '"'; out[o++] = '"'; out[o++] = ' '; out[o++] = '"';
-            *lossy = 1;
-            p += 3;
-            continue;
-        }
-        if (o + 1 >= cap) return (size_t)-1;
-        out[o++] = *p++;
-    }
-    /* A trailing quote would close the delimiter one byte early. */
-    if (o > 0 && out[o - 1] == '"') {
-        if (o + 1 >= cap) return (size_t)-1;
-        out[o++] = '\n';
-        *lossy = 1;
-    }
-    out[o] = '\0';
-    return o;
+    if (cap < 9 || n > cap - 9) return 0;
+    out[0] = '\0';
+    for (i = 8; i-- > 0; ) { out[1 + i] = (char)(v & 0xFFu); v >>= 8; }
+    memcpy(out + 9, in, n);
+    return n + 9;
+}
+
+/* Total on-wire size of the blob at `p` — 9 plus its byte count — or 0
+ * if `avail` does not hold all of it. A length that overruns the buffer
+ * is a malformed datagram rather than a short read: there is no more of
+ * it coming. */
+static size_t basta_blob_span(const char *p, size_t avail, size_t *n_out) {
+    unsigned long long v = 0;
+    size_t i;
+
+    if (avail < 9) return 0;
+    for (i = 0; i < 8; i++) v = (v << 8) | (unsigned char)p[1 + i];
+    if (v > (unsigned long long)(avail - 9)) return 0;
+    if (n_out) *n_out = (size_t)v;
+    return (size_t)v + 9;
 }
 
 /* Short fields (ids, names, paths) go out as plain "..." strings. They
  * cannot contain a quote or a newline by construction, but a hostile or
  * corrupt one must not be able to break the framing, so anything that
  * would is dropped. */
-static size_t pasta_escape_plain(char *out, size_t cap, const char *in) {
+static size_t basta_escape_plain(char *out, size_t cap, const char *in) {
     size_t o = 0;
     const char *p = in;
     for (; *p; p++) {
@@ -471,29 +500,33 @@ static size_t pasta_escape_plain(char *out, size_t cap, const char *in) {
     return o;
 }
 
-static size_t encode_pasta_attempt(char *out, size_t cap, const NowEvent *ev,
+static size_t encode_basta_attempt(char *out, size_t cap, const NowEvent *ev,
                                    size_t detail_len, int mark_lossy) {
-    char det[1600], mod[600], proj[420], hst[128], cut[768];
+    char mod[600], proj[420], hst[128];
+    size_t full = strlen(ev->detail);
     size_t n = 0;
     int w;
     int lossy = mark_lossy;
 
-    det[0] = mod[0] = proj[0] = hst[0] = '\0';
+    mod[0] = proj[0] = hst[0] = '\0';
 
-    if (ev->detail[0]) {
-        if (detail_len >= sizeof(cut)) detail_len = sizeof(cut) - 1;
+    if (detail_len > full) detail_len = full;
+    if (detail_len < full) {
+        /* Shortening to fit the datagram is now the only thing that
+         * loses a byte, and backing off a partial character is a
+         * courtesy to whoever renders the result rather than a rule of
+         * the format: a blob would carry half a character quite
+         * happily, and the person reading it would see a broken one. */
         detail_len = utf8_back_off(ev->detail, detail_len);
-        memcpy(cut, ev->detail, detail_len);
-        cut[detail_len] = '\0';
-        if (pasta_escape_free_text(det, sizeof(det), cut, &lossy) == (size_t)-1)
-            return 0;
+        lossy = 1;
     }
+
     if (ev->module[0] &&
-        pasta_escape_plain(mod, sizeof(mod), ev->module) == (size_t)-1) return 0;
+        basta_escape_plain(mod, sizeof(mod), ev->module) == (size_t)-1) return 0;
     if (ev->project[0] &&
-        pasta_escape_plain(proj, sizeof(proj), ev->project) == (size_t)-1) return 0;
+        basta_escape_plain(proj, sizeof(proj), ev->project) == (size_t)-1) return 0;
     if (ev->host[0] &&
-        pasta_escape_plain(hst, sizeof(hst), ev->host) == (size_t)-1) return 0;
+        basta_escape_plain(hst, sizeof(hst), ev->host) == (size_t)-1) return 0;
 
     w = snprintf(out, cap,
         "{ v: %d, run: \"%s\", seq: %ld, ts: \"%s\", event: \"%s\", "
@@ -511,9 +544,13 @@ static size_t encode_pasta_attempt(char *out, size_t cap, const NowEvent *ev,
 
     if (proj[0]) PAPPEND(", project: \"%s\"", proj);
     if (mod[0])  PAPPEND(", module: \"%s\"", mod);
-    if (det[0]) {
-        PAPPEND(", detail: \"\"\"%s\"\"\"", det);
-        if (lossy) PAPPEND(", detail_lossy: true");
+    if (detail_len) {
+        size_t b;
+        PAPPEND("%s", ", detail: ");
+        b = basta_write_blob(out + n, cap - n, ev->detail, detail_len);
+        if (!b) return 0;
+        n += b;
+        if (lossy) PAPPEND("%s", ", detail_lossy: true");
     }
     if (ev->code >= 0)       PAPPEND(", code: %d", ev->code);
     if (ev->elapsed_ms >= 0) PAPPEND(", elapsed_ms: %ld", ev->elapsed_ms);
@@ -532,7 +569,7 @@ static size_t encode_pasta_attempt(char *out, size_t cap, const NowEvent *ev,
     return n;
 }
 
-NOW_API size_t now_event_encode_pasta(char *out, size_t out_cap,
+NOW_API size_t now_event_encode_basta(char *out, size_t out_cap,
                                       const NowEvent *ev) {
     size_t detail_len, n;
 
@@ -540,12 +577,12 @@ NOW_API size_t now_event_encode_pasta(char *out, size_t out_cap,
     if (out_cap > NOW_EVENTS_MAX_DATAGRAM) out_cap = NOW_EVENTS_MAX_DATAGRAM;
 
     detail_len = strlen(ev->detail);
-    n = encode_pasta_attempt(out, out_cap, ev, detail_len, ev->detail_lossy);
+    n = encode_basta_attempt(out, out_cap, ev, detail_len, ev->detail_lossy);
     if (n) return n;
 
     while (detail_len > 0) {
         detail_len /= 2;
-        n = encode_pasta_attempt(out, out_cap, ev, detail_len, 1);
+        n = encode_basta_attempt(out, out_cap, ev, detail_len, 1);
         if (n) return n;
     }
     {
@@ -553,49 +590,65 @@ NOW_API size_t now_event_encode_pasta(char *out, size_t out_cap,
         bare.detail[0] = '\0';
         bare.module[0] = '\0';
         bare.detail_lossy = 1;
-        return encode_pasta_attempt(out, out_cap, &bare, 0, 1);
+        return encode_basta_attempt(out, out_cap, &bare, 0, 1);
     }
 }
 
-/* ---- reading Pasta back ---- */
+/* ---- reading Basta back ---- */
 
-static const char *pasta_find_key(const char *doc, size_t len, const char *key) {
+/* Find `key:` and return the first byte of its value.
+ *
+ * The walk steps OVER a blob rather than through it, and that is what
+ * makes it safe to scan a document one of whose values is somebody
+ * else's bytes: a diagnostic that happens to contain `, module: "x"`
+ * cannot be read as a field, because the scan never enters the blob
+ * holding it. No value-position tracking is needed to know where a blob
+ * begins — 0x00 is illegal everywhere else in the format, so a sentinel
+ * is unambiguous wherever it is met. */
+static const char *basta_find_key(const char *doc, size_t len, const char *key) {
     char pat[64];
     size_t plen = (size_t)snprintf(pat, sizeof(pat), "%s:", key);
-    size_t i;
+    size_t i = 0;
     if (plen >= sizeof(pat)) return NULL;
-    for (i = 0; i + plen <= len; i++) {
+    while (i < len) {
+        if (doc[i] == '\0') {
+            size_t span = basta_blob_span(doc + i, len - i, NULL);
+            if (!span) return NULL;      /* malformed; nothing beyond it is safe */
+            i += span;
+            continue;
+        }
         /* A key is preceded by '{' or ', ' — without that check, "total"
          * would also match the tail of "subtotal". */
-        if (i > 0 && doc[i - 1] != ' ' && doc[i - 1] != '{') continue;
-        if (memcmp(doc + i, pat, plen) != 0) continue;
-        {
+        if (i + plen <= len &&
+            (i == 0 || doc[i - 1] == ' ' || doc[i - 1] == '{') &&
+            memcmp(doc + i, pat, plen) == 0) {
             const char *p = doc + i + plen;
             const char *end = doc + len;
             while (p < end && (*p == ' ' || *p == '\t')) p++;
             return p;
         }
+        i++;
     }
     return NULL;
 }
 
-static int pasta_get_int(const char *doc, size_t len, const char *key, long *out) {
-    const char *p = pasta_find_key(doc, len, key);
+static int basta_get_int(const char *doc, size_t len, const char *key, long *out) {
+    const char *p = basta_find_key(doc, len, key);
     if (!p) return -1;
     *out = strtol(p, NULL, 10);
     return 0;
 }
 
-static int pasta_get_bool(const char *doc, size_t len, const char *key, int *out) {
-    const char *p = pasta_find_key(doc, len, key);
+static int basta_get_bool(const char *doc, size_t len, const char *key, int *out) {
+    const char *p = basta_find_key(doc, len, key);
     if (!p) return -1;
     *out = (strncmp(p, "true", 4) == 0);
     return 0;
 }
 
-static int pasta_get_str(const char *doc, size_t len, const char *key,
+static int basta_get_str(const char *doc, size_t len, const char *key,
                          char *out, size_t cap) {
-    const char *p = pasta_find_key(doc, len, key);
+    const char *p = basta_find_key(doc, len, key);
     const char *end = doc + len;
     const char *stop;
     size_t n;
@@ -623,7 +676,35 @@ static int pasta_get_str(const char *doc, size_t len, const char *key,
     return 0;
 }
 
-NOW_API int now_event_decode_pasta(NowEvent *ev, const char *doc, size_t len) {
+/* `detail` is written as a blob, but read as either: a field is defined
+ * by its key, not by the representation a particular emitter chose, and
+ * a hand-written test event or a foreign sender may well send a string.
+ *
+ * A blob longer than the field is truncated and flagged rather than
+ * refused. Refusing would drop the whole event — including the seq that
+ * tells a listener nothing was missed — over a detail that was only ever
+ * advisory. */
+static int basta_get_detail(const char *doc, size_t len,
+                            char *out, size_t cap, int *lossy) {
+    const char *p = basta_find_key(doc, len, "detail");
+    size_t n = 0;
+
+    if (!p) return -1;
+    if (*p != '\0')
+        return basta_get_str(doc, len, "detail", out, cap);
+
+    if (!basta_blob_span(p, len - (size_t)(p - doc), &n)) return -1;
+    if (n + 1 > cap) { n = cap - 1; *lossy = 1; }
+    /* A blob's bytes are carried into a C string, so a NUL inside one
+     * ends the detail here. Ours cannot contain one — it arrives as a
+     * C string from the capture site — and the format is not what
+     * limits that, we are. */
+    memcpy(out, p + 9, n);
+    out[n] = '\0';
+    return 0;
+}
+
+NOW_API int now_event_decode_basta(NowEvent *ev, const char *doc, size_t len) {
     long v = 0, n = 0;
     char name[64];
 
@@ -635,36 +716,40 @@ NOW_API int now_event_decode_pasta(NowEvent *ev, const char *doc, size_t len) {
     ev->counts.compiled = ev->counts.skipped = ev->counts.failed =
         ev->counts.passed = ev->counts.total = -1;
 
-    if (pasta_get_int(doc, len, "v", &v) != 0) return -1;
+    if (basta_get_int(doc, len, "v", &v) != 0) return -1;
     if (v != NOW_EVENTS_SCHEMA_VERSION) return -1;
     ev->v = (int)v;
 
-    if (pasta_get_str(doc, len, "run", ev->run, sizeof(ev->run)) != 0) return -1;
-    if (pasta_get_int(doc, len, "seq", &ev->seq) != 0) return -1;
-    if (pasta_get_str(doc, len, "ts", ev->ts, sizeof(ev->ts)) != 0) return -1;
-    if (pasta_get_str(doc, len, "event", name, sizeof(name)) != 0) return -1;
+    if (basta_get_str(doc, len, "run", ev->run, sizeof(ev->run)) != 0) return -1;
+    if (basta_get_int(doc, len, "seq", &ev->seq) != 0) return -1;
+    if (basta_get_str(doc, len, "ts", ev->ts, sizeof(ev->ts)) != 0) return -1;
+    if (basta_get_str(doc, len, "event", name, sizeof(name)) != 0) return -1;
 
     ev->event = now_event_parse_name(name);
     if (ev->event == NOW_EVENT__COUNT) return -1;
 
-    if (pasta_get_str(doc, len, "phase", ev->phase, sizeof(ev->phase)) != 0)
+    if (basta_get_str(doc, len, "phase", ev->phase, sizeof(ev->phase)) != 0)
         ev->phase[0] = '\0';
-    if (pasta_get_bool(doc, len, "ok", &ev->ok) != 0) ev->ok = 1;
+    if (basta_get_bool(doc, len, "ok", &ev->ok) != 0) ev->ok = 1;
 
-    pasta_get_str(doc, len, "project", ev->project, sizeof(ev->project));
-    pasta_get_str(doc, len, "module",  ev->module,  sizeof(ev->module));
-    pasta_get_str(doc, len, "detail",  ev->detail,  sizeof(ev->detail));
-    pasta_get_bool(doc, len, "detail_lossy", &ev->detail_lossy);
+    basta_get_str(doc, len, "project", ev->project, sizeof(ev->project));
+    basta_get_str(doc, len, "module",  ev->module,  sizeof(ev->module));
+    /* The flag is read before the value it describes: reading `detail`
+     * can raise it, and reading the sender's flag afterwards would
+     * overwrite what we just learned with what they claimed. */
+    basta_get_bool(doc, len, "detail_lossy", &ev->detail_lossy);
+    basta_get_detail(doc, len, ev->detail, sizeof(ev->detail),
+                     &ev->detail_lossy);
 
-    if (pasta_get_int(doc, len, "code", &n) == 0)       ev->code = (int)n;
-    if (pasta_get_int(doc, len, "elapsed_ms", &n) == 0) ev->elapsed_ms = n;
-    if (pasta_get_int(doc, len, "compiled", &n) == 0)   ev->counts.compiled = (int)n;
-    if (pasta_get_int(doc, len, "skipped", &n) == 0)    ev->counts.skipped  = (int)n;
-    if (pasta_get_int(doc, len, "failed", &n) == 0)     ev->counts.failed   = (int)n;
-    if (pasta_get_int(doc, len, "passed", &n) == 0)     ev->counts.passed   = (int)n;
-    if (pasta_get_int(doc, len, "total", &n) == 0)      ev->counts.total    = (int)n;
-    if (pasta_get_int(doc, len, "pid", &n) == 0)        ev->pid = (int)n;
-    pasta_get_str(doc, len, "host", ev->host, sizeof(ev->host));
+    if (basta_get_int(doc, len, "code", &n) == 0)       ev->code = (int)n;
+    if (basta_get_int(doc, len, "elapsed_ms", &n) == 0) ev->elapsed_ms = n;
+    if (basta_get_int(doc, len, "compiled", &n) == 0)   ev->counts.compiled = (int)n;
+    if (basta_get_int(doc, len, "skipped", &n) == 0)    ev->counts.skipped  = (int)n;
+    if (basta_get_int(doc, len, "failed", &n) == 0)     ev->counts.failed   = (int)n;
+    if (basta_get_int(doc, len, "passed", &n) == 0)     ev->counts.passed   = (int)n;
+    if (basta_get_int(doc, len, "total", &n) == 0)      ev->counts.total    = (int)n;
+    if (basta_get_int(doc, len, "pid", &n) == 0)        ev->pid = (int)n;
+    basta_get_str(doc, len, "host", ev->host, sizeof(ev->host));
 
     return 0;
 }
@@ -735,7 +820,7 @@ NOW_API NowEventSink *now_event_sink_open(const char *url, const char *wire) {
     s = (NowEventSink *)calloc(1, sizeof(*s));
     if (!s) return NULL;
 
-    snprintf(s->wire, sizeof(s->wire), "%s", (wire && *wire) ? wire : "pasta");
+    snprintf(s->wire, sizeof(s->wire), "%s", (wire && *wire) ? wire : "basta");
 
     s->fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (s->fd == NOW_SOCK_BAD) { free(s); return NULL; }
@@ -1238,7 +1323,7 @@ NOW_API int now_events_listen(const NowEventListenOpts *opts,
 
         if (filter_admits(opts->filter, now_event_name(ev.event))) {
             size_t n = now_event_render(line, sizeof(line), &ev,
-                                        opts->output ? opts->output : "pasta");
+                                        opts->output ? opts->output : "basta");
             if (n) {
                 fwrite(line, 1, n, stdout);
                 fputc('\n', stdout);

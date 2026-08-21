@@ -54,7 +54,7 @@ without the failure modes multicast brings:
 
 ## 3. Framing
 
-One event per datagram, no trailing newline, UTF-8.
+One event per datagram, no trailing newline.
 
 **A datagram MUST NOT exceed 1200 bytes.** That is under the smallest
 MTU worth assuming, so no event is ever IP-fragmented — a fragmented
@@ -62,71 +62,105 @@ datagram is far likelier to be dropped, and dropping the one that says
 the build finished is the failure this design exists to avoid. Emitters
 shorten `detail` until the datagram fits and set `detail_lossy`.
 
-### Pasta is the default; json and text are alternatives
+### Basta is the default; json and text are alternatives
 
-**Pasta**, because it has a stricter grammar and one implementation
-behind it, so there is far less room for two readers to disagree about
-the same bytes. JSON's ambiguities are real — number precision,
-duplicate keys, encoding — and this is a stream meant to be acted on
-rather than read.
+**Basta** is Pasta's grammar plus one production, the blob. Pasta's
+reasons for being chosen here are unchanged: a stricter grammar than
+JSON with one implementation behind it, so far less room for two readers
+to disagree about the same bytes. JSON's ambiguities — number precision,
+duplicate keys, encoding — are real, and this is a stream meant to be
+acted on rather than read.
 
-The first draft of this spec chose JSON, on the grounds that Pasta
-strings have no escape sequences and a compiler diagnostic is full of
-quotes and newlines. That was the wrong trade: it optimised for the
-convenience of the *serialiser* over the determinism of the *format*.
-Pasta's `"""..."""` form carries quotes and newlines with no escaping
-at all, which is a better answer than escaping to begin with.
+Selected per sink: `basta` (default), `json`, `text`.
 
-Selected per sink: `pasta` (default), `json`, `text`.
+This spec has now chosen a wire format three times, and the third answer
+is the one that stopped arguing about escaping. The first draft chose
+JSON, because Pasta strings have no escape sequences and a compiler
+diagnostic is full of quotes and newlines. The second chose Pasta,
+because its `"""..."""` form carries quotes and newlines with no
+escaping at all — which is a better answer than escaping, and still the
+wrong question. **`detail` is not text. It is whatever bytes a compiler
+wrote**, and the format needed for that is one with a byte count.
 
-### A serialiser caveat that is not the format's fault
+### `detail` is a blob
 
-**`basta_write()` cannot currently serialise these payloads**, measured
-2026-08-21 by round-tripping strings through `pasta_write` →
-`pasta_parse`:
+A blob is the byte `0x00`, an 8-byte big-endian length, then exactly
+that many bytes. `0x00` is illegal in every other position in Basta and
+Pasta — not in a label, not in a string, not in any token — so the
+sentinel is unambiguous wherever it appears, and the parser resumes
+ordinary text immediately after the last data byte.
 
-| input | written as | re-parses |
+Measured against basta `0696908`, in both directions:
+
+| payload | in a `"""` string | in a blob |
 |---|---|---|
-| `error: unknown type name "u64"` | `"error: ... "u64""` | **no** |
-| a string ending in `"` | closing quote merges with the delimiter | **no** |
-| a string containing `"""` | terminates early | **no** |
-| anything with a newline | `"""..."""` | yes |
+| a quote at the end | merges with the delimiter | exact |
+| an interior `"""` | ends the string early | exact |
+| `"""#`, then `"""##` | needs a fence, then a longer one | exact |
+| a NUL byte | no representation at all | exact |
+| non-UTF-8 bytes | not text | exact |
 
-`basta_writer.c`'s `write_string()` only reaches for the `"""` form when
-the string contains a newline, so an ordinary single-line diagnostic
-carrying a double quote is emitted unparseably — and `pasta_write()`
-returns it without complaint, so only re-parsing catches it.
+The last two are the ones that decided it. A fence — `#"""..."""#`,
+escalating — was designed and offered by the format owner, and it
+handles the first three at any size. It cannot handle the last two at
+any size, because the problem there is not the delimiter.
 
-So `now_events.c` writes its own Pasta rather than building a value tree
-and calling the library writer. The rules it follows are:
+**The property being bought is that a blob cannot refuse.** Refusing to
+write a value is the honest answer for a config file, where a human
+reads the diagnostic and fixes the file. Here the same refusal is a
+*dropped event*, and a watcher that never learns what broke is exactly
+the failure §6 exists to prevent. Nothing in the emitter may be able to
+decline a payload, and with a blob nothing can — so there is no fallback
+path to get wrong either.
 
-- free text (`detail`) always goes in `"""..."""`;
-- a `"""` inside that text is broken up and `detail_lossy` is set;
-- text ending in `"` gets a newline appended and `detail_lossy` is set;
-- short fields (ids, names, paths) go in plain `"..."` and cannot
-  contain a quote or newline — anything that would is dropped, so a
-  corrupt value can never break the framing.
+Blessed by the format owner on 2026-08-21 as the intended use of a blob
+rather than a stretch of one: *a binary escape from the text domain*,
+which is what captured process output is. alforno treats a blob as an
+opaque atomic leaf — never scanned for `{variable}`, never examined for
+`@link` — so a diagnostic containing either cannot be interpreted by
+accident.
 
-This is reported to the format owner. If the writer is fixed, this
-module should move to it — the tests that pin these four cases are what
-tells you the move is safe.
+**Two consequences, both accepted deliberately.**
+
+A consumer needs a Basta parser, not a Pasta one: `pasta_parse` rejects
+a blob outright with *"unexpected character"*, measured. An event with
+no `detail` is byte-identical under both, so most of the stream parses
+either way — which makes this exactly the kind of thing that would be
+discovered by a consumer rather than by us if it were not written down
+here.
+
+And a `detail` is no longer readable by eye in a tailed stream. That is
+what `--output text` is for, and it is what `now events:listen` prints
+unless asked otherwise.
+
+### What a reader must do about blobs
+
+**A reader that scans for keys must step over a blob rather than
+through it.** A `detail` is somebody else's bytes: a compiler quoting a
+line of Pasta back in a diagnostic would otherwise write its own
+envelope by accident, and that is before anyone tries it on purpose.
+Because `0x00` cannot occur anywhere else, skipping needs no
+value-position tracking — read the length, jump, continue.
+
+`now`'s own reader does this, and the test that pins it is a `detail`
+containing a plausible envelope: the event decodes with the real
+`module` and the real `code`, not the ones in the diagnostic.
+
+### The limit that is ours rather than the format's
+
+`NowEvent.detail` is a C string, so a NUL byte in captured output ends
+the detail at the capture site, before any of this is reached. The wire
+form would carry it; we do not hand it one. Whoever needs that should
+make `detail` length-carrying — the format is not what is in the way.
 
 ### Reading either form
 
 `now events:listen` accepts both without being told which arrived. That
-is a dispatch, not a guess: a Pasta event's first key is bare (`{ v: 1`)
+is a dispatch, not a guess: a Basta event's first key is bare (`{ v: 1`)
 and a JSON event's is quoted (`{"v":1`), so each decoder rejects the
 other's output outright rather than half-reading it. There is a test for
 exactly that property, because a decoder that *partially* accepted the
 other format would turn this into sniffing.
-
-### basta, and what it is for
-
-Named here and deliberately not implemented in v1. Its value is not a
-fourth spelling of the same map — it is carrying bytes no text form can:
-a small binary payload, or a credential a chained step needs. That wants
-its own design (who may read it, how it is bounded, whether it belongs
-in an event at all) and it is a v1.1 question, not a v1 one.
 
 ## 4. Envelope
 
@@ -151,8 +185,8 @@ Optional fields, by event:
 |---|---|---|
 | `project` | string | `group:artifact:version` |
 | `module` | string | source path or module name |
-| `detail` | string | human-readable text, truncated to fit |
-| `detail_lossy` | bool | present and true when `detail` is not byte-exact — shortened to fit, or altered to suit the format |
+| `detail` | blob | captured process output — bytes, not text (§3), shortened to fit |
+| `detail_lossy` | bool | present and true when `detail` was shortened to fit. Nothing else can raise it: since `detail` became a blob there is no content the wire form has to alter |
 | `code` | int | process exit code (`run.finished` only) |
 | `counts` | object | `{compiled, skipped, failed, passed, total}` — any subset |
 | `elapsed_ms` | int | milliseconds since `run.started` |
@@ -259,8 +293,14 @@ build, so a shell branches on it without parsing a line.
 ### Example
 
 ```
-{ v: 1, run: "a3f1c9d2e4b6", seq: 7, ts: "2026-08-21T09:41:02Z", event: "module.failed", phase: "compile", ok: false, project: "dev.iridium:gut:0.1.0", module: "src/main/c/remote.c", detail: """remote.c:512:9: error: unknown type name "u64"""" }
+{ v: 1, run: "a3f1c9d2e4b6", seq: 7, ts: "2026-08-21T09:41:02Z", event: "module.failed", phase: "compile", ok: false, project: "dev.iridium:gut:0.1.0", module: "src/main/c/remote.c", detail: ‹00›‹00 00 00 00 00 00 00 2e›remote.c:512:9: error: unknown type name "u64" }
 ```
+
+The nine bytes in guillemets are the blob's sentinel and its big-endian
+length; they are bytes on the wire, not the text shown here. The 46
+bytes after them are the diagnostic exactly as the compiler wrote it —
+including the closing quote, which is the byte that made this example
+unparseable in the previous draft of this spec.
 
 The same event with `--wire json`:
 
@@ -334,7 +374,7 @@ NOW_EVENTS=udp://127.0.0.1:9099             # environment
 ```
 ```pasta
 ; ~/.now/config.pasta
-events: { url: "udp://127.0.0.1:9099", wire: "pasta", file: 1 }
+events: { url: "udp://127.0.0.1:9099", wire: "basta", file: 1 }
 ```
 
 Absent all three, nothing is emitted and no socket is created.
@@ -343,7 +383,7 @@ Absent all three, nothing is emitted and no socket is created.
 
 ```
 now events:listen <url> [--filter <event>[,<event>...]]
-                        [--output pasta|json|text]
+                        [--output basta|json|text]
                         [--until <event>] [--timeout <sec>]
                         [--insecure]
 ```
@@ -363,3 +403,10 @@ second CI system.
 fields and MUST refuse an event whose `v` it does not know. Adding a
 field is not a version bump; changing the meaning of one, the key order,
 or the framing is.
+
+By that rule the move from Pasta to a Basta blob (§3) is a framing
+change and would be a version bump — except that there is nothing to be
+compatible with. The event stream landed after `1.0.0-rc8` was cut and
+has never been in a release, so v1 has had exactly one published
+framing. It is worth saying rather than leaving a reader to reconstruct
+it from the git log.
