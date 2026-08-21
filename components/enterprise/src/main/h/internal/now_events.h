@@ -68,7 +68,11 @@ typedef struct {
     char            project[192];
     char            module[256];
     char            detail[768];
-    int             detail_truncated;
+    /* Set when `detail` is not byte-exact: shortened to fit the
+     * datagram, or altered because the wire format could not carry it
+     * verbatim. One flag for both, because a consumer's question is
+     * "can I trust these bytes", not "which way did they change". */
+    int             detail_lossy;
     int             code;
     NowEventCounts  counts;
     long            elapsed_ms;
@@ -85,25 +89,56 @@ NOW_API int          now_event_is_terminal(NowEventType e);
 
 /* ---- wire form ---- */
 
+/* ---- Pasta is the default wire format ----
+ *
+ * Not JSON: Pasta has a stricter grammar and one implementation behind
+ * it, so there is much less room for two readers to disagree about the
+ * same bytes. JSON's ambiguities — number precision, duplicate keys,
+ * encoding — are real and this stream is meant to be acted on.
+ *
+ * Free text goes in a """...""" string, which carries quotes and
+ * newlines without escaping at all.
+ *
+ * Encode as Pasta. Returns bytes written, 0 on error. */
+NOW_API size_t now_event_encode_pasta(char *out, size_t out_cap,
+                                      const NowEvent *ev);
+
+/* Decode a Pasta event. Returns 0 on success. */
+NOW_API int now_event_decode_pasta(NowEvent *ev, const char *doc, size_t len);
+
 /* Encode `ev` as one JSON object into `out` (no trailing newline).
  * Keys are written in the order specs/now-events-v1.md §4 fixes, which
  * is what will make a canonical byte sequence available to v2 signing
  * without re-cutting v1.
  *
  * If the object would exceed NOW_EVENTS_MAX_DATAGRAM, `detail` is
- * truncated until it fits and detail_truncated is set in the output.
+ * truncated until it fits and detail_lossy is set in the output.
  * Returns the number of bytes written, or 0 on error. */
-NOW_API size_t now_event_encode(char *out, size_t out_cap, const NowEvent *ev);
+NOW_API size_t now_event_encode_json(char *out, size_t out_cap,
+                                     const NowEvent *ev);
 
 /* Decode one JSON object into `ev`. Returns 0 on success.
  *
  * Refuses an event whose `v` is not NOW_EVENTS_SCHEMA_VERSION, and
  * ignores fields it does not know — that pair is the whole compatibility
  * story (§11). */
-NOW_API int now_event_decode(NowEvent *ev, const char *json, size_t len);
+NOW_API int now_event_decode_json(NowEvent *ev, const char *json, size_t len);
+
+/* Decode an event in whichever of the two textual formats arrived.
+ *
+ * This is not sniffing: the two forms are mutually exclusive by
+ * construction. A Pasta event's first key is bare (`{ v: 1`), a JSON
+ * event's is quoted (`{"v":1`), so each decoder rejects the other's
+ * output outright rather than half-reading it. Returns 0 on success. */
+NOW_API int now_event_decode(NowEvent *ev, const char *buf, size_t len);
 
 /* Render a decoded event for a human or for a pipe. `fmt` is one of
- * "json", "pasta", "text". Returns bytes written, 0 on error. */
+ * "pasta" (default), "json", "text". Returns bytes written, 0 on error.
+ *
+ * "basta" is named in specs/now-events-v1.md and not implemented here:
+ * its value is carrying bytes that no text form can (a small binary
+ * payload, a credential for a chained step), and that is a v1.1 job with
+ * its own design rather than a fourth spelling of the same map. */
 NOW_API size_t now_event_render(char *out, size_t out_cap,
                                 const NowEvent *ev, const char *fmt);
 
@@ -111,10 +146,12 @@ NOW_API size_t now_event_render(char *out, size_t out_cap,
 
 typedef struct NowEventSink NowEventSink;
 
-/* Open a sink for a destination URL ("udp://host:port"). Returns NULL if
- * the URL is unusable — which the caller treats as "do not emit", never
- * as a build failure. */
-NOW_API NowEventSink *now_event_sink_open(const char *url);
+/* Open a sink for a destination URL ("udp://host:port").
+ *
+ * `wire` is "pasta" (the default when NULL), "json" or "text". Returns
+ * NULL if the URL is unusable — which the caller treats as "do not
+ * emit", never as a build failure. */
+NOW_API NowEventSink *now_event_sink_open(const char *url, const char *wire);
 
 /* Send one event. Never blocks, never retries beyond the terminal-event
  * repeat, and never reports failure: there is nothing a build could

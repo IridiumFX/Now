@@ -1,6 +1,6 @@
 # now events — wire schema v1
 
-Status: **draft, listener implemented, emission not yet wired**
+Status: **draft — listener implemented and tested, emission not yet wired**
 Written 2026-08-21.
 
 An optional, opt-in stream of build lifecycle events, so that something
@@ -54,31 +54,79 @@ without the failure modes multicast brings:
 
 ## 3. Framing
 
-One event per datagram. One JSON object, no trailing newline, UTF-8.
+One event per datagram, no trailing newline, UTF-8.
 
 **A datagram MUST NOT exceed 1200 bytes.** That is under the smallest
 MTU worth assuming, so no event is ever IP-fragmented — a fragmented
 datagram is far likelier to be dropped, and dropping the one that says
 the build finished is the failure this design exists to avoid. Emitters
-truncate `detail` until the datagram fits and set `detail_truncated`.
+shorten `detail` until the datagram fits and set `detail_lossy`.
 
-### Why JSON and not Pasta
+### Pasta is the default; json and text are alternatives
 
-Pasta is the format of this ecosystem and the audit log is Pasta, so the
-default answer would be Pasta. It is the wrong answer here for one
-concrete reason: **Pasta strings have no escape sequences.** A compiler
-diagnostic — the most valuable payload an event can carry — contains
-quotes, newlines and backslashes as a matter of course, and cannot be
-written as a Pasta string at all without either lossy sanitising or a
-multiline form that then cannot contain its own delimiter.
+**Pasta**, because it has a stricter grammar and one implementation
+behind it, so there is far less room for two readers to disagree about
+the same bytes. JSON's ambiguities are real — number precision,
+duplicate keys, encoding — and this is a stream meant to be acted on
+rather than read.
 
-The line this draws is the one cookbook already draws with content
-negotiation: **Pasta is for things people author, JSON is for things
-machines exchange.** Descriptors are authored. Events are not.
+The first draft of this spec chose JSON, on the grounds that Pasta
+strings have no escape sequences and a compiler diagnostic is full of
+quotes and newlines. That was the wrong trade: it optimised for the
+convenience of the *serialiser* over the determinism of the *format*.
+Pasta's `"""..."""` form carries quotes and newlines with no escaping
+at all, which is a better answer than escaping to begin with.
 
-`now events:listen` renders to `--output json|pasta|text`, so a consumer
-that wants Pasta gets Pasta without the wire format having to carry text
-it cannot represent.
+Selected per sink: `pasta` (default), `json`, `text`.
+
+### A serialiser caveat that is not the format's fault
+
+**`basta_write()` cannot currently serialise these payloads**, measured
+2026-08-21 by round-tripping strings through `pasta_write` →
+`pasta_parse`:
+
+| input | written as | re-parses |
+|---|---|---|
+| `error: unknown type name "u64"` | `"error: ... "u64""` | **no** |
+| a string ending in `"` | closing quote merges with the delimiter | **no** |
+| a string containing `"""` | terminates early | **no** |
+| anything with a newline | `"""..."""` | yes |
+
+`basta_writer.c`'s `write_string()` only reaches for the `"""` form when
+the string contains a newline, so an ordinary single-line diagnostic
+carrying a double quote is emitted unparseably — and `pasta_write()`
+returns it without complaint, so only re-parsing catches it.
+
+So `now_events.c` writes its own Pasta rather than building a value tree
+and calling the library writer. The rules it follows are:
+
+- free text (`detail`) always goes in `"""..."""`;
+- a `"""` inside that text is broken up and `detail_lossy` is set;
+- text ending in `"` gets a newline appended and `detail_lossy` is set;
+- short fields (ids, names, paths) go in plain `"..."` and cannot
+  contain a quote or newline — anything that would is dropped, so a
+  corrupt value can never break the framing.
+
+This is reported to the format owner. If the writer is fixed, this
+module should move to it — the tests that pin these four cases are what
+tells you the move is safe.
+
+### Reading either form
+
+`now events:listen` accepts both without being told which arrived. That
+is a dispatch, not a guess: a Pasta event's first key is bare (`{ v: 1`)
+and a JSON event's is quoted (`{"v":1`), so each decoder rejects the
+other's output outright rather than half-reading it. There is a test for
+exactly that property, because a decoder that *partially* accepted the
+other format would turn this into sniffing.
+
+### basta, and what it is for
+
+Named here and deliberately not implemented in v1. Its value is not a
+fourth spelling of the same map — it is carrying bytes no text form can:
+a small binary payload, or a credential a chained step needs. That wants
+its own design (who may read it, how it is bounded, whether it belongs
+in an event at all) and it is a v1.1 question, not a v1 one.
 
 ## 4. Envelope
 
@@ -104,7 +152,7 @@ Optional fields, by event:
 | `project` | string | `group:artifact:version` |
 | `module` | string | source path or module name |
 | `detail` | string | human-readable text, truncated to fit |
-| `detail_truncated` | bool | present and true only when `detail` was cut |
+| `detail_lossy` | bool | present and true when `detail` is not byte-exact — shortened to fit, or altered to suit the format |
 | `code` | int | process exit code (`run.finished` only) |
 | `counts` | object | `{compiled, skipped, failed, passed, total}` — any subset |
 | `elapsed_ms` | int | milliseconds since `run.started` |
@@ -135,8 +183,14 @@ running.
 
 ### Example
 
+```
+{ v: 1, run: "a3f1c9d2e4b6", seq: 7, ts: "2026-08-21T09:41:02Z", event: "module.failed", phase: "compile", ok: false, project: "dev.iridium:gut:0.1.0", module: "src/main/c/remote.c", detail: """remote.c:512:9: error: unknown type name "u64"""" }
+```
+
+The same event with `--wire json`:
+
 ```json
-{"v":1,"run":"a3f1c9d2e4b6","seq":7,"ts":"2026-08-21T09:41:02Z","event":"module.failed","phase":"compile","ok":false,"project":"dev.iridium:gut:0.1.0","module":"src/main/c/remote.c","detail":"remote.c:512:9: error: 'pos' undeclared"}
+{"v":1,"run":"a3f1c9d2e4b6","seq":7,"ts":"2026-08-21T09:41:02Z","event":"module.failed","phase":"compile","ok":false,"project":"dev.iridium:gut:0.1.0","module":"src/main/c/remote.c","detail":"remote.c:512:9: error: unknown type name \"u64\""}
 ```
 
 ## 6. Loss, ordering and the rule that matters
@@ -205,7 +259,7 @@ NOW_EVENTS=udp://127.0.0.1:9099             # environment
 ```
 ```pasta
 ; ~/.now/config.pasta
-events: { url: "udp://127.0.0.1:9099", file: 1 }
+events: { url: "udp://127.0.0.1:9099", wire: "pasta", file: 1 }
 ```
 
 Absent all three, nothing is emitted and no socket is created.
@@ -214,7 +268,7 @@ Absent all three, nothing is emitted and no socket is created.
 
 ```
 now events:listen <url> [--filter <event>[,<event>...]]
-                        [--output json|pasta|text]
+                        [--output pasta|json|text]
                         [--until <event>] [--timeout <sec>]
                         [--insecure]
 ```

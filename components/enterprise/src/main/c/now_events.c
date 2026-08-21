@@ -150,7 +150,7 @@ static size_t encode_attempt(char *out, size_t cap, const NowEvent *ev,
     if (esc_module[0])  APPEND(",\"module\":\"%s\"", esc_module);
     if (esc_detail[0]) {
         APPEND(",\"detail\":\"%s\"", esc_detail);
-        if (mark_truncated) APPEND(",\"detail_truncated\":true");
+        if (mark_truncated) APPEND(",\"detail_lossy\":true");
     }
     if (ev->code >= 0)       APPEND(",\"code\":%d", ev->code);
     if (ev->elapsed_ms >= 0) APPEND(",\"elapsed_ms\":%ld", ev->elapsed_ms);
@@ -176,14 +176,14 @@ static size_t encode_attempt(char *out, size_t cap, const NowEvent *ev,
     return n;
 }
 
-NOW_API size_t now_event_encode(char *out, size_t out_cap, const NowEvent *ev) {
+NOW_API size_t now_event_encode_json(char *out, size_t out_cap, const NowEvent *ev) {
     size_t detail_len, n;
 
     if (!out || !ev || out_cap == 0) return 0;
     if (out_cap > NOW_EVENTS_MAX_DATAGRAM) out_cap = NOW_EVENTS_MAX_DATAGRAM;
 
     detail_len = strlen(ev->detail);
-    n = encode_attempt(out, out_cap, ev, detail_len, ev->detail_truncated);
+    n = encode_attempt(out, out_cap, ev, detail_len, ev->detail_lossy);
     if (n) return n;
 
     /* Too big. Shorten `detail` until it fits — it is the only field
@@ -201,7 +201,7 @@ NOW_API size_t now_event_encode(char *out, size_t out_cap, const NowEvent *ev) {
         NowEvent bare = *ev;
         bare.detail[0] = '\0';
         bare.module[0] = '\0';
-        bare.detail_truncated = 1;
+        bare.detail_lossy = 1;
         return encode_attempt(out, out_cap, &bare, 0, 1);
     }
 }
@@ -290,7 +290,7 @@ static int json_get_str(const char *json, size_t len, const char *key,
     return 0;
 }
 
-NOW_API int now_event_decode(NowEvent *ev, const char *json, size_t len) {
+NOW_API int now_event_decode_json(NowEvent *ev, const char *json, size_t len) {
     long v = 0, n = 0;
     char name[64];
 
@@ -321,7 +321,7 @@ NOW_API int now_event_decode(NowEvent *ev, const char *json, size_t len) {
     json_get_str(json, len, "project", ev->project, sizeof(ev->project));
     json_get_str(json, len, "module",  ev->module,  sizeof(ev->module));
     json_get_str(json, len, "detail",  ev->detail,  sizeof(ev->detail));
-    json_get_bool(json, len, "detail_truncated", &ev->detail_truncated);
+    json_get_bool(json, len, "detail_lossy", &ev->detail_lossy);
 
     if (json_get_int(json, len, "code", &n) == 0)       ev->code = (int)n;
     if (json_get_int(json, len, "elapsed_ms", &n) == 0) ev->elapsed_ms = n;
@@ -336,29 +336,25 @@ NOW_API int now_event_decode(NowEvent *ev, const char *json, size_t len) {
     return 0;
 }
 
+NOW_API int now_event_decode(NowEvent *ev, const char *buf, size_t len) {
+    /* Pasta first, because it is the default on the wire. The two are
+     * mutually exclusive by construction — a bare first key versus a
+     * quoted one — so this is a dispatch, not a guess. */
+    if (now_event_decode_pasta(ev, buf, len) == 0) return 0;
+    return now_event_decode_json(ev, buf, len);
+}
+
 /* ==== rendering ==== */
 
 NOW_API size_t now_event_render(char *out, size_t out_cap,
                                 const NowEvent *ev, const char *fmt) {
     if (!out || !ev || out_cap == 0) return 0;
-    if (!fmt) fmt = "json";
+    if (!fmt) fmt = "pasta";
 
     if (strcmp(fmt, "json") == 0)
-        return now_event_encode(out, out_cap, ev);
-
-    if (strcmp(fmt, "pasta") == 0) {
-        /* Pasta strings carry no escapes, so anything that would need one
-         * cannot appear. `detail` is the field that would, and it is
-         * dropped rather than mangled — the JSON form is there for
-         * callers who need it. This is the same constraint that kept
-         * Pasta off the wire (§3). */
-        int w = snprintf(out, out_cap,
-            "{ v: %d, run: \"%s\", seq: %ld, ts: \"%s\", event: \"%s\", "
-            "phase: \"%s\", ok: %s }",
-            ev->v, ev->run, ev->seq, ev->ts, now_event_name(ev->event),
-            ev->phase, ev->ok ? "true" : "false");
-        return (w < 0 || (size_t)w >= out_cap) ? 0 : (size_t)w;
-    }
+        return now_event_encode_json(out, out_cap, ev);
+    if (strcmp(fmt, "pasta") == 0)
+        return now_event_encode_pasta(out, out_cap, ev);
 
     /* text */
     {
@@ -381,6 +377,274 @@ NOW_API size_t now_event_render(char *out, size_t out_cap,
                          ev->ts, now_event_name(ev->event), ev->phase);
         return (w < 0 || (size_t)w >= out_cap) ? 0 : (size_t)w;
     }
+}
+
+/* ==== Pasta ====
+ *
+ * Pasta is the wire default: a stricter grammar than JSON with one
+ * implementation behind it, so there is far less room for two readers to
+ * disagree about the same bytes.
+ *
+ * It is hand-written rather than built through basta_new_map() +
+ * basta_write(), and that is not a preference. Measured 2026-08-21,
+ * basta_writer.c's write_string() only reaches for the """ form when a
+ * string contains a newline, so it emits unparseable output for three
+ * ordinary cases:
+ *
+ *   error: unknown type name "u64"   ->  {detail: "error: ... "u64""}
+ *   a string ending in a quote        ->  closing delimiter merges
+ *   a string containing """           ->  terminates early
+ *
+ * pasta_write() returns those happily; only re-parsing catches them. A
+ * compiler diagnostic containing a double quote is the most ordinary
+ * payload an event has, so the writer cannot be used here until that is
+ * fixed. Reported to the format owner. Meanwhile the rules below are
+ * explicit and the round trip is tested.
+ */
+
+/* Free-text fields go out as """...""" so quotes need no escaping. Two
+ * things still cannot appear inside that form: the delimiter itself, and
+ * a trailing quote (which would merge with it). Both are altered and
+ * flagged rather than silently mangled. */
+static size_t pasta_escape_free_text(char *out, size_t cap, const char *in,
+                                     int *lossy) {
+    size_t o = 0;
+    const char *p = in;
+
+    while (*p) {
+        if (p[0] == '"' && p[1] == '"' && p[2] == '"') {
+            /* Break the delimiter with a space; the text stays readable
+             * and the reader is told it is not byte-exact. */
+            if (o + 4 >= cap) return (size_t)-1;
+            out[o++] = '"'; out[o++] = '"'; out[o++] = ' '; out[o++] = '"';
+            *lossy = 1;
+            p += 3;
+            continue;
+        }
+        if (o + 1 >= cap) return (size_t)-1;
+        out[o++] = *p++;
+    }
+    /* A trailing quote would close the delimiter one byte early. */
+    if (o > 0 && out[o - 1] == '"') {
+        if (o + 1 >= cap) return (size_t)-1;
+        out[o++] = '\n';
+        *lossy = 1;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/* Short fields (ids, names, paths) go out as plain "..." strings. They
+ * cannot contain a quote or a newline by construction, but a hostile or
+ * corrupt one must not be able to break the framing, so anything that
+ * would is dropped. */
+static size_t pasta_escape_plain(char *out, size_t cap, const char *in) {
+    size_t o = 0;
+    const char *p = in;
+    for (; *p; p++) {
+        if (*p == '"' || *p == '\n' || *p == '\r') continue;
+        if (o + 1 >= cap) return (size_t)-1;
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+static size_t encode_pasta_attempt(char *out, size_t cap, const NowEvent *ev,
+                                   size_t detail_len, int mark_lossy) {
+    char det[1600], mod[600], proj[420], hst[128], cut[768];
+    size_t n = 0;
+    int w;
+    int lossy = mark_lossy;
+
+    det[0] = mod[0] = proj[0] = hst[0] = '\0';
+
+    if (ev->detail[0]) {
+        if (detail_len >= sizeof(cut)) detail_len = sizeof(cut) - 1;
+        memcpy(cut, ev->detail, detail_len);
+        cut[detail_len] = '\0';
+        if (pasta_escape_free_text(det, sizeof(det), cut, &lossy) == (size_t)-1)
+            return 0;
+    }
+    if (ev->module[0] &&
+        pasta_escape_plain(mod, sizeof(mod), ev->module) == (size_t)-1) return 0;
+    if (ev->project[0] &&
+        pasta_escape_plain(proj, sizeof(proj), ev->project) == (size_t)-1) return 0;
+    if (ev->host[0] &&
+        pasta_escape_plain(hst, sizeof(hst), ev->host) == (size_t)-1) return 0;
+
+    w = snprintf(out, cap,
+        "{ v: %d, run: \"%s\", seq: %ld, ts: \"%s\", event: \"%s\", "
+        "phase: \"%s\", ok: %s",
+        ev->v, ev->run, ev->seq, ev->ts,
+        now_event_name(ev->event), ev->phase, ev->ok ? "true" : "false");
+    if (w < 0 || (size_t)w >= cap) return 0;
+    n = (size_t)w;
+
+#define PAPPEND(...) do {                                  \
+        w = snprintf(out + n, cap - n, __VA_ARGS__);       \
+        if (w < 0 || (size_t)w >= cap - n) return 0;       \
+        n += (size_t)w;                                    \
+    } while (0)
+
+    if (proj[0]) PAPPEND(", project: \"%s\"", proj);
+    if (mod[0])  PAPPEND(", module: \"%s\"", mod);
+    if (det[0]) {
+        PAPPEND(", detail: \"\"\"%s\"\"\"", det);
+        if (lossy) PAPPEND(", detail_lossy: true");
+    }
+    if (ev->code >= 0)       PAPPEND(", code: %d", ev->code);
+    if (ev->elapsed_ms >= 0) PAPPEND(", elapsed_ms: %ld", ev->elapsed_ms);
+
+    if (ev->counts.compiled >= 0) PAPPEND(", compiled: %d", ev->counts.compiled);
+    if (ev->counts.skipped  >= 0) PAPPEND(", skipped: %d",  ev->counts.skipped);
+    if (ev->counts.failed   >= 0) PAPPEND(", failed: %d",   ev->counts.failed);
+    if (ev->counts.passed   >= 0) PAPPEND(", passed: %d",   ev->counts.passed);
+    if (ev->counts.total    >= 0) PAPPEND(", total: %d",    ev->counts.total);
+
+    if (hst[0])      PAPPEND(", host: \"%s\"", hst);
+    if (ev->pid > 0) PAPPEND(", pid: %d", ev->pid);
+
+    PAPPEND(" }");
+#undef PAPPEND
+    return n;
+}
+
+NOW_API size_t now_event_encode_pasta(char *out, size_t out_cap,
+                                      const NowEvent *ev) {
+    size_t detail_len, n;
+
+    if (!out || !ev || out_cap == 0) return 0;
+    if (out_cap > NOW_EVENTS_MAX_DATAGRAM) out_cap = NOW_EVENTS_MAX_DATAGRAM;
+
+    detail_len = strlen(ev->detail);
+    n = encode_pasta_attempt(out, out_cap, ev, detail_len, ev->detail_lossy);
+    if (n) return n;
+
+    while (detail_len > 0) {
+        detail_len /= 2;
+        n = encode_pasta_attempt(out, out_cap, ev, detail_len, 1);
+        if (n) return n;
+    }
+    {
+        NowEvent bare = *ev;
+        bare.detail[0] = '\0';
+        bare.module[0] = '\0';
+        bare.detail_lossy = 1;
+        return encode_pasta_attempt(out, out_cap, &bare, 0, 1);
+    }
+}
+
+/* ---- reading Pasta back ---- */
+
+static const char *pasta_find_key(const char *doc, size_t len, const char *key) {
+    char pat[64];
+    size_t plen = (size_t)snprintf(pat, sizeof(pat), "%s:", key);
+    size_t i;
+    if (plen >= sizeof(pat)) return NULL;
+    for (i = 0; i + plen <= len; i++) {
+        /* A key is preceded by '{' or ', ' — without that check, "total"
+         * would also match the tail of "subtotal". */
+        if (i > 0 && doc[i - 1] != ' ' && doc[i - 1] != '{') continue;
+        if (memcmp(doc + i, pat, plen) != 0) continue;
+        {
+            const char *p = doc + i + plen;
+            const char *end = doc + len;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static int pasta_get_int(const char *doc, size_t len, const char *key, long *out) {
+    const char *p = pasta_find_key(doc, len, key);
+    if (!p) return -1;
+    *out = strtol(p, NULL, 10);
+    return 0;
+}
+
+static int pasta_get_bool(const char *doc, size_t len, const char *key, int *out) {
+    const char *p = pasta_find_key(doc, len, key);
+    if (!p) return -1;
+    *out = (strncmp(p, "true", 4) == 0);
+    return 0;
+}
+
+static int pasta_get_str(const char *doc, size_t len, const char *key,
+                         char *out, size_t cap) {
+    const char *p = pasta_find_key(doc, len, key);
+    const char *end = doc + len;
+    const char *stop;
+    size_t n;
+
+    if (!p || p >= end || *p != '"') return -1;
+
+    if (p + 2 < end && p[1] == '"' && p[2] == '"') {
+        /* """ ... """ — everything up to the next delimiter, verbatim. */
+        p += 3;
+        stop = p;
+        while (stop + 2 < end &&
+               !(stop[0] == '"' && stop[1] == '"' && stop[2] == '"')) stop++;
+        if (stop + 2 >= end) return -1;
+    } else {
+        p += 1;
+        stop = p;
+        while (stop < end && *stop != '"') stop++;
+        if (stop >= end) return -1;
+    }
+
+    n = (size_t)(stop - p);
+    if (n + 1 > cap) return -1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 0;
+}
+
+NOW_API int now_event_decode_pasta(NowEvent *ev, const char *doc, size_t len) {
+    long v = 0, n = 0;
+    char name[64];
+
+    if (!ev || !doc || len == 0) return -1;
+
+    memset(ev, 0, sizeof(*ev));
+    ev->code = -1;
+    ev->elapsed_ms = -1;
+    ev->counts.compiled = ev->counts.skipped = ev->counts.failed =
+        ev->counts.passed = ev->counts.total = -1;
+
+    if (pasta_get_int(doc, len, "v", &v) != 0) return -1;
+    if (v != NOW_EVENTS_SCHEMA_VERSION) return -1;
+    ev->v = (int)v;
+
+    if (pasta_get_str(doc, len, "run", ev->run, sizeof(ev->run)) != 0) return -1;
+    if (pasta_get_int(doc, len, "seq", &ev->seq) != 0) return -1;
+    if (pasta_get_str(doc, len, "ts", ev->ts, sizeof(ev->ts)) != 0) return -1;
+    if (pasta_get_str(doc, len, "event", name, sizeof(name)) != 0) return -1;
+
+    ev->event = now_event_parse_name(name);
+    if (ev->event == NOW_EVENT__COUNT) return -1;
+
+    if (pasta_get_str(doc, len, "phase", ev->phase, sizeof(ev->phase)) != 0)
+        ev->phase[0] = '\0';
+    if (pasta_get_bool(doc, len, "ok", &ev->ok) != 0) ev->ok = 1;
+
+    pasta_get_str(doc, len, "project", ev->project, sizeof(ev->project));
+    pasta_get_str(doc, len, "module",  ev->module,  sizeof(ev->module));
+    pasta_get_str(doc, len, "detail",  ev->detail,  sizeof(ev->detail));
+    pasta_get_bool(doc, len, "detail_lossy", &ev->detail_lossy);
+
+    if (pasta_get_int(doc, len, "code", &n) == 0)       ev->code = (int)n;
+    if (pasta_get_int(doc, len, "elapsed_ms", &n) == 0) ev->elapsed_ms = n;
+    if (pasta_get_int(doc, len, "compiled", &n) == 0)   ev->counts.compiled = (int)n;
+    if (pasta_get_int(doc, len, "skipped", &n) == 0)    ev->counts.skipped  = (int)n;
+    if (pasta_get_int(doc, len, "failed", &n) == 0)     ev->counts.failed   = (int)n;
+    if (pasta_get_int(doc, len, "passed", &n) == 0)     ev->counts.passed   = (int)n;
+    if (pasta_get_int(doc, len, "total", &n) == 0)      ev->counts.total    = (int)n;
+    if (pasta_get_int(doc, len, "pid", &n) == 0)        ev->pid = (int)n;
+    pasta_get_str(doc, len, "host", ev->host, sizeof(ev->host));
+
+    return 0;
 }
 
 /* ==== UDP ==== */
@@ -435,9 +699,10 @@ static int addr_is_multicast(const char *host) {
 struct NowEventSink {
     now_sock           fd;
     struct sockaddr_in to;
+    char               wire[16];
 };
 
-NOW_API NowEventSink *now_event_sink_open(const char *url) {
+NOW_API NowEventSink *now_event_sink_open(const char *url, const char *wire) {
     char host[128];
     int port;
     NowEventSink *s;
@@ -447,6 +712,8 @@ NOW_API NowEventSink *now_event_sink_open(const char *url) {
 
     s = (NowEventSink *)calloc(1, sizeof(*s));
     if (!s) return NULL;
+
+    snprintf(s->wire, sizeof(s->wire), "%s", (wire && *wire) ? wire : "pasta");
 
     s->fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (s->fd == NOW_SOCK_BAD) { free(s); return NULL; }
@@ -484,7 +751,7 @@ NOW_API void now_event_sink_send(NowEventSink *sink, const NowEvent *ev) {
 
     if (!sink || !ev) return;
 
-    n = now_event_encode(buf, sizeof(buf), ev);
+    n = now_event_render(buf, sizeof(buf), ev, sink->wire);
     if (n == 0) return;
 
     repeats = now_event_is_terminal(ev->event) ? NOW_EVENTS_TERMINAL_REPEATS : 1;
@@ -732,7 +999,8 @@ NOW_API int now_events_listen(const NowEventListenOpts *opts,
         expect_seq = ev.seq + 1;
 
         if (filter_admits(opts->filter, now_event_name(ev.event))) {
-            size_t n = now_event_render(line, sizeof(line), &ev, opts->output);
+            size_t n = now_event_render(line, sizeof(line), &ev,
+                                        opts->output ? opts->output : "pasta");
             if (n) {
                 fwrite(line, 1, n, stdout);
                 fputc('\n', stdout);

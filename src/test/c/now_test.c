@@ -1878,7 +1878,7 @@ static void test_events_encode_decode_roundtrip(void) {
     in.pid = 4242;
     snprintf(in.host, sizeof(in.host), "workstation");
 
-    size_t n = now_event_encode(buf, sizeof(buf), &in);
+    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
     ASSERT_EQ(n > 0, 1);
     ASSERT_EQ(now_event_decode(&out, buf, n), 0);
 
@@ -1919,11 +1919,18 @@ static void test_events_detail_survives_escaping(void) {
     ev_seed(&in, NOW_EVENT_MODULE_FAILED);
     snprintf(in.detail, sizeof(in.detail), "%s", nasty);
 
-    size_t n = now_event_encode(buf, sizeof(buf), &in);
+    /* Both textual forms have to carry it, and the decoder has to pick
+     * the right one without being told. */
+    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
     ASSERT_EQ(n > 0, 1);
     ASSERT_EQ(now_event_decode(&out, buf, n), 0);
     ASSERT_SAME_STR(out.detail, nasty);
-    ASSERT_EQ(out.detail_truncated, 0);
+    ASSERT_EQ(out.detail_lossy, 0);
+
+    n = now_event_render(buf, sizeof(buf), &in, "json");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+    ASSERT_SAME_STR(out.detail, nasty);
     PASS();
 }
 
@@ -1944,12 +1951,12 @@ static void test_events_oversize_detail_is_truncated_not_dropped(void) {
     for (i = 0; i < sizeof(in.detail) - 1; i++) in.detail[i] = '"';
     in.detail[sizeof(in.detail) - 1] = '\0';
 
-    size_t n = now_event_encode(buf, sizeof(buf), &in);
+    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
     ASSERT_EQ(n > 0, 1);
     /* Never fragment: §3 makes this a hard bound, not a target. */
     ASSERT_EQ(n <= NOW_EVENTS_MAX_DATAGRAM, 1);
     ASSERT_EQ(now_event_decode(&out, buf, n), 0);
-    ASSERT_EQ(out.detail_truncated, 1);
+    ASSERT_EQ(out.detail_lossy, 1);
     ASSERT_EQ(strlen(out.detail) < strlen(in.detail), 1);
     /* The event still arrives, which is the whole point of truncating. */
     ASSERT_EQ((int)out.event, (int)NOW_EVENT_MODULE_FAILED);
@@ -2023,7 +2030,7 @@ static void test_events_over_a_real_socket(void) {
     NowEventSource *src = now_event_source_open("udp://127.0.0.1:19477", 0, &res);
     if (!src) { FAIL(res.message); return; }
 
-    NowEventSink *sink = now_event_sink_open("udp://127.0.0.1:19477");
+    NowEventSink *sink = now_event_sink_open("udp://127.0.0.1:19477", NULL);
     if (!sink) { now_event_source_close(src); FAIL("sink open"); return; }
 
     NowEvent in, out;
@@ -2085,6 +2092,91 @@ static void test_events_names_round_trip(void) {
      * has to be repeated on the wire. */
     ASSERT_EQ(now_event_is_terminal(NOW_EVENT_RUN_FINISHED), 1);
     ASSERT_EQ(now_event_is_terminal(NOW_EVENT_RUN_PROGRESS), 0);
+    PASS();
+}
+
+static void test_events_pasta_carries_what_the_writer_cannot(void) {
+    TEST("events: Pasta carries the strings basta_write mangles");
+
+    /* Measured 2026-08-21: basta_writer.c's write_string() only reaches
+     * for the """ form when a string contains a newline, so each of
+     * these comes back out of pasta_write() as text that will not
+     * re-parse. They are the reason this module writes its own Pasta.
+     * If that writer is fixed and this module is switched over, these
+     * are the cases that must keep passing. */
+    static const char *hard[] = {
+        "error: unknown type name \"u64\"",   /* quote, no newline */
+        "ends with a quote\"",                 /* would close early */
+        "line one\nline two",                  /* the easy one */
+        "multi\nline with \"quotes\" inside",
+        NULL
+    };
+    int i;
+
+    for (i = 0; hard[i]; i++) {
+        NowEvent in, out;
+        char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+        size_t n;
+
+        ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+        snprintf(in.detail, sizeof(in.detail), "%s", hard[i]);
+
+        n = now_event_render(buf, sizeof(buf), &in, "pasta");
+        ASSERT_EQ(n > 0, 1);
+        ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+
+        if (out.detail_lossy) {
+            /* Only the trailing-quote case may be altered, and it must
+             * say so rather than change the bytes quietly. */
+            ASSERT_EQ(strncmp(out.detail, hard[i], strlen(hard[i])) == 0, 1);
+        } else {
+            ASSERT_SAME_STR(out.detail, hard[i]);
+        }
+    }
+
+    /* A detail containing the delimiter itself cannot be carried
+     * verbatim by any """ string. It must arrive altered AND flagged,
+     * never altered in silence. */
+    {
+        NowEvent in, out;
+        char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+        size_t n;
+
+        ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+        snprintf(in.detail, sizeof(in.detail), "contains \"\"\" a delimiter");
+
+        n = now_event_render(buf, sizeof(buf), &in, "pasta");
+        ASSERT_EQ(n > 0, 1);
+        ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+        ASSERT_EQ(out.detail_lossy, 1);
+        ASSERT_EQ((int)out.event, (int)NOW_EVENT_MODULE_FAILED);
+    }
+    PASS();
+}
+
+static void test_events_formats_do_not_read_each_other(void) {
+    TEST("events: a Pasta reader will not half-read JSON, or the reverse");
+
+    NowEvent in, out;
+    char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+    size_t n;
+
+    ev_seed(&in, NOW_EVENT_RUN_FINISHED);
+    in.code = 0;
+    in.ok = 1;
+
+    /* Each decoder must refuse the other's output outright. If one could
+     * partially read the other, the dispatching decoder would be a guess
+     * rather than a dispatch. */
+    n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode_pasta(&out, buf, n), 0);
+    ASSERT_EQ(now_event_decode_json(&out, buf, n) != 0, 1);
+
+    n = now_event_render(buf, sizeof(buf), &in, "json");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode_json(&out, buf, n), 0);
+    ASSERT_EQ(now_event_decode_pasta(&out, buf, n) != 0, 1);
     PASS();
 }
 
@@ -8385,6 +8477,8 @@ int main(void) {
     test_events_over_a_real_socket();
     test_events_listener_refuses_untrusted_addresses();
     test_events_names_round_trip();
+    test_events_pasta_carries_what_the_writer_cannot();
+    test_events_formats_do_not_read_each_other();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 
