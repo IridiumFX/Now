@@ -4747,6 +4747,74 @@ static void test_module_order_basic(void) {
     PASS();
 }
 
+/* The same ordering property at N=3, which is where it stops being
+ * symmetric.
+ *
+ * Amy's observation, named in three consecutive handovers and never run
+ * until now: a relation checked with two elements hides its own
+ * direction and cannot see transitivity at all. `now` orders module
+ * units, workspace waves, override precedence and search paths, and
+ * every ordering test in this suite used exactly two elements — so a
+ * sort that respected only direct edges, or that stopped after a single
+ * pass, passed all of them.
+ *
+ * base <- middle <- top, handed to the sorter exactly reversed. Getting
+ * this right needs the ordering to be transitive, not merely pairwise. */
+static void test_module_order_three_deep(void) {
+    TEST("module: topo order is transitive at three units");
+
+    char *base = write_temp_module_file("topo3_base.cppm",
+        "export module base;\n"
+        "export const char *base_v() { return \"b\"; }\n");
+    char *middle = write_temp_module_file("topo3_middle.cppm",
+        "export module middle;\n"
+        "import base;\n"
+        "export const char *middle_v() { return base_v(); }\n");
+    char *top = write_temp_module_file("topo3_top.cpp",
+        "import middle;\n"
+        "int main() { middle_v(); return 0; }\n");
+    ASSERT_NOT_NULL(base);
+    ASSERT_NOT_NULL(middle);
+    ASSERT_NOT_NULL(top);
+
+    NowModuleScan scan;
+    now_module_scan_init(&scan);
+    now_module_scan_file(&scan, base);
+    now_module_scan_file(&scan, middle);
+    now_module_scan_file(&scan, top);
+
+    const char *sources[] = { top, middle, base };
+    NowModuleOrder order;
+    int rc = now_module_order(&scan, sources, 3, &order);
+
+    int ok = 0;
+    int base_at = -1, middle_at = -1, top_at = -1;
+    if (rc == 0 && order.count == 3) {
+        for (size_t i = 0; i < order.count; i++) {
+            if (strcmp(order.paths[i], base) == 0)   base_at   = (int)i;
+            if (strcmp(order.paths[i], middle) == 0) middle_at = (int)i;
+            if (strcmp(order.paths[i], top) == 0)    top_at    = (int)i;
+        }
+        ok = (base_at >= 0 && middle_at >= 0 && top_at >= 0 &&
+              base_at < middle_at && middle_at < top_at);
+    }
+    if (rc == 0) now_module_order_free(&order);
+    now_module_scan_free(&scan);
+    remove_temp_file(base); remove_temp_file(middle); remove_temp_file(top);
+    free(base); free(middle); free(top);
+
+    if (rc != 0) { FAIL("now_module_order failed on three units"); return; }
+    if (!ok) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "expected base < middle < top, got %d %d %d",
+                 base_at, middle_at, top_at);
+        FAIL(msg);
+        return;
+    }
+    PASS();
+}
+
 static void test_module_find(void) {
     TEST("module: find returns interface by name");
     char *path = write_temp_module_file("test_find.cppm",
@@ -7897,6 +7965,7 @@ int main(void) {
     test_module_scan_impl();
     test_module_scan_skips_comments();
     test_module_order_basic();
+    test_module_order_three_deep();
     test_module_find();
     test_module_bmi_path();
     test_module_classify_cppm();
