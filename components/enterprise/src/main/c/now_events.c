@@ -10,10 +10,11 @@
  *
  * The UDP shim at the bottom is written against raw sockets because
  * apennines has no datagram primitive: it exposes tcp.h but nothing for
- * SOCK_DGRAM, and only dns.c uses one, privately. A `t3/net/udp.h` is
- * the natural home for this and is worth asking them for — that request
- * has NOT been sent yet. Until it exists this mirrors dns.c's platform
- * guards rather than inventing a third shape.
+ * SOCK_DGRAM, and only dns.c uses one, privately. `t3/net/udp.h` is the
+ * natural home for it and has been requested (to-apennines.md,
+ * 2026-08-21). Until it exists this mirrors dns.c's platform guards
+ * rather than inventing a third shape; when it lands, this section is
+ * what should be deleted.
  */
 #include "now_events.h"
 #include "now_fs.h"
@@ -22,6 +23,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -904,6 +910,193 @@ NOW_API void now_event_source_close(NowEventSource *src) {
     if (!src) return;
     if (src->fd != NOW_SOCK_BAD) now_sock_close(src->fd);
     free(src);
+}
+
+/* ==== the emitter ====
+ *
+ * One per process. Off unless a destination was named, and every entry
+ * point leaves immediately when it is off — a build that did not ask for
+ * events pays one predicate per call site and nothing more.
+ */
+
+static struct {
+    int            active;
+    NowEventSink  *sink;
+    FILE          *file;
+    char           run[13];
+    long           seq;
+    char           project[192];
+    char           phase[32];
+    int            ok;
+    time_t         started;
+    time_t         last_progress;
+} g_ev;
+
+static void ev_now_ts(char *out, size_t cap) {
+    time_t t = time(NULL);
+    struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+NOW_API int now_events_active(void) { return g_ev.active; }
+
+NOW_API void now_events_open(const char *url, const char *wire,
+                             const char *file_path) {
+    memset(&g_ev, 0, sizeof(g_ev));
+    g_ev.ok = 1;
+    g_ev.started = time(NULL);
+
+    if (!url || !*url) url = getenv("NOW_EVENTS");
+    if (!wire || !*wire) wire = getenv("NOW_EVENTS_WIRE");
+
+    if (url && *url) g_ev.sink = now_event_sink_open(url, wire);
+
+    if (file_path && *file_path) {
+        /* The sidecar usually lives under target/, which does not exist
+         * yet on a clean tree — the build creates it later. Without this
+         * the fopen simply failed and the file half of §6 quietly did
+         * not happen, which is the one guarantee a stalled waiter
+         * depends on. Measured: a real failing build emitted every
+         * datagram correctly and wrote no record at all. */
+        char dir[PATH_MAX];
+        char *sep;
+        snprintf(dir, sizeof(dir), "%s", file_path);
+        sep = strrchr(dir, '/');
+        {
+            char *bsep = strrchr(dir, '\\');
+            if (bsep && (!sep || bsep > sep)) sep = bsep;
+        }
+        if (sep) {
+            *sep = '\0';
+            now_mkdir_p(dir);
+        }
+        g_ev.file = fopen(file_path, "ab");
+    }
+
+    if (!g_ev.sink && !g_ev.file) return;
+
+    /* An id only has to separate runs that could overlap on one
+     * destination. Two builds cannot share a pid in the same second, so
+     * the pair is enough without pulling an entropy source into this
+     * component. */
+    {
+        unsigned long a = (unsigned long)g_ev.started;
+#ifdef _WIN32
+        unsigned long b = (unsigned long)GetCurrentProcessId();
+#else
+        unsigned long b = (unsigned long)getpid();
+#endif
+        snprintf(g_ev.run, sizeof(g_ev.run), "%08lx%04lx", a, b & 0xffffUL);
+    }
+    g_ev.active = 1;
+}
+
+/* Fill the envelope, send, append to the sidecar. The sidecar is the
+ * record and the datagram is the notification — §6. */
+static void ev_emit(NowEventType type, const char *module,
+                    const char *detail, int code,
+                    const NowEventCounts *counts) {
+    NowEvent ev;
+
+    if (!g_ev.active) return;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.v = NOW_EVENTS_SCHEMA_VERSION;
+    snprintf(ev.run, sizeof(ev.run), "%s", g_ev.run);
+    ev.seq = g_ev.seq++;
+    ev_now_ts(ev.ts, sizeof(ev.ts));
+    ev.event = type;
+    snprintf(ev.phase, sizeof(ev.phase), "%s", g_ev.phase);
+    ev.ok = g_ev.ok;
+    snprintf(ev.project, sizeof(ev.project), "%s", g_ev.project);
+    if (module) snprintf(ev.module, sizeof(ev.module), "%s", module);
+    if (detail) snprintf(ev.detail, sizeof(ev.detail), "%s", detail);
+    ev.code = code;
+    ev.elapsed_ms = (type == NOW_EVENT_RUN_STARTED)
+                  ? -1
+                  : (long)(time(NULL) - g_ev.started) * 1000L;
+    ev.counts.compiled = ev.counts.skipped = ev.counts.failed =
+        ev.counts.passed = ev.counts.total = -1;
+    if (counts) ev.counts = *counts;
+    ev.pid = 0;
+
+    if (g_ev.sink) now_event_sink_send(g_ev.sink, &ev);
+
+    if (g_ev.file) {
+        char line[NOW_EVENTS_MAX_DATAGRAM + 2];
+        size_t n = now_event_encode_json(line, sizeof(line) - 1, &ev);
+        if (n) {
+            line[n] = '\n';
+            fwrite(line, 1, n + 1, g_ev.file);
+            /* Flushed per line on purpose: the whole value of the file is
+             * that a listener which missed a datagram can read it *now*,
+             * and a buffered record of a build that is still running is
+             * no record at all. */
+            fflush(g_ev.file);
+        }
+    }
+}
+
+NOW_API void now_events_run_started(const char *phase, const char *project) {
+    if (!g_ev.active) return;
+    snprintf(g_ev.phase, sizeof(g_ev.phase), "%s", phase ? phase : "");
+    if (project) snprintf(g_ev.project, sizeof(g_ev.project), "%s", project);
+    ev_emit(NOW_EVENT_RUN_STARTED, NULL, NULL, -1, NULL);
+}
+
+NOW_API void now_events_phase_started(const char *phase) {
+    if (!g_ev.active) return;
+    if (phase) snprintf(g_ev.phase, sizeof(g_ev.phase), "%s", phase);
+    ev_emit(NOW_EVENT_PHASE_STARTED, NULL, NULL, -1, NULL);
+}
+
+NOW_API void now_events_phase_finished(const char *phase, int ok,
+                                       const NowEventCounts *counts) {
+    if (!g_ev.active) return;
+    if (phase) snprintf(g_ev.phase, sizeof(g_ev.phase), "%s", phase);
+    if (!ok) g_ev.ok = 0;
+    ev_emit(NOW_EVENT_PHASE_FINISHED, NULL, NULL, -1, counts);
+}
+
+NOW_API void now_events_progress(const NowEventCounts *counts) {
+    time_t now;
+    if (!g_ev.active) return;
+    now = time(NULL);
+    /* At most one per second (§5). A 32-way build finishing a hundred
+     * translation units a second would otherwise say nothing useful very
+     * loudly. */
+    if (now == g_ev.last_progress) return;
+    g_ev.last_progress = now;
+    ev_emit(NOW_EVENT_RUN_PROGRESS, NULL, NULL, -1, counts);
+}
+
+NOW_API void now_events_module_failed(const char *module, const char *detail) {
+    if (!g_ev.active) return;
+    g_ev.ok = 0;
+    ev_emit(NOW_EVENT_MODULE_FAILED, module, detail, -1, NULL);
+}
+
+NOW_API void now_events_test_failed(const char *name, const char *detail) {
+    if (!g_ev.active) return;
+    g_ev.ok = 0;
+    ev_emit(NOW_EVENT_TEST_FAILED, name, detail, -1, NULL);
+}
+
+NOW_API void now_events_run_finished(int code, const NowEventCounts *counts) {
+    if (!g_ev.active) return;
+    if (code != 0) g_ev.ok = 0;
+    ev_emit(NOW_EVENT_RUN_FINISHED, NULL, NULL, code, counts);
+}
+
+NOW_API void now_events_close(void) {
+    if (g_ev.sink) now_event_sink_close(g_ev.sink);
+    if (g_ev.file) fclose(g_ev.file);
+    memset(&g_ev, 0, sizeof(g_ev));
 }
 
 /* ==== the listen loop ==== */

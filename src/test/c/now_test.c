@@ -2180,6 +2180,113 @@ static void test_events_formats_do_not_read_each_other(void) {
     PASS();
 }
 
+static void test_events_emitter_end_to_end(void) {
+    TEST("events: the emitter's run reaches a listener in order");
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19478", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    remove("target/test-events.jsonl");
+    now_events_open("udp://127.0.0.1:19478", NULL, "target/test-events.jsonl");
+    ASSERT_EQ(now_events_active(), 1);
+
+    now_events_run_started("build", "dev.iridium:demo:1.0.0");
+    now_events_phase_started("compile");
+    now_events_module_failed("src/main/c/broken.c",
+                             "error: unknown type name \"u64\"");
+    now_events_run_finished(1, NULL);
+    now_events_close();
+
+    /* Four distinct events, in order, with contiguous seq. The terminal
+     * one is sent three times and must dedupe to one. */
+    {
+        NowEvent ev;
+        int seen = 0;
+        long last = -1;
+        int saw_started = 0, saw_failed = 0, saw_finished = 0;
+        int guard;
+
+        for (guard = 0; guard < 20; guard++) {
+            int rc = now_event_source_recv(src, &ev, 1500);
+            if (rc != 1) break;
+            if (ev.seq == last) continue;          /* the terminal repeat */
+            ASSERT_EQ((int)(ev.seq == last + 1), 1);
+            last = ev.seq;
+            seen++;
+            if (ev.event == NOW_EVENT_RUN_STARTED) {
+                saw_started = 1;
+                ASSERT_SAME_STR(ev.project, "dev.iridium:demo:1.0.0");
+            }
+            if (ev.event == NOW_EVENT_MODULE_FAILED) {
+                saw_failed = 1;
+                ASSERT_SAME_STR(ev.module, "src/main/c/broken.c");
+                /* The double quote is the payload that decided the wire
+                 * format; it has to survive the whole path. */
+                ASSERT_EQ(strstr(ev.detail, "\"u64\"") != NULL, 1);
+                /* ok flips false the moment something fails, not at the
+                 * end of the run. */
+                ASSERT_EQ(ev.ok, 0);
+            }
+            if (ev.event == NOW_EVENT_RUN_FINISHED) {
+                saw_finished = 1;
+                ASSERT_EQ(ev.code, 1);
+                break;
+            }
+        }
+        now_event_source_close(src);
+
+        ASSERT_EQ(saw_started, 1);
+        ASSERT_EQ(saw_failed, 1);
+        ASSERT_EQ(saw_finished, 1);
+        ASSERT_EQ(seen, 4);
+    }
+
+    /* §6: the datagram is a doorbell, the file is the record. A waiter
+     * that missed a packet has to be able to read what it missed. */
+    {
+        FILE *fp = fopen("target/test-events.jsonl", "rb");
+        char line[2048];
+        int lines = 0;
+        if (!fp) { FAIL("no sidecar written"); return; }
+        while (fgets(line, sizeof(line), fp)) lines++;
+        fclose(fp);
+        remove("target/test-events.jsonl");
+        ASSERT_EQ(lines, 4);
+    }
+    PASS();
+}
+
+static void test_events_off_by_default(void) {
+    TEST("events: with no destination, nothing is opened or written");
+
+    /* The opt-in promise, asserted rather than assumed: a build that did
+     * not ask for events must not create a socket or a file. */
+    const char *prev = getenv("NOW_EVENTS");
+    if (prev && *prev) { tests_run--; printf("SKIP (NOW_EVENTS is set)\n"); return; }
+
+    remove("target/should-not-exist.jsonl");
+    now_events_open(NULL, NULL, NULL);
+    ASSERT_EQ(now_events_active(), 0);
+
+    /* Every entry point must be safe to call while off. */
+    now_events_run_started("build", "dev.iridium:demo:1.0.0");
+    now_events_phase_started("compile");
+    now_events_module_failed("x.c", "boom");
+    now_events_test_failed("t", "boom");
+    now_events_progress(NULL);
+    now_events_run_finished(1, NULL);
+    now_events_close();
+
+    {
+        FILE *fp = fopen("target/should-not-exist.jsonl", "rb");
+        if (fp) { fclose(fp); FAIL("a file was written with events off"); return; }
+    }
+    PASS();
+}
+
 static void test_build_java_hello(void) {
     TEST("build: compile and package Java project");
 
@@ -8479,6 +8586,8 @@ int main(void) {
     test_events_names_round_trip();
     test_events_pasta_carries_what_the_writer_cannot();
     test_events_formats_do_not_read_each_other();
+    test_events_emitter_end_to_end();
+    test_events_off_by_default();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 

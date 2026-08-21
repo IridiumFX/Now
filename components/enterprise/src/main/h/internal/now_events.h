@@ -187,6 +187,39 @@ NOW_API int now_event_source_recv(NowEventSource *src, NowEvent *ev,
 
 NOW_API void now_event_source_close(NowEventSource *src);
 
+/* ---- emitting, from inside a run ----
+ *
+ * One emitter per process, because one `now` invocation is one run. Every
+ * call below returns immediately when no destination was configured, so
+ * a build that did not ask for events pays a predicate and nothing else.
+ *
+ * None of these can fail in a way a caller should react to, so none of
+ * them return anything: specs/now-events-v1.md §7 makes "emission never
+ * changes the build" a requirement, and a return value invites someone
+ * to check it and branch. */
+
+/* Resolve a destination and open it. `url` may be NULL, in which case
+ * $NOW_EVENTS is consulted. `file_path` may be NULL to skip the sidecar.
+ * Safe to call when everything is NULL: the emitter simply stays off. */
+NOW_API void now_events_open(const char *url, const char *wire,
+                             const char *file_path);
+
+/* Is anything actually being emitted? Only for callers that would do
+ * real work to build a detail string. */
+NOW_API int now_events_active(void);
+
+NOW_API void now_events_run_started(const char *phase, const char *project);
+NOW_API void now_events_phase_started(const char *phase);
+NOW_API void now_events_phase_finished(const char *phase, int ok,
+                                       const NowEventCounts *counts);
+/* Rate-limited to one per second inside the emitter; callers may call it
+ * as often as is convenient. */
+NOW_API void now_events_progress(const NowEventCounts *counts);
+NOW_API void now_events_module_failed(const char *module, const char *detail);
+NOW_API void now_events_test_failed(const char *name, const char *detail);
+NOW_API void now_events_run_finished(int code, const NowEventCounts *counts);
+NOW_API void now_events_close(void);
+
 /* ---- the listener command ---- */
 
 typedef struct {

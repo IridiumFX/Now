@@ -4,6 +4,7 @@
  * Compiles source files to objects, then links into final output.
  */
 #include "now_build.h"
+#include "now_events.h"
 #include "now_manifest.h"
 #include "now_dirwalk.h"
 #include "now_repro.h"
@@ -3073,6 +3074,8 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
 
     if (g_timing_on) now_timing_mark("  .classify+manifest_check");
 
+    now_events_phase_started("compile");
+
     /* Phase 2: Execute jobs in parallel */
     int compiled = 0;
 
@@ -3100,6 +3103,12 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                         snprintf(result->message, sizeof(result->message),
                                  "compiler failed on %s (exit %d)", job->src_rel, rc);
                     }
+                    /* Emitted here, as it happens, rather than collected
+                     * for the end: "something started failing" is only
+                     * useful to a watcher while the build is still
+                     * running. */
+                    now_events_module_failed(job->src_rel,
+                                             result ? result->message : NULL);
                     errors++;
                     if (now_tui_global) now_tui_compile_done(now_tui_global, job->src_rel, 0);
                     continue;
@@ -3244,6 +3253,12 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                                      "compiler failed on %s (exit %d)",
                                      job->src_rel, exit_code);
                         }
+                        /* The captured output is the diagnostic itself,
+                         * which is the whole reason a watcher wants the
+                         * event rather than the exit code. */
+                        now_events_module_failed(job->src_rel,
+                            (captured.data && captured.len)
+                                ? captured.data : (result ? result->message : NULL));
                         errors++;
                         if (now_tui_global) {
                             now_tui_compile_done(now_tui_global, job->src_rel, 0);
@@ -3962,6 +3977,7 @@ NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
                     result->code = NOW_ERR_TOOL;
                     snprintf(result->message, sizeof(result->message),
                              "linker failed (exit %d)", rc);
+            now_events_module_failed("link", result ? result->message : NULL);
                 }
                 now_repro_free_flags(link_repro_flags, link_repro_nflags);
                 now_repro_free(&link_repro);
@@ -4588,6 +4604,8 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         }
         return 0;
     }
+
+    now_events_phase_started("test");
 
     /* Mode dispatch: "single" (default) links everything into one binary
      * with a single main(); "each" / "per-file" produces one binary per
