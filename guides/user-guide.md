@@ -745,6 +745,7 @@ The generated files are standalone and fully functional. They include:
 | `now export:make` | Generate Makefile |
 | `now trust:list` | List trusted keys |
 | `now trust:add <scope> <key> [comment]` | Add trusted key |
+| `now keys:register [--registry URL] [--group G]` | Register your signing key with a registry |
 | `now verify <archive> <sig>` | Verify archive signature |
 | `now advisory:check` | Check deps against advisory DB |
 | `now reproducible:check` | Build twice and compare hashes |
@@ -788,9 +789,28 @@ archive that was signed, and signing needs a key:
 ```sh
 now keygen                     # Ed25519 keypair → ~/.now/signing.key
                                # prints the public half, base64
+now keys:register              # tells the registry which key signs for
+                               # this group — do this BEFORE publishing
 now package                    # signs when a key is present
 now publish --repo <url>       # uploads the archive and its .sig
 ```
+
+`now keys:register [--registry URL] [--group GROUP] [--key-id ID]
+[--comment TEXT]` — the registry and group default to the `now.pasta`
+in the current directory, and the key id defaults to the first 16 hex
+digits of the key.
+
+**The order matters.** A registry that has a key registered for a group
+checks every signature published under it, so a publisher whose key it
+has never seen is refused with `400`. Before the first key is
+registered, signatures are stored but recorded as unverified — which is
+why registering one changes behaviour for *everyone* publishing to that
+group, not only for you.
+
+The registry key and the consumer trust store are two different places
+and both want the same public half: `keys:register` sends it to the
+registry so the registry can refuse a forgery, and `trust:add` (below)
+gives it to a consumer so `procure` can verify what it fetched.
 
 On the consuming side, add the publisher's public key to the trust
 store, then require signatures:
