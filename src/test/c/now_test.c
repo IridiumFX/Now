@@ -2287,6 +2287,109 @@ static void test_events_off_by_default(void) {
     PASS();
 }
 
+/* ---- the vendored Pasta writer must not emit what its parser refuses ----
+ *
+ * Reported to basta 2026-08-21 and fixed in `0696908`: `write_string`
+ * chose the """ form only for a newline, so a single-line string carrying
+ * a quote self-terminated and `pasta_write` returned a document that
+ * would not re-parse. The number path had the mirror of it — the writer
+ * emitted exponents the vendored lexer had no production for.
+ *
+ * The assertion is the invariant rather than a list of good cases: **not
+ * that everything writes, but that whatever IS written reads back**. A
+ * value the format cannot represent may be refused; it may not be
+ * written as if it could be. That is what makes this test survive a
+ * re-vendor rather than pinning today's behaviour. */
+static void test_pasta_writer_output_always_reparses(void) {
+    TEST("pasta: anything the writer emits, the parser reads back");
+
+    static const char *strings[] = {
+        "plain text no specials",
+        "error: unknown type name \"u64\"",     /* quote, no newline */
+        "error: expected ';' before '}' token",
+        "line one\nline two",
+        "multi\nline with \"quotes\" inside",
+        "ends with a quote\"",                   /* delimiter collision */
+        "contains \"\"\" a triple",              /* may be refused */
+        "tab\there",
+        "",
+        NULL
+    };
+    static const double numbers[] = {
+        1.0, 0.15, 1e16, 1e17, 1e-5, 2.5e-8, 123456789.0, -0.0625
+    };
+    int i;
+
+    for (i = 0; strings[i]; i++) {
+        PastaValue *m = pasta_new_map();
+        char *text;
+        PastaResult pr;
+        PastaValue *back;
+
+        pasta_set(m, "detail", pasta_new_string(strings[i]));
+        text = pasta_write(m, BASTA_COMPACT);
+        if (!text) {
+            /* Refusing to serialise is allowed. Corrupting is not. */
+            pasta_free(m);
+            continue;
+        }
+
+        back = pasta_parse(text, strlen(text), &pr);
+        if (!back) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "writer emitted unparseable text for case %d: %.80s",
+                     i, text);
+            free(text);
+            pasta_free(m);
+            FAIL(msg);
+            return;
+        }
+        {
+            const PastaValue *dv = pasta_map_get(back, "detail");
+            const char *got = dv ? pasta_get_string(dv) : NULL;
+            if (!got || strcmp(got, strings[i]) != 0) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "case %d round-tripped to different bytes: %.60s",
+                         i, got ? got : "(null)");
+                pasta_free(back); free(text); pasta_free(m);
+                FAIL(msg);
+                return;
+            }
+        }
+        pasta_free(back);
+        free(text);
+        pasta_free(m);
+    }
+
+    for (i = 0; i < (int)(sizeof(numbers) / sizeof(numbers[0])); i++) {
+        PastaValue *m = pasta_new_map();
+        char *text;
+        PastaResult pr;
+        PastaValue *back;
+
+        pasta_set(m, "n", basta_new_number(numbers[i]));
+        text = pasta_write(m, BASTA_COMPACT);
+        if (!text) { pasta_free(m); continue; }
+
+        back = pasta_parse(text, strlen(text), &pr);
+        if (!back) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "writer emitted unparseable number %g as %.60s",
+                     numbers[i], text);
+            free(text); pasta_free(m);
+            FAIL(msg);
+            return;
+        }
+        pasta_free(back);
+        free(text);
+        pasta_free(m);
+    }
+    PASS();
+}
+
 static void test_build_java_hello(void) {
     TEST("build: compile and package Java project");
 
@@ -8588,6 +8691,7 @@ int main(void) {
     test_events_formats_do_not_read_each_other();
     test_events_emitter_end_to_end();
     test_events_off_by_default();
+    test_pasta_writer_output_always_reparses();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 
