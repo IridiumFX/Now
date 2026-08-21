@@ -42,6 +42,19 @@ NOW_API int now_cpu_count(void);
  * the given label, and resets the running anchor. */
 NOW_API void   now_timing_set(int enabled);
 
+/* --fail-fast: stop dispatching new compile jobs once one has failed.
+ *
+ * Jobs already running are NOT killed — they are waited for. A compiler
+ * killed mid-write leaves a truncated object that the next build has no
+ * way to tell from a good one, which trades a loud failure for a silent
+ * one. The only thing this changes is whether more work is *started*.
+ *
+ * Off by default: a full build reports every broken file in one pass,
+ * which is what you want when fixing a batch. --fail-fast is for the
+ * other case, where the first error is the only one that matters and the
+ * remaining thirty seconds of compiling are wasted. */
+NOW_API void   now_build_set_fail_fast(int enabled);
+
 /* --explain: print why each source rebuilt or was skipped, and why the
  * link ran or did not. Off by default. */
 NOW_API void   now_explain_set(int enabled);

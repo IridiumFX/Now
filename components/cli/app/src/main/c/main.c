@@ -222,6 +222,7 @@ static void usage(void) {
         "                  in the triple)\n"
         "  --tui           Live progress display\n"
         "  --timing        Print wall-clock per build phase\n"
+        "  --fail-fast     Stop starting new compiles after the first failure\n"
         "  --no-color      Disable ANSI colors\n"
         "  -h              Show this help\n",
         now_version());
@@ -285,6 +286,8 @@ int main(int argc, char *argv[]) {
             flag_no_color = 1;
         else if (strcmp(argv[i], "--tui") == 0)
             flag_tui = 1;
+        else if (strcmp(argv[i], "--fail-fast") == 0)
+            now_build_set_fail_fast(1);
         else if (strcmp(argv[i], "--timing") == 0)
             now_timing_set(1);
 

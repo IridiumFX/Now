@@ -89,6 +89,9 @@ NOW_API double now_clock_secs(void) {
 }
 
 NOW_API void now_timing_set(int enabled) { g_timing_on = enabled; }
+
+static int g_fail_fast = 0;
+NOW_API void now_build_set_fail_fast(int enabled) { g_fail_fast = enabled; }
 NOW_API int  now_timing_enabled(void)    { return g_timing_on; }
 NOW_API void now_explain_set(int enabled) { g_explain = enabled; }
 
@@ -2055,7 +2058,7 @@ static void warn_link_target_missing(const NowProject *p, const char *basedir,
 
 /* Build a hash of the compile flags for a given source file.
  * Used for incremental rebuild detection. */
-static char *link_flags_hash(const NowProject *p);
+static char *link_flags_hash(const NowProject *p, const NowFileList *objects);
 /* Expand the built-in ${project.dir} placeholder in a descriptor value.
  *
  * A define whose value is a path is only useful if it can name a
@@ -3086,6 +3089,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
 
     /* Phase 2: Execute jobs in parallel */
     int compiled = 0;
+    size_t not_started = 0;   /* --fail-fast: work we chose not to start */
 
     if (njobs > 0 && errors == 0) {
         int pool_size = (int)njobs < max_jobs ? (int)njobs : max_jobs;
@@ -3103,6 +3107,8 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         if (pool_size <= 1 && !now_events_active()) {
             for (size_t i = 0; i < njobs; i++) {
                 NowCompileJob *job = &jobs[i];
+
+                if (g_fail_fast && errors > 0) { not_started = njobs - i; break; }
 
                 if (now_tui_global)
                     now_tui_compile_start(now_tui_global, job->src_rel);
@@ -3213,9 +3219,23 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
             size_t next_job = 0;  /* next job to dispatch */
             int running = 0;
 
-            while (next_job < njobs || running > 0) {
-                /* Fill available slots */
-                while (running < pool_size && next_job < njobs) {
+            /* Under --fail-fast this stops asking for new work once
+             * something has failed, while `running > 0` keeps draining —
+             * so jobs already in flight finish normally and write
+             * complete objects. Killing them would be faster and would
+             * leave truncated .o files behind, which the next build has
+             * no way to tell from good ones.
+             *
+             * Both halves of the condition matter. Gating only the inner
+             * dispatch loop deadlocks: with nothing running and jobs
+             * still queued, the outer loop stays true, dispatches
+             * nothing, and then waits for a child that will never
+             * exist. Measured — it hung until the process was killed. */
+            while ((next_job < njobs && !(g_fail_fast && errors > 0))
+                   || running > 0) {
+                /* Fill available slots. */
+                while (running < pool_size && next_job < njobs
+                       && !(g_fail_fast && errors > 0)) {
                     /* Find a free slot */
                     int slot_idx = -1;
                     for (int s = 0; s < pool_size; s++) {
@@ -3366,6 +3386,9 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                 }
             }
 
+            if (g_fail_fast && errors > 0 && next_job < njobs)
+                not_started = njobs - next_job;
+
             free(slots);
         }
     }
@@ -3389,7 +3412,7 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
      * whose objects all came from the cache never converged to "up to
      * date" and paid a full copy-and-verify pass on every build. */
     if (manifest_path) {
-        char *lfh = link_flags_hash(ctx->project);
+        char *lfh = link_flags_hash(ctx->project, &ctx->objects);
         int lfh_changed = (lfh && (!manifest.link_flags_hash ||
                                     strcmp(lfh, manifest.link_flags_hash) != 0));
         if (lfh_changed) {
@@ -3439,10 +3462,21 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         result->build_failed   = errors;
     }
 
+    if (g_fail_fast && errors > 0 && not_started > 0) {
+        /* Say how much was dropped. A build that quietly stops early
+         * looks exactly like a build that had less to do, and "silently
+         * did less than you asked" is the failure mode this whole file
+         * keeps producing. */
+        fprintf(stderr,
+                "  --fail-fast: stopped after the first failure, "
+                "%zu file(s) not compiled\n", not_started);
+    }
+
     {
         NowEventCounts ec = EV_COUNTS(compiled, skipped + cache_hits + remote_hits,
                                       errors,
-                                      compiled + cache_hits + remote_hits + skipped);
+                                      compiled + cache_hits + remote_hits + skipped
+                                      + (int)not_started);
         now_events_phase_finished("compile", errors == 0, &ec);
     }
 #undef EV_COUNTS
@@ -3487,7 +3521,11 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
 }
 
 /* Build a hash of the link flags */
-static char *link_flags_hash(const NowProject *p) {
+static int cmp_path_ptr(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static char *link_flags_hash(const NowProject *p, const NowFileList *objects) {
     size_t cap = 256;
     char *buf = malloc(cap);
     if (!buf) return NULL;
@@ -3519,6 +3557,35 @@ static char *link_flags_hash(const NowProject *p) {
         APPEND(p->link.archives.items[i]);
     if (p->link.script)      APPEND(p->link.script);
     if (p->link.script_body) APPEND(p->link.script_body);
+
+    /* The SET of objects is a link input too.
+     *
+     * Without this, deleting a source made the link phase decide nothing
+     * had changed — every object still in the list was older than the
+     * output, and nothing looks at the one that left. The archive then
+     * kept a member whose source no longer exists, which is the bug Amy
+     * reported; deleting the archive before `ar` only helps on the runs
+     * where `ar` is reached at all.
+     *
+     * It presented as an intermittent test failure rather than a
+     * constant one, because `st_mtime` is second-resolution and the
+     * check uses `>=`: when the surviving object and the archive landed
+     * in the same second it relinked and looked correct.
+     *
+     * Sorted, because the parallel compile pushes objects as jobs
+     * finish — hashing them in completion order would change the hash
+     * on most runs and relink every time. */
+    if (objects && objects->count > 0) {
+        const char **sorted = (const char **)malloc(
+            objects->count * sizeof(*sorted));
+        if (sorted) {
+            size_t i;
+            for (i = 0; i < objects->count; i++) sorted[i] = objects->paths[i];
+            qsort(sorted, objects->count, sizeof(*sorted), cmp_path_ptr);
+            for (i = 0; i < objects->count; i++) APPEND(sorted[i]);
+            free(sorted);
+        }
+    }
     #undef APPEND
 
     char *hash = now_sha256_string(buf, len);
@@ -3669,7 +3736,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
                  * Use ctx->last_link_flags_hash when set (compile ran in
                  * this process); fall back to loading the manifest only
                  * when running `now link` standalone. */
-                char *cur_lfh = link_flags_hash(p);
+                char *cur_lfh = link_flags_hash(p, &ctx->objects);
                 const char *prev_lfh = ctx->last_link_flags_hash;
                 NowManifest standalone_manifest;
                 int loaded_standalone = 0;
