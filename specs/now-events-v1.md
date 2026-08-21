@@ -1,6 +1,6 @@
 # now events — wire schema v1
 
-Status: **v1 implemented — listener, emitter and sidecar all live; four of the seven event types are wired into the build so far (§5)**
+Status: **v1 implemented — listener, emitter, sidecar and counts all live; five of the seven event types are wired into the build (§5)**
 Written 2026-08-21.
 
 An optional, opt-in stream of build lifecycle events, so that something
@@ -174,29 +174,57 @@ that adding them later is not a version bump.
 |---|---|---|---|
 | `run.started` | a `now` invocation begins | | yes |
 | `phase.started` | compile / link / test / package / … begins | | compile, test |
-| `run.progress` | heartbeat, **at most once per second**, carries `counts` | | no |
+| `run.progress` | heartbeat, **at most once per second**, carries `counts` | | yes |
 | `module.failed` | one compile or link unit failed | | yes |
 | `test.failed` | one test failed | | no |
-| `phase.finished` | a phase ended; `ok` says how | | no |
+| `phase.finished` | a phase ended; `ok` says how | | compile |
 | `run.finished` | the invocation ended; carries `code` | ✓ | yes |
 
-`counts` is defined on three events and populated on none of them yet:
-the build tracks its compiled/skipped totals in locals that the emitter
-cannot see without threading them out, and inventing a number here would
-be worse than omitting the field.
+`counts` is carried by `run.progress`, `phase.finished` and
+`run.finished`, assembled from the same tallies the human-readable
+summary line prints — so the stream and the terminal can never drift
+into describing the same build differently. A field a phase did not
+measure stays absent rather than being sent as zero: *"no tests ran"*
+and *"zero tests passed"* are different claims.
+
+### A note on `module.failed` and its detail
+
+The event carries the compiler's own diagnostic, which is the reason to
+want it rather than the exit code. Getting that reliably needed one
+change to the build: `now` normally skips its worker pool for a single
+job and lets the compiler write straight to the terminal, so nothing is
+captured to put in the event. That is exactly backwards — a one-file
+incremental rebuild is the commonest thing a watcher waits on. With
+events enabled the pool is used even for one job; with events off the
+shortcut is unchanged, and so is what you see in the terminal.
 
 `module.failed` and `test.failed` are the early-warning events: they are
 emitted as the failure happens, not collected at the end, which is what
 makes "something started failing" observable while the build is still
 running.
 
-### What a real failing build emits today
+### What a real build emits today
+
+A healthy 220-file build, one second apart:
 
 ```
-run.started    build
-phase.started  compile
-module.failed  src/main/c/broken.c: broken.c:1:20: error: unknown type name 'u64'
-run.finished   FAILED (exit 1)
+run.progress   compile   counts {compiled: 1,   total: 220}
+run.progress   compile   counts {compiled: 41,  total: 220}
+run.progress   compile   counts {compiled: 98,  total: 220}
+run.progress   compile   counts {compiled: 182, total: 220}
+phase.finished compile   counts {compiled: 220, failed: 0}
+run.finished   ok (exit 0)
+```
+
+and the incremental rebuild after breaking one file:
+
+```
+module.failed  src/main/c/m7.c
+               m7.c:1:20: error: unknown type name 'u64'
+                   1 | int broken(void) { u64 x = 0; return x; }
+                     |                    ^~~
+phase.finished compile   counts {compiled: 0, skipped: 219, failed: 1}
+run.finished   FAILED (exit 1)  counts {failed: 1, total: 219}
 ```
 
 and `now events:listen --until run.finished` exits **1**, matching the

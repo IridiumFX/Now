@@ -1987,7 +1987,20 @@ skip_header:
      * anything. It goes out after the normalisation above for exactly
      * that reason: reporting -1 here and 1 to the shell would make the
      * stream disagree with the process. */
-    now_events_run_finished(rc, NULL);
+    {
+        /* The tallies `now ci --output json` already reports, so the
+         * stream and the JSON summary cannot disagree. Fields the phase
+         * did not set stay -1 and are omitted rather than sent as zero —
+         * "no tests ran" and "zero tests passed" are different claims. */
+        NowEventCounts ec;
+        ec.compiled = result.build_compiled > 0 ? result.build_compiled : -1;
+        ec.skipped  = -1;
+        ec.failed   = result.build_failed  > 0 ? result.build_failed  : -1;
+        ec.passed   = -1;
+        ec.total    = result.build_total   > 0 ? result.build_total   : -1;
+        now_events_run_finished(rc,
+            (ec.compiled >= 0 || ec.failed >= 0 || ec.total >= 0) ? &ec : NULL);
+    }
     now_events_close();
     return rc;
 }

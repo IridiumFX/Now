@@ -930,6 +930,8 @@ static struct {
     int            ok;
     time_t         started;
     time_t         last_progress;
+    NowEventCounts last_counts;
+    int            have_counts;
 } g_ev;
 
 static void ev_now_ts(char *out, size_t cap) {
@@ -1022,7 +1024,11 @@ static void ev_emit(NowEventType type, const char *module,
                   : (long)(time(NULL) - g_ev.started) * 1000L;
     ev.counts.compiled = ev.counts.skipped = ev.counts.failed =
         ev.counts.passed = ev.counts.total = -1;
-    if (counts) ev.counts = *counts;
+    if (counts) {
+        ev.counts = *counts;
+        g_ev.last_counts = *counts;
+        g_ev.have_counts = 1;
+    }
     ev.pid = 0;
 
     if (g_ev.sink) now_event_sink_send(g_ev.sink, &ev);
@@ -1090,6 +1096,7 @@ NOW_API void now_events_test_failed(const char *name, const char *detail) {
 NOW_API void now_events_run_finished(int code, const NowEventCounts *counts) {
     if (!g_ev.active) return;
     if (code != 0) g_ev.ok = 0;
+    if (!counts && g_ev.have_counts) counts = &g_ev.last_counts;
     ev_emit(NOW_EVENT_RUN_FINISHED, NULL, NULL, code, counts);
 }
 

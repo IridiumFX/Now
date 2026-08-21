@@ -3076,14 +3076,31 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
 
     now_events_phase_started("compile");
 
+    /* Counts for the event stream. Assembled from the same tallies the
+     * human-readable summary prints, so the two can never drift into
+     * saying different things about one build. */
+#define EV_COUNTS(c_, s_, f_, t_) \
+    ((NowEventCounts){ .compiled = (c_), .skipped = (s_), .failed = (f_), \
+                       .passed = -1, .total = (t_) })
+
+
     /* Phase 2: Execute jobs in parallel */
     int compiled = 0;
 
     if (njobs > 0 && errors == 0) {
         int pool_size = (int)njobs < max_jobs ? (int)njobs : max_jobs;
 
-        /* For single job, skip the pool overhead */
-        if (pool_size <= 1) {
+        /* For single job, skip the pool overhead.
+         *
+         * Except when events are on. The shortcut lets the compiler write
+         * straight to the terminal rather than capturing it, so
+         * `module.failed` can only carry "compiler failed on x.c" — and a
+         * one-file incremental rebuild is the commonest thing a watcher
+         * is waiting on, so the diagnostic would be missing from exactly
+         * the case that wants it most. Measured: a 220-file build carried
+         * the compiler's own text, the one-file rebuild after it did not.
+         * With one job the pool costs one process either way. */
+        if (pool_size <= 1 && !now_events_active()) {
             for (size_t i = 0; i < njobs; i++) {
                 NowCompileJob *job = &jobs[i];
 
@@ -3171,6 +3188,14 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                 now_filelist_push(&ctx->objects, job->obj_path);
                 compiled++;
                 if (now_tui_global) now_tui_compile_done(now_tui_global, job->src_rel, 1);
+                {
+                    /* Rate-limited to one a second inside the emitter, so
+                     * this can sit in the hot loop without a 32-way build
+                     * turning the socket into a firehose. */
+                    NowEventCounts ec = EV_COUNTS(compiled, skipped, errors,
+                                                  (int)njobs + skipped);
+                    now_events_progress(&ec);
+                }
             }
         } else {
             /* Parallel execution with process pool */
@@ -3329,6 +3354,12 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
                         now_filelist_push(&ctx->objects, job->obj_path);
                         compiled++;
                         if (now_tui_global) now_tui_compile_done(now_tui_global, job->src_rel, 1);
+                        {
+                            NowEventCounts ec = EV_COUNTS(compiled, skipped,
+                                                          errors,
+                                                          (int)njobs + skipped);
+                            now_events_progress(&ec);
+                        }
                     }
 
                     free(captured.data);
@@ -3407,6 +3438,14 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         result->build_total    = compiled + cache_hits + remote_hits + skipped;
         result->build_failed   = errors;
     }
+
+    {
+        NowEventCounts ec = EV_COUNTS(compiled, skipped + cache_hits + remote_hits,
+                                      errors,
+                                      compiled + cache_hits + remote_hits + skipped);
+        now_events_phase_finished("compile", errors == 0, &ec);
+    }
+#undef EV_COUNTS
 
     if (!now_tui_global && (compiled > 0 || skipped > 0 || cache_hits > 0 || remote_hits > 0)) {
         int total_cached = cache_hits + remote_hits;

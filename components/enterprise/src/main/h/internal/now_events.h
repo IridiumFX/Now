@@ -217,6 +217,10 @@ NOW_API void now_events_phase_finished(const char *phase, int ok,
 NOW_API void now_events_progress(const NowEventCounts *counts);
 NOW_API void now_events_module_failed(const char *module, const char *detail);
 NOW_API void now_events_test_failed(const char *name, const char *detail);
+/* Pass NULL for `counts` to reuse the last set the emitter was given.
+ * The totals a run finishes with are the ones its last phase reported,
+ * and threading them back out to the caller only to hand them straight
+ * back would be ceremony. */
 NOW_API void now_events_run_finished(int code, const NowEventCounts *counts);
 NOW_API void now_events_close(void);
 
