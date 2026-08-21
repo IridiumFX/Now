@@ -38,6 +38,7 @@
 #include "now_sbom.h"
 #include "now_remote.h"
 #include "now_audit.h"
+#include "now_events.h"
 #include "now_watch.h"
 #include "now_graph.h"
 #include "pico_h2.h"
@@ -1830,6 +1831,458 @@ static void test_build_each_names_binaries_by_source(void) {
     if (!ghost_no) {
         FAIL("a binary was named after the excluded source");
         return;
+    }
+    PASS();
+}
+
+/* ---- build event stream (specs/now-events-v1.md) ---- */
+
+/* ASSERT_STR concatenates `expected` into a message literal, so it only
+ * works against a literal. These tests compare two decoded values. */
+#define ASSERT_SAME_STR(a, b) \
+    do { if (strcmp((a), (b)) != 0) { \
+        tests_failed++; \
+        printf("FAIL: %s != %s (\"%s\" vs \"%s\")\n", #a, #b, (a), (b)); \
+        return; } } while (0)
+
+static void ev_seed(NowEvent *ev, NowEventType type) {
+    memset(ev, 0, sizeof(*ev));
+    ev->v = NOW_EVENTS_SCHEMA_VERSION;
+    snprintf(ev->run, sizeof(ev->run), "a3f1c9d2e4b6");
+    ev->seq = 7;
+    snprintf(ev->ts, sizeof(ev->ts), "2026-08-21T09:41:02Z");
+    ev->event = type;
+    snprintf(ev->phase, sizeof(ev->phase), "compile");
+    ev->ok = 0;
+    ev->code = -1;
+    ev->elapsed_ms = -1;
+    ev->counts.compiled = ev->counts.skipped = ev->counts.failed =
+        ev->counts.passed = ev->counts.total = -1;
+}
+
+static void test_events_encode_decode_roundtrip(void) {
+    TEST("events: encode -> decode keeps every field");
+
+    NowEvent in, out;
+    char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+
+    ev_seed(&in, NOW_EVENT_RUN_FINISHED);
+    snprintf(in.project, sizeof(in.project), "dev.iridium:gut:0.1.0");
+    snprintf(in.module, sizeof(in.module), "src/main/c/remote.c");
+    snprintf(in.detail, sizeof(in.detail), "51 compiled, 1 failed");
+    in.code = 1;
+    in.elapsed_ms = 8421;
+    in.counts.compiled = 51;
+    in.counts.failed = 1;
+    in.counts.total = 52;
+    in.pid = 4242;
+    snprintf(in.host, sizeof(in.host), "workstation");
+
+    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+
+    ASSERT_EQ(out.v, NOW_EVENTS_SCHEMA_VERSION);
+    ASSERT_SAME_STR(out.run, in.run);
+    ASSERT_EQ((int)out.seq, (int)in.seq);
+    ASSERT_SAME_STR(out.ts, in.ts);
+    ASSERT_EQ((int)out.event, (int)in.event);
+    ASSERT_SAME_STR(out.phase, in.phase);
+    ASSERT_EQ(out.ok, 0);
+    ASSERT_SAME_STR(out.project, in.project);
+    ASSERT_SAME_STR(out.module, in.module);
+    ASSERT_SAME_STR(out.detail, in.detail);
+    ASSERT_EQ(out.code, 1);
+    ASSERT_EQ((int)out.elapsed_ms, 8421);
+    ASSERT_EQ(out.counts.compiled, 51);
+    ASSERT_EQ(out.counts.failed, 1);
+    ASSERT_EQ(out.counts.total, 52);
+    ASSERT_EQ(out.pid, 4242);
+    ASSERT_STR(out.host, "workstation");
+    PASS();
+}
+
+static void test_events_detail_survives_escaping(void) {
+    TEST("events: a compiler diagnostic survives the wire intact");
+
+    /* The payload that made JSON the wire format rather than Pasta:
+     * quotes, a backslash, newlines and a tab, all of which a Pasta
+     * string cannot carry at all. */
+    const char *nasty =
+        "remote.c:512:9: error: expected \";\" before \"}\" token\n"
+        "  512 |     u64 pos = *pos_inout\n"
+        "\t     |         ^ path C:\\Users\\x\n";
+
+    NowEvent in, out;
+    char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+
+    ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+    snprintf(in.detail, sizeof(in.detail), "%s", nasty);
+
+    /* Both textual forms have to carry it, and the decoder has to pick
+     * the right one without being told. */
+    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+    ASSERT_SAME_STR(out.detail, nasty);
+    ASSERT_EQ(out.detail_lossy, 0);
+
+    n = now_event_render(buf, sizeof(buf), &in, "json");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+    ASSERT_SAME_STR(out.detail, nasty);
+    PASS();
+}
+
+static void test_events_oversize_detail_is_truncated_not_dropped(void) {
+    TEST("events: an oversize detail truncates, and says so");
+
+    NowEvent in, out;
+    char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+    size_t i;
+
+    ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+    snprintf(in.module, sizeof(in.module), "src/main/c/remote.c");
+
+    /* Every byte escapes to two, so a detail field that fits in the
+     * struct still does not fit in a datagram. Plain filler would not
+     * reach the truncation path at all — the bound that bites is the
+     * one after escaping, not the one before it. */
+    for (i = 0; i < sizeof(in.detail) - 1; i++) in.detail[i] = '"';
+    in.detail[sizeof(in.detail) - 1] = '\0';
+
+    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    ASSERT_EQ(n > 0, 1);
+    /* Never fragment: §3 makes this a hard bound, not a target. */
+    ASSERT_EQ(n <= NOW_EVENTS_MAX_DATAGRAM, 1);
+    ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+    ASSERT_EQ(out.detail_lossy, 1);
+    ASSERT_EQ(strlen(out.detail) < strlen(in.detail), 1);
+    /* The event still arrives, which is the whole point of truncating. */
+    ASSERT_EQ((int)out.event, (int)NOW_EVENT_MODULE_FAILED);
+    PASS();
+}
+
+static void test_events_decode_reads_spaced_json(void) {
+    TEST("events: JSON with spaces after the colons decodes");
+
+    /* Our encoder emits no space after a colon, so a decoder checked
+     * only against it round-trips perfectly and cannot read anything
+     * else. This is what a Python sender produced, and it was rejected
+     * outright — reported by the listener as silence. */
+    const char *spaced =
+        "{\"v\": 1, \"run\": \"a3f1c9d2e4b6\", \"seq\": 3, "
+        "\"ts\": \"2026-08-21T09:41:03Z\", \"event\": \"module.failed\", "
+        "\"phase\": \"compile\", \"ok\": false, "
+        "\"module\": \"src/main/c/remote.c\", \"code\": 1}";
+
+    NowEvent out;
+    ASSERT_EQ(now_event_decode(&out, spaced, strlen(spaced)), 0);
+    ASSERT_STR(out.run, "a3f1c9d2e4b6");
+    ASSERT_EQ((int)out.seq, 3);
+    ASSERT_EQ((int)out.event, (int)NOW_EVENT_MODULE_FAILED);
+    ASSERT_STR(out.module, "src/main/c/remote.c");
+    ASSERT_EQ(out.ok, 0);
+    ASSERT_EQ(out.code, 1);
+    PASS();
+}
+
+static void test_events_version_and_unknown_fields(void) {
+    TEST("events: unknown fields are ignored, unknown versions are not");
+
+    /* §11: adding a field is not a version bump, so a v1 reader must
+     * accept one it has never heard of... */
+    const char *future_field =
+        "{\"v\":1,\"run\":\"a3f1c9d2e4b6\",\"seq\":1,"
+        "\"ts\":\"2026-08-21T09:41:01Z\",\"event\":\"run.started\","
+        "\"phase\":\"build\",\"ok\":true,\"sig\":\"deadbeef\","
+        "\"lane\":\"experimental\"}";
+    NowEvent out;
+    ASSERT_EQ(now_event_decode(&out, future_field, strlen(future_field)), 0);
+    ASSERT_EQ((int)out.event, (int)NOW_EVENT_RUN_STARTED);
+
+    /* ...and must refuse a version whose meaning it cannot know. */
+    const char *v2 =
+        "{\"v\":2,\"run\":\"a3f1c9d2e4b6\",\"seq\":1,"
+        "\"ts\":\"2026-08-21T09:41:01Z\",\"event\":\"run.started\","
+        "\"phase\":\"build\",\"ok\":true}";
+    ASSERT_EQ(now_event_decode(&out, v2, strlen(v2)) != 0, 1);
+
+    /* An event name we do not know is not an event. */
+    const char *bogus =
+        "{\"v\":1,\"run\":\"a3f1c9d2e4b6\",\"seq\":1,"
+        "\"ts\":\"2026-08-21T09:41:01Z\",\"event\":\"run.exploded\","
+        "\"phase\":\"build\",\"ok\":true}";
+    ASSERT_EQ(now_event_decode(&out, bogus, strlen(bogus)) != 0, 1);
+
+    /* And neither is a bare line of log text. */
+    const char *junk = "compiled 41, skipped 0 (up to date)";
+    ASSERT_EQ(now_event_decode(&out, junk, strlen(junk)) != 0, 1);
+    PASS();
+}
+
+static void test_events_over_a_real_socket(void) {
+    TEST("events: a datagram crosses loopback and decodes");
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19477", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    NowEventSink *sink = now_event_sink_open("udp://127.0.0.1:19477", NULL);
+    if (!sink) { now_event_source_close(src); FAIL("sink open"); return; }
+
+    NowEvent in, out;
+    ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+    snprintf(in.module, sizeof(in.module), "src/main/c/remote.c");
+    snprintf(in.detail, sizeof(in.detail), "error: expected \";\"\nline 2");
+
+    now_event_sink_send(sink, &in);
+
+    int rc = now_event_source_recv(src, &out, 3000);
+    now_event_sink_close(sink);
+    now_event_source_close(src);
+
+    if (rc != 1) { FAIL("no event arrived over loopback"); return; }
+    ASSERT_EQ((int)out.event, (int)NOW_EVENT_MODULE_FAILED);
+    ASSERT_STR(out.module, "src/main/c/remote.c");
+    ASSERT_SAME_STR(out.detail, in.detail);
+    PASS();
+}
+
+static void test_events_listener_refuses_untrusted_addresses(void) {
+    TEST("events: v1 refuses to listen where anyone could forge");
+
+    NowResult res;
+
+    /* Unsigned events on a shared segment are forgeable by anyone who
+     * can reach the socket. §8 enforces that here rather than in prose,
+     * so it is a limitation instead of a hole. */
+    memset(&res, 0, sizeof(res));
+    ASSERT_NULL(now_event_source_open("udp://239.7.7.7:9099", 0, &res));
+    ASSERT_EQ(strstr(res.message, "multicast") != NULL, 1);
+
+    /* Even with --insecure, multicast stays refused in v1. */
+    memset(&res, 0, sizeof(res));
+    ASSERT_NULL(now_event_source_open("udp://239.7.7.7:9099", 1, &res));
+
+    memset(&res, 0, sizeof(res));
+    ASSERT_NULL(now_event_source_open("udp://10.0.0.5:9099", 0, &res));
+    ASSERT_EQ(strstr(res.message, "unsigned") != NULL, 1);
+
+    /* A malformed URL is refused rather than half-parsed. */
+    memset(&res, 0, sizeof(res));
+    ASSERT_NULL(now_event_source_open("http://127.0.0.1:9099", 0, &res));
+    memset(&res, 0, sizeof(res));
+    ASSERT_NULL(now_event_source_open("udp://127.0.0.1", 0, &res));
+    PASS();
+}
+
+static void test_events_names_round_trip(void) {
+    TEST("events: every event name parses back to itself");
+
+    int i;
+    for (i = 0; i < (int)NOW_EVENT__COUNT; i++) {
+        const char *name = now_event_name((NowEventType)i);
+        ASSERT_EQ((int)now_event_parse_name(name), i);
+    }
+    ASSERT_EQ((int)now_event_parse_name("nope"), (int)NOW_EVENT__COUNT);
+    /* run.finished is the one a waiter blocks on, so it is the one that
+     * has to be repeated on the wire. */
+    ASSERT_EQ(now_event_is_terminal(NOW_EVENT_RUN_FINISHED), 1);
+    ASSERT_EQ(now_event_is_terminal(NOW_EVENT_RUN_PROGRESS), 0);
+    PASS();
+}
+
+static void test_events_pasta_carries_what_the_writer_cannot(void) {
+    TEST("events: Pasta carries the strings basta_write mangles");
+
+    /* Measured 2026-08-21: basta_writer.c's write_string() only reaches
+     * for the """ form when a string contains a newline, so each of
+     * these comes back out of pasta_write() as text that will not
+     * re-parse. They are the reason this module writes its own Pasta.
+     * If that writer is fixed and this module is switched over, these
+     * are the cases that must keep passing. */
+    static const char *hard[] = {
+        "error: unknown type name \"u64\"",   /* quote, no newline */
+        "ends with a quote\"",                 /* would close early */
+        "line one\nline two",                  /* the easy one */
+        "multi\nline with \"quotes\" inside",
+        NULL
+    };
+    int i;
+
+    for (i = 0; hard[i]; i++) {
+        NowEvent in, out;
+        char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+        size_t n;
+
+        ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+        snprintf(in.detail, sizeof(in.detail), "%s", hard[i]);
+
+        n = now_event_render(buf, sizeof(buf), &in, "pasta");
+        ASSERT_EQ(n > 0, 1);
+        ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+
+        if (out.detail_lossy) {
+            /* Only the trailing-quote case may be altered, and it must
+             * say so rather than change the bytes quietly. */
+            ASSERT_EQ(strncmp(out.detail, hard[i], strlen(hard[i])) == 0, 1);
+        } else {
+            ASSERT_SAME_STR(out.detail, hard[i]);
+        }
+    }
+
+    /* A detail containing the delimiter itself cannot be carried
+     * verbatim by any """ string. It must arrive altered AND flagged,
+     * never altered in silence. */
+    {
+        NowEvent in, out;
+        char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+        size_t n;
+
+        ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+        snprintf(in.detail, sizeof(in.detail), "contains \"\"\" a delimiter");
+
+        n = now_event_render(buf, sizeof(buf), &in, "pasta");
+        ASSERT_EQ(n > 0, 1);
+        ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+        ASSERT_EQ(out.detail_lossy, 1);
+        ASSERT_EQ((int)out.event, (int)NOW_EVENT_MODULE_FAILED);
+    }
+    PASS();
+}
+
+static void test_events_formats_do_not_read_each_other(void) {
+    TEST("events: a Pasta reader will not half-read JSON, or the reverse");
+
+    NowEvent in, out;
+    char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+    size_t n;
+
+    ev_seed(&in, NOW_EVENT_RUN_FINISHED);
+    in.code = 0;
+    in.ok = 1;
+
+    /* Each decoder must refuse the other's output outright. If one could
+     * partially read the other, the dispatching decoder would be a guess
+     * rather than a dispatch. */
+    n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode_pasta(&out, buf, n), 0);
+    ASSERT_EQ(now_event_decode_json(&out, buf, n) != 0, 1);
+
+    n = now_event_render(buf, sizeof(buf), &in, "json");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode_json(&out, buf, n), 0);
+    ASSERT_EQ(now_event_decode_pasta(&out, buf, n) != 0, 1);
+    PASS();
+}
+
+static void test_events_emitter_end_to_end(void) {
+    TEST("events: the emitter's run reaches a listener in order");
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19478", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    remove("target/test-events.jsonl");
+    now_events_open("udp://127.0.0.1:19478", NULL, "target/test-events.jsonl");
+    ASSERT_EQ(now_events_active(), 1);
+
+    now_events_run_started("build", "dev.iridium:demo:1.0.0");
+    now_events_phase_started("compile");
+    now_events_module_failed("src/main/c/broken.c",
+                             "error: unknown type name \"u64\"");
+    now_events_run_finished(1, NULL);
+    now_events_close();
+
+    /* Four distinct events, in order, with contiguous seq. The terminal
+     * one is sent three times and must dedupe to one. */
+    {
+        NowEvent ev;
+        int seen = 0;
+        long last = -1;
+        int saw_started = 0, saw_failed = 0, saw_finished = 0;
+        int guard;
+
+        for (guard = 0; guard < 20; guard++) {
+            int rc = now_event_source_recv(src, &ev, 1500);
+            if (rc != 1) break;
+            if (ev.seq == last) continue;          /* the terminal repeat */
+            ASSERT_EQ((int)(ev.seq == last + 1), 1);
+            last = ev.seq;
+            seen++;
+            if (ev.event == NOW_EVENT_RUN_STARTED) {
+                saw_started = 1;
+                ASSERT_SAME_STR(ev.project, "dev.iridium:demo:1.0.0");
+            }
+            if (ev.event == NOW_EVENT_MODULE_FAILED) {
+                saw_failed = 1;
+                ASSERT_SAME_STR(ev.module, "src/main/c/broken.c");
+                /* The double quote is the payload that decided the wire
+                 * format; it has to survive the whole path. */
+                ASSERT_EQ(strstr(ev.detail, "\"u64\"") != NULL, 1);
+                /* ok flips false the moment something fails, not at the
+                 * end of the run. */
+                ASSERT_EQ(ev.ok, 0);
+            }
+            if (ev.event == NOW_EVENT_RUN_FINISHED) {
+                saw_finished = 1;
+                ASSERT_EQ(ev.code, 1);
+                break;
+            }
+        }
+        now_event_source_close(src);
+
+        ASSERT_EQ(saw_started, 1);
+        ASSERT_EQ(saw_failed, 1);
+        ASSERT_EQ(saw_finished, 1);
+        ASSERT_EQ(seen, 4);
+    }
+
+    /* §6: the datagram is a doorbell, the file is the record. A waiter
+     * that missed a packet has to be able to read what it missed. */
+    {
+        FILE *fp = fopen("target/test-events.jsonl", "rb");
+        char line[2048];
+        int lines = 0;
+        if (!fp) { FAIL("no sidecar written"); return; }
+        while (fgets(line, sizeof(line), fp)) lines++;
+        fclose(fp);
+        remove("target/test-events.jsonl");
+        ASSERT_EQ(lines, 4);
+    }
+    PASS();
+}
+
+static void test_events_off_by_default(void) {
+    TEST("events: with no destination, nothing is opened or written");
+
+    /* The opt-in promise, asserted rather than assumed: a build that did
+     * not ask for events must not create a socket or a file. */
+    const char *prev = getenv("NOW_EVENTS");
+    if (prev && *prev) { tests_run--; printf("SKIP (NOW_EVENTS is set)\n"); return; }
+
+    remove("target/should-not-exist.jsonl");
+    now_events_open(NULL, NULL, NULL);
+    ASSERT_EQ(now_events_active(), 0);
+
+    /* Every entry point must be safe to call while off. */
+    now_events_run_started("build", "dev.iridium:demo:1.0.0");
+    now_events_phase_started("compile");
+    now_events_module_failed("x.c", "boom");
+    now_events_test_failed("t", "boom");
+    now_events_progress(NULL);
+    now_events_run_finished(1, NULL);
+    now_events_close();
+
+    {
+        FILE *fp = fopen("target/should-not-exist.jsonl", "rb");
+        if (fp) { fclose(fp); FAIL("a file was written with events off"); return; }
     }
     PASS();
 }
@@ -8123,6 +8576,18 @@ int main(void) {
     test_build_include_only_module();
     test_build_warnings_reach_test_compile();
     test_build_each_names_binaries_by_source();
+    test_events_encode_decode_roundtrip();
+    test_events_detail_survives_escaping();
+    test_events_oversize_detail_is_truncated_not_dropped();
+    test_events_decode_reads_spaced_json();
+    test_events_version_and_unknown_fields();
+    test_events_over_a_real_socket();
+    test_events_listener_refuses_untrusted_addresses();
+    test_events_names_round_trip();
+    test_events_pasta_carries_what_the_writer_cannot();
+    test_events_formats_do_not_read_each_other();
+    test_events_emitter_end_to_end();
+    test_events_off_by_default();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */
 
