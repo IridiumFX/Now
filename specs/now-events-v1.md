@@ -1,6 +1,6 @@
 # now events — wire schema v1
 
-Status: **draft — listener implemented and tested, emission not yet wired**
+Status: **v1 implemented — listener, emitter and sidecar all live; four of the seven event types are wired into the build so far (§5)**
 Written 2026-08-21.
 
 An optional, opt-in stream of build lifecycle events, so that something
@@ -166,20 +166,41 @@ Optional fields, by event:
 Seven. The set is deliberately small: an event per compiled file would
 flood the socket on a 32-way build and tell nobody anything they need.
 
-| event | when | terminal |
-|---|---|---|
-| `run.started` | a `now` invocation begins | |
-| `phase.started` | compile / link / test / package / … begins | |
-| `run.progress` | heartbeat, **at most once per second**, carries `counts` | |
-| `module.failed` | one compile or link unit failed | |
-| `test.failed` | one test failed | |
-| `phase.finished` | a phase ended; `ok` says how | |
-| `run.finished` | the invocation ended; carries `code` and `counts` | ✓ |
+The **wired** column is what `now` emits today, not what the schema
+allows. A consumer may rely on the wired ones; the rest are defined so
+that adding them later is not a version bump.
+
+| event | when | terminal | wired |
+|---|---|---|---|
+| `run.started` | a `now` invocation begins | | yes |
+| `phase.started` | compile / link / test / package / … begins | | compile, test |
+| `run.progress` | heartbeat, **at most once per second**, carries `counts` | | no |
+| `module.failed` | one compile or link unit failed | | yes |
+| `test.failed` | one test failed | | no |
+| `phase.finished` | a phase ended; `ok` says how | | no |
+| `run.finished` | the invocation ended; carries `code` | ✓ | yes |
+
+`counts` is defined on three events and populated on none of them yet:
+the build tracks its compiled/skipped totals in locals that the emitter
+cannot see without threading them out, and inventing a number here would
+be worse than omitting the field.
 
 `module.failed` and `test.failed` are the early-warning events: they are
 emitted as the failure happens, not collected at the end, which is what
 makes "something started failing" observable while the build is still
 running.
+
+### What a real failing build emits today
+
+```
+run.started    build
+phase.started  compile
+module.failed  src/main/c/broken.c: broken.c:1:20: error: unknown type name 'u64'
+run.finished   FAILED (exit 1)
+```
+
+and `now events:listen --until run.finished` exits **1**, matching the
+build, so a shell branches on it without parsing a line.
 
 ### Example
 
