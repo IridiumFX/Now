@@ -404,6 +404,15 @@ Deliberately not a job runner: it prints, and a chain is a loop over its
 stdout. Keeping `now` out of orchestration is what stops this becoming a
 second CI system.
 
+**`--output basta` writes bytes, so the listener puts stdout in binary
+mode for it.** Found by running it rather than by reading it: on Windows
+a text-mode stdout turns every `0x0A` inside a blob into `0x0D 0x0A`, so
+the blob's declared length stops matching the bytes that follow it and a
+consumer reading by count gets a short, shifted value — while the stream
+still looks well formed. A two-line compiler diagnostic came out three
+bytes shy of what gcc wrote, with nothing flagged. `text` and `json` stay
+in text mode, where CRLF is what a Windows consumer expects.
+
 ## 11. Compatibility
 
 `v` is the whole compatibility story. A listener MUST ignore unknown
