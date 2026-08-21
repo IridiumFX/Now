@@ -25,6 +25,11 @@
 #include <time.h>
 #include <limits.h>
 
+#ifdef _WIN32
+  #include <io.h>
+  #include <fcntl.h>
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -1257,8 +1262,26 @@ NOW_API int now_events_listen(const NowEventListenOpts *opts,
     int  waited_ms = 0;
     int  exit_code = 0;
     long unreadable = 0;
+    const char *out_fmt;
 
     if (!opts || !opts->url) return 1;
+    out_fmt = opts->output ? opts->output : "basta";
+
+#ifdef _WIN32
+    /* A blob carries 0x0A bytes like any other, and stdout in text mode
+     * turns every one of them into 0x0D 0x0A. The blob's declared length
+     * then no longer matches the bytes that follow it, so a consumer
+     * reading by count silently gets a short, shifted value — the worst
+     * available failure, because the stream still looks well-formed.
+     *
+     * Measured before this line existed: a two-line compiler diagnostic
+     * arrived three bytes shy of what gcc wrote, with no flag set,
+     * because two interior newlines had each grown a byte. Only the
+     * basta form carries raw bytes; text and json stay in text mode,
+     * where CRLF line endings are what a Windows consumer expects. */
+    if (strcmp(out_fmt, "text") != 0 && strcmp(out_fmt, "json") != 0)
+        _setmode(_fileno(stdout), _O_BINARY);
+#endif
 
     src = now_event_source_open(opts->url, opts->insecure, result);
     if (!src) return 1;
@@ -1322,8 +1345,7 @@ NOW_API int now_events_listen(const NowEventListenOpts *opts,
         expect_seq = ev.seq + 1;
 
         if (filter_admits(opts->filter, now_event_name(ev.event))) {
-            size_t n = now_event_render(line, sizeof(line), &ev,
-                                        opts->output ? opts->output : "basta");
+            size_t n = now_event_render(line, sizeof(line), &ev, out_fmt);
             if (n) {
                 fwrite(line, 1, n, stdout);
                 fputc('\n', stdout);
