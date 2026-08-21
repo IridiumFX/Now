@@ -2616,6 +2616,95 @@ static void test_events_test_failed_carries_the_case(void) {
     PASS();
 }
 
+/* --fail-fast stops starting work; it does not kill work in flight.
+ *
+ * Driven at jobs=1 on purpose. The pool path dispatches up to 32 jobs
+ * before the first failure comes back, so how much it skips depends on
+ * timing and would make this test a race. The serial path makes the
+ * decision observable exactly: it checks before each job, so the counts
+ * are deterministic.
+ *
+ * The assertion is the relationship, not the numbers — discovery order
+ * is not something this test should be pinning. */
+static void test_build_fail_fast_stops_starting_work(void) {
+    TEST("build: --fail-fast stops starting new compiles");
+
+    char root[512], d[512], p[512];
+    int i;
+    int compiled_default = -1, compiled_ff = -1;
+
+    snprintf(root, sizeof(root), "%s/failfast_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+
+    for (i = 0; i < 8; i++) {
+        FILE *fp;
+        snprintf(p, sizeof(p), "%s/src/main/c/m%02d.c", root, i);
+        fp = fopen(p, "wb");
+        if (!fp) { FAIL("cannot write a source"); return; }
+        if (i == 3)
+            fputs("int broken(void) { u64 x = 0; return x; }\n", fp);
+        else
+            fprintf(fp, "int fn_%d(void) { return %d; }\n", i, i);
+        fclose(fp);
+    }
+
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"ff\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"ff\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+
+    /* Default: one failure does not stop the rest. */
+    {
+        NowResult res;
+        NowProject *prj;
+        memset(&res, 0, sizeof(res));
+        prj = now_project_load_string(pasta, strlen(pasta), &res);
+        ASSERT_NOT_NULL(prj);
+        now_build_set_fail_fast(0);
+        (void)now_build(prj, root, 0, 1, &res);
+        compiled_default = res.build_compiled;
+        now_project_free(prj);
+    }
+
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+
+    /* --fail-fast: the same tree stops early. */
+    {
+        NowResult res;
+        NowProject *prj;
+        memset(&res, 0, sizeof(res));
+        prj = now_project_load_string(pasta, strlen(pasta), &res);
+        ASSERT_NOT_NULL(prj);
+        now_build_set_fail_fast(1);
+        (void)now_build(prj, root, 0, 1, &res);
+        compiled_ff = res.build_compiled;
+        now_project_free(prj);
+    }
+    /* A global: leaving it on would quietly change every later test. */
+    now_build_set_fail_fast(0);
+
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+
+    /* Both runs must have failed — otherwise this measured nothing. */
+    if (compiled_default < 0 || compiled_ff < 0) {
+        FAIL("no compile counts reported");
+        return;
+    }
+    if (compiled_ff >= compiled_default) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "--fail-fast compiled %d, default compiled %d — expected fewer",
+                 compiled_ff, compiled_default);
+        FAIL(msg);
+        return;
+    }
+    PASS();
+}
+
 static void test_build_java_hello(void) {
     TEST("build: compile and package Java project");
 
@@ -8906,6 +8995,7 @@ int main(void) {
     test_build_warnings_reach_test_compile();
     test_build_each_names_binaries_by_source();
     test_build_archive_drops_a_removed_source();
+    test_build_fail_fast_stops_starting_work();
     test_events_encode_decode_roundtrip();
     test_events_detail_survives_escaping();
     test_events_oversize_detail_is_truncated_not_dropped();
