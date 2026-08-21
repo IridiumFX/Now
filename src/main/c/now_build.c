@@ -3528,7 +3528,9 @@ static char *link_flags_hash(const NowProject *p) {
 
 /* ---- Link phase (§2.4, §7.6) ---- */
 
-NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
+/* The body; now_build_link below wraps it so the phase events pair on
+ * every exit path rather than on the ones someone remembered. */
+static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
     const NowProject *p = ctx->project;
     const char *basedir = ctx->basedir;
 
@@ -4101,7 +4103,7 @@ static int is_entry_point_obj(const char *path) {
            strcmp(base, "main.cxx.obj")== 0;
 }
 
-NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
+static int build_test_body(NowBuildCtx *ctx, NowResult *result) {
     const NowProject *p = ctx->project;
     const char *basedir = ctx->basedir;
 
@@ -4674,8 +4676,6 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
         return 0;
     }
 
-    now_events_phase_started("test");
-
     /* Mode dispatch: "single" (default) links everything into one binary
      * with a single main(); "each" / "per-file" produces one binary per
      * test source, runs each one, reports aggregate pass/fail. */
@@ -4825,6 +4825,12 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
 
                 if (link_rc != 0) {
                     fprintf(stderr, "  [FAIL] %s — link error (exit %d)\n", name, link_rc);
+                    {
+                        char why[128];
+                        snprintf(why, sizeof(why),
+                                 "link error (exit %d)", link_rc);
+                        now_events_test_failed(name, why);
+                    }
                     fail++;
                     continue;
                 }
@@ -4838,6 +4844,11 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
                     pass++;
                 } else {
                     fprintf(stderr, "  [FAIL] %s (exit %d)\n", name, run_rc);
+                    {
+                        char why[128];
+                        snprintf(why, sizeof(why), "exit %d", run_rc);
+                        now_events_test_failed(name, why);
+                    }
                     fail++;
                 }
             }
@@ -5085,6 +5096,14 @@ run_test_bin:
             snprintf(result->message, sizeof(result->message),
                      "test execution failed (exit %d)", rc);
         }
+        /* Single-binary mode is one process, so its internal case count
+         * is its own business — the same reasoning that makes
+         * tests_total 1 here. One binary failing is one test.failed. */
+        {
+            char why[128];
+            snprintf(why, sizeof(why), "exit %d", rc);
+            now_events_test_failed(test_bin, why);
+        }
         return rc;
     }
 
@@ -5093,6 +5112,40 @@ run_test_bin:
         result->message[0] = '\0';
     }
     return 0;
+}
+
+/* ---- phase wrappers ----
+ *
+ * Both bodies return from many places. Emitting the phase events here
+ * rather than inside them means a `phase.started` always has its
+ * matching `phase.finished`, whichever way the phase ended — and a
+ * listener can tell "this phase failed" from "this phase is still
+ * running", which is the whole reason to send the pair. */
+
+NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
+    int rc;
+    now_events_phase_started("link");
+    rc = build_link_body(ctx, result);
+    now_events_phase_finished("link", rc == 0, NULL);
+    return rc;
+}
+
+NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result) {
+    int rc;
+    now_events_phase_started("test");
+    rc = build_test_body(ctx, result);
+    {
+        /* The tallies the suite itself reported, so the stream and the
+         * "tests: N passed, M failed" line cannot disagree. */
+        NowEventCounts ec;
+        ec.compiled = -1;
+        ec.skipped  = -1;
+        ec.failed   = (result && result->tests_failed > 0) ? result->tests_failed : -1;
+        ec.passed   = (result && result->tests_passed > 0) ? result->tests_passed : -1;
+        ec.total    = (result && result->tests_total  > 0) ? result->tests_total  : -1;
+        now_events_phase_finished("test", rc == 0, &ec);
+    }
+    return rc;
 }
 
 /* ---- compile_commands.json generation (§22.1) ---- */

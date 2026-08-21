@@ -948,6 +948,7 @@ static struct {
     time_t         last_progress;
     NowEventCounts last_counts;
     int            have_counts;
+    int            phase_open;
 } g_ev;
 
 static void ev_now_ts(char *out, size_t cap) {
@@ -1071,9 +1072,28 @@ NOW_API void now_events_run_started(const char *phase, const char *project) {
     ev_emit(NOW_EVENT_RUN_STARTED, NULL, NULL, -1, NULL);
 }
 
+/* Close whatever phase is open, if one is.
+ *
+ * A `phase.started` with no matching `phase.finished` is indistinguishable
+ * to a listener from a phase that is still running, so a build that
+ * returns early out of the middle of a phase would leave a watcher
+ * waiting on something that already ended. The compile phase has several
+ * such returns. Rather than find every one of them and hope, the pairing
+ * is guaranteed here: a new phase closes the previous one, and so does
+ * the end of the run. */
+static void ev_close_phase(int ok) {
+    if (!g_ev.phase_open) return;
+    g_ev.phase_open = 0;
+    if (!ok) g_ev.ok = 0;
+    ev_emit(NOW_EVENT_PHASE_FINISHED, NULL, NULL, -1,
+            g_ev.have_counts ? &g_ev.last_counts : NULL);
+}
+
 NOW_API void now_events_phase_started(const char *phase) {
     if (!g_ev.active) return;
+    ev_close_phase(g_ev.ok);
     if (phase) snprintf(g_ev.phase, sizeof(g_ev.phase), "%s", phase);
+    g_ev.phase_open = 1;
     ev_emit(NOW_EVENT_PHASE_STARTED, NULL, NULL, -1, NULL);
 }
 
@@ -1082,6 +1102,7 @@ NOW_API void now_events_phase_finished(const char *phase, int ok,
     if (!g_ev.active) return;
     if (phase) snprintf(g_ev.phase, sizeof(g_ev.phase), "%s", phase);
     if (!ok) g_ev.ok = 0;
+    g_ev.phase_open = 0;      /* explicit close; the net below is idle */
     ev_emit(NOW_EVENT_PHASE_FINISHED, NULL, NULL, -1, counts);
 }
 
@@ -1112,6 +1133,7 @@ NOW_API void now_events_test_failed(const char *name, const char *detail) {
 NOW_API void now_events_run_finished(int code, const NowEventCounts *counts) {
     if (!g_ev.active) return;
     if (code != 0) g_ev.ok = 0;
+    ev_close_phase(code == 0);
     if (!counts && g_ev.have_counts) counts = &g_ev.last_counts;
     ev_emit(NOW_EVENT_RUN_FINISHED, NULL, NULL, code, counts);
 }

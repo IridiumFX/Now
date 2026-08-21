@@ -2200,13 +2200,16 @@ static void test_events_emitter_end_to_end(void) {
     now_events_run_finished(1, NULL);
     now_events_close();
 
-    /* Four distinct events, in order, with contiguous seq. The terminal
-     * one is sent three times and must dedupe to one. */
+    /* Five distinct events, in order, with contiguous seq: the four
+     * emitted here plus the `phase.finished` the emitter adds when the
+     * run ends with a phase still open. The terminal event is sent three
+     * times and must dedupe to one. */
     {
         NowEvent ev;
         int seen = 0;
         long last = -1;
         int saw_started = 0, saw_failed = 0, saw_finished = 0;
+        int saw_phase_closed = 0;
         int guard;
 
         for (guard = 0; guard < 20; guard++) {
@@ -2230,6 +2233,7 @@ static void test_events_emitter_end_to_end(void) {
                  * end of the run. */
                 ASSERT_EQ(ev.ok, 0);
             }
+            if (ev.event == NOW_EVENT_PHASE_FINISHED) saw_phase_closed = 1;
             if (ev.event == NOW_EVENT_RUN_FINISHED) {
                 saw_finished = 1;
                 ASSERT_EQ(ev.code, 1);
@@ -2241,7 +2245,11 @@ static void test_events_emitter_end_to_end(void) {
         ASSERT_EQ(saw_started, 1);
         ASSERT_EQ(saw_failed, 1);
         ASSERT_EQ(saw_finished, 1);
-        ASSERT_EQ(seen, 4);
+        /* The compile phase was opened and never explicitly closed, so
+         * the run end has to close it — otherwise a listener cannot tell
+         * a phase that ended from one still running. */
+        ASSERT_EQ(saw_phase_closed, 1);
+        ASSERT_EQ(seen, 5);
     }
 
     /* §6: the datagram is a doorbell, the file is the record. A waiter
@@ -2254,7 +2262,7 @@ static void test_events_emitter_end_to_end(void) {
         while (fgets(line, sizeof(line), fp)) lines++;
         fclose(fp);
         remove("target/test-events.jsonl");
-        ASSERT_EQ(lines, 4);
+        ASSERT_EQ(lines, 5);
     }
     PASS();
 }
@@ -2509,6 +2517,101 @@ static void test_build_archive_drops_a_removed_source(void) {
             FAIL("the removed source's object is still in the archive");
             return;
         }
+    }
+    PASS();
+}
+
+static void test_events_every_started_phase_is_finished(void) {
+    TEST("events: a phase that starts always finishes");
+
+    /* A `phase.started` with no matching `phase.finished` reads to a
+     * listener exactly like a phase that is still running, so a build
+     * that returns out of the middle of one would strand a watcher. The
+     * compile phase has several early returns; rather than find them all
+     * and hope, the emitter closes an open phase when the next one
+     * starts and when the run ends. This asserts that. */
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19479", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    remove("target/test-pairing.jsonl");
+    now_events_open("udp://127.0.0.1:19479", NULL, "target/test-pairing.jsonl");
+
+    now_events_run_started("build", "dev.iridium:demo:1.0.0");
+    now_events_phase_started("compile");
+    /* No phase_finished for compile — the next phase must close it. */
+    now_events_phase_started("link");
+    /* No phase_finished for link either — the run end must close it. */
+    now_events_run_finished(0, NULL);
+    now_events_close();
+
+    {
+        NowEvent ev;
+        int started = 0, finished = 0, guard;
+        long last = -1;
+
+        for (guard = 0; guard < 24; guard++) {
+            int rc = now_event_source_recv(src, &ev, 1200);
+            if (rc != 1) break;
+            if (ev.seq == last) continue;
+            last = ev.seq;
+            if (ev.event == NOW_EVENT_PHASE_STARTED)  started++;
+            if (ev.event == NOW_EVENT_PHASE_FINISHED) finished++;
+            if (ev.event == NOW_EVENT_RUN_FINISHED)   break;
+        }
+        now_event_source_close(src);
+        remove("target/test-pairing.jsonl");
+
+        ASSERT_EQ(started, 2);
+        ASSERT_EQ(finished, 2);
+    }
+    PASS();
+}
+
+static void test_events_test_failed_carries_the_case(void) {
+    TEST("events: test.failed names the test and flips ok");
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19480", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    now_events_open("udp://127.0.0.1:19480", NULL, NULL);
+    now_events_run_started("test", "dev.iridium:demo:1.0.0");
+    now_events_phase_started("test");
+    now_events_test_failed("suite/parser_test", "exit 1");
+    now_events_run_finished(1, NULL);
+    now_events_close();
+
+    {
+        NowEvent ev;
+        int saw = 0, guard;
+        long last = -1;
+
+        for (guard = 0; guard < 24; guard++) {
+            int rc = now_event_source_recv(src, &ev, 1200);
+            if (rc != 1) break;
+            if (ev.seq == last) continue;
+            last = ev.seq;
+            if (ev.event == NOW_EVENT_TEST_FAILED) {
+                saw = 1;
+                ASSERT_SAME_STR(ev.module, "suite/parser_test");
+                ASSERT_SAME_STR(ev.detail, "exit 1");
+                /* ok is false from the failure onwards, not only at the
+                 * end of the run. */
+                ASSERT_EQ(ev.ok, 0);
+            }
+            if (ev.event == NOW_EVENT_RUN_FINISHED) {
+                /* and it stays false through the terminal event */
+                ASSERT_EQ(ev.ok, 0);
+                break;
+            }
+        }
+        now_event_source_close(src);
+        ASSERT_EQ(saw, 1);
     }
     PASS();
 }
@@ -8815,6 +8918,8 @@ int main(void) {
     test_events_formats_do_not_read_each_other();
     test_events_emitter_end_to_end();
     test_events_off_by_default();
+    test_events_every_started_phase_is_finished();
+    test_events_test_failed_carries_the_case();
     test_pasta_writer_output_always_reparses();
     test_build_java_hello();
     /* test_test_phase requires gcc in PATH at runtime — run manually */

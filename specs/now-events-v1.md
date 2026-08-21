@@ -1,6 +1,6 @@
 # now events — wire schema v1
 
-Status: **v1 implemented — listener, emitter, sidecar and counts all live; five of the seven event types are wired into the build (§5)**
+Status: **v1 complete — all seven event types wired, listener, emitter, sidecar and counts live**
 Written 2026-08-21.
 
 An optional, opt-in stream of build lifecycle events, so that something
@@ -166,19 +166,19 @@ Optional fields, by event:
 Seven. The set is deliberately small: an event per compiled file would
 flood the socket on a 32-way build and tell nobody anything they need.
 
-The **wired** column is what `now` emits today, not what the schema
-allows. A consumer may rely on the wired ones; the rest are defined so
-that adding them later is not a version bump.
+| event | when | terminal |
+|---|---|---|
+| `run.started` | a `now` invocation begins | |
+| `phase.started` | compile / link / test begins | |
+| `run.progress` | heartbeat, **at most once per second**, carries `counts` | |
+| `module.failed` | one compile or link unit failed | |
+| `test.failed` | one test failed | |
+| `phase.finished` | a phase ended; `ok` says how | |
+| `run.finished` | the invocation ended; carries `code` | ✓ |
 
-| event | when | terminal | wired |
-|---|---|---|---|
-| `run.started` | a `now` invocation begins | | yes |
-| `phase.started` | compile / link / test / package / … begins | | compile, test |
-| `run.progress` | heartbeat, **at most once per second**, carries `counts` | | yes |
-| `module.failed` | one compile or link unit failed | | yes |
-| `test.failed` | one test failed | | no |
-| `phase.finished` | a phase ended; `ok` says how | | compile |
-| `run.finished` | the invocation ended; carries `code` | ✓ | yes |
+All seven are emitted. `package`, `publish` and `procure` run under
+`run.started`/`run.finished` but do not yet bracket themselves with
+phase events — adding them is not a version bump.
 
 `counts` is carried by `run.progress`, `phase.finished` and
 `run.finished`, assembled from the same tallies the human-readable
@@ -186,6 +186,20 @@ summary line prints — so the stream and the terminal can never drift
 into describing the same build differently. A field a phase did not
 measure stays absent rather than being sent as zero: *"no tests ran"*
 and *"zero tests passed"* are different claims.
+
+### A phase that starts always finishes
+
+**`phase.started` and `phase.finished` are guaranteed to pair.** A
+started phase with no finish is indistinguishable, to a listener, from a
+phase that is still running — so a build returning out of the middle of
+one would strand a watcher for ever rather than tell it something ended.
+
+The compile phase has several early returns and the link and test bodies
+have many. Rather than find every one and hope, the emitter closes an
+open phase when the next phase starts and when the run ends, and the link
+and test phases are bracketed by thin wrappers around their bodies so
+their `ok` is the phase's own rather than the run's. A listener may rely
+on the pairing.
 
 ### A note on `module.failed` and its detail
 
@@ -214,6 +228,18 @@ run.progress   compile   counts {compiled: 98,  total: 220}
 run.progress   compile   counts {compiled: 182, total: 220}
 phase.finished compile   counts {compiled: 220, failed: 0}
 run.finished   ok (exit 0)
+```
+
+a `now test` whose suite fails:
+
+```
+run.started    test
+phase.started  compile
+phase.finished compile   counts {compiled: 1}
+phase.started  test
+test.failed    t.exe: exit 1
+phase.finished test      counts {failed: 1, total: 1}
+run.finished   FAILED (exit 1)
 ```
 
 and the incremental rebuild after breaking one file:
