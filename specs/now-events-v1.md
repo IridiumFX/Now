@@ -210,9 +210,16 @@ flood the socket on a 32-way build and tell nobody anything they need.
 | `phase.finished` | a phase ended; `ok` says how | |
 | `run.finished` | the invocation ended; carries `code` | ✓ |
 
-All seven are emitted. `package`, `publish` and `procure` run under
-`run.started`/`run.finished` but do not yet bracket themselves with
-phase events — adding them is not a version bump.
+All seven are emitted, and every phase brackets itself: `compile`,
+`link` and `test` from `now_build.c`, and `package`, `publish` and
+`procure` at their own entry points.
+
+**Phases never nest.** `procure` runs before `compile` whether it was
+asked for directly or reached through `now build`'s dependency step, and
+`package` and `publish` run after the build they package. That matters
+because the pairing guarantee below is implemented by closing an open
+phase when the next one starts — a phase opening inside another would
+close it early and leave its eventual `phase.finished` unmatched.
 
 `counts` is carried by `run.progress`, `phase.finished` and
 `run.finished`, assembled from the same tallies the human-readable

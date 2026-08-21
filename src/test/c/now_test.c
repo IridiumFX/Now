@@ -2594,6 +2594,71 @@ static void test_events_every_started_phase_is_finished(void) {
     PASS();
 }
 
+static void test_events_the_late_phases_bracket_themselves(void) {
+    TEST("events: package, publish and procure open and close a phase");
+
+    /* The three phases that ran under run.started/run.finished with no
+     * bracket of their own until now.
+     *
+     * Each body is handed arguments it refuses, so it returns from its
+     * very first line. That is deliberately the case the wrapper exists
+     * for: the pair has to hold for the earliest return, not only for
+     * the path where everything works. */
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19481", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    now_events_open("udp://127.0.0.1:19481", NULL, NULL);
+
+    now_events_run_started("publish", "dev.iridium:demo:1.0.0");
+    now_procure(NULL, NULL, &res);
+    now_package(NULL, NULL, 0, &res);
+    now_publish(NULL, NULL, NULL, 0, &res);
+    now_events_run_finished(1, NULL);
+    now_events_close();
+
+    {
+        NowEvent ev;
+        int started = 0, finished = 0, guard;
+        int saw_procure = 0, saw_package = 0, saw_publish = 0;
+        int first_finish_ok = -1;
+        long last = -1;
+
+        for (guard = 0; guard < 32; guard++) {
+            int rc = now_event_source_recv(src, &ev, 1200);
+            if (rc != 1) break;
+            if (ev.seq == last) continue;
+            last = ev.seq;
+            if (ev.event == NOW_EVENT_PHASE_STARTED) {
+                started++;
+                if (strcmp(ev.phase, "procure") == 0) saw_procure = 1;
+                if (strcmp(ev.phase, "package") == 0) saw_package = 1;
+                if (strcmp(ev.phase, "publish") == 0) saw_publish = 1;
+            }
+            if (ev.event == NOW_EVENT_PHASE_FINISHED) {
+                finished++;
+                if (first_finish_ok < 0) first_finish_ok = ev.ok;
+            }
+            if (ev.event == NOW_EVENT_RUN_FINISHED) break;
+        }
+        now_event_source_close(src);
+
+        ASSERT_EQ(started, 3);
+        ASSERT_EQ(finished, 3);
+        ASSERT_EQ(saw_procure && saw_package && saw_publish, 1);
+        /* Only the FIRST finish is evidence that a wrapper passed its
+         * body's result along. `ok` is the run's flag, not the phase's
+         * (§4: false once anything in the run has failed), so once
+         * procure has cleared it every later event reads false whatever
+         * its own wrapper said. Asserting on all three would look like a
+         * stronger check and be a weaker one. */
+        ASSERT_EQ(first_finish_ok, 0);
+    }
+    PASS();
+}
+
 static void test_events_test_failed_carries_the_case(void) {
     TEST("events: test.failed names the test and flips ok");
 
@@ -9034,6 +9099,7 @@ int main(void) {
     test_events_emitter_end_to_end();
     test_events_off_by_default();
     test_events_every_started_phase_is_finished();
+    test_events_the_late_phases_bracket_themselves();
     test_events_test_failed_carries_the_case();
     test_pasta_writer_output_always_reparses();
     test_build_java_hello();
