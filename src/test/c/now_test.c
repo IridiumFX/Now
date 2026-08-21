@@ -1878,7 +1878,7 @@ static void test_events_encode_decode_roundtrip(void) {
     in.pid = 4242;
     snprintf(in.host, sizeof(in.host), "workstation");
 
-    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    size_t n = now_event_render(buf, sizeof(buf), &in, "basta");
     ASSERT_EQ(n > 0, 1);
     ASSERT_EQ(now_event_decode(&out, buf, n), 0);
 
@@ -1905,9 +1905,9 @@ static void test_events_encode_decode_roundtrip(void) {
 static void test_events_detail_survives_escaping(void) {
     TEST("events: a compiler diagnostic survives the wire intact");
 
-    /* The payload that made JSON the wire format rather than Pasta:
-     * quotes, a backslash, newlines and a tab, all of which a Pasta
-     * string cannot carry at all. */
+    /* The payload that made JSON the wire format in the first draft:
+     * quotes, a backslash, newlines and a tab. A blob carries all four
+     * without noticing they are there. */
     const char *nasty =
         "remote.c:512:9: error: expected \";\" before \"}\" token\n"
         "  512 |     u64 pos = *pos_inout\n"
@@ -1919,9 +1919,9 @@ static void test_events_detail_survives_escaping(void) {
     ev_seed(&in, NOW_EVENT_MODULE_FAILED);
     snprintf(in.detail, sizeof(in.detail), "%s", nasty);
 
-    /* Both textual forms have to carry it, and the decoder has to pick
-     * the right one without being told. */
-    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    /* Both wire forms have to carry it, and the decoder has to pick the
+     * right one without being told. */
+    size_t n = now_event_render(buf, sizeof(buf), &in, "basta");
     ASSERT_EQ(n > 0, 1);
     ASSERT_EQ(now_event_decode(&out, buf, n), 0);
     ASSERT_SAME_STR(out.detail, nasty);
@@ -1942,16 +1942,20 @@ static void test_events_oversize_detail_is_truncated_not_dropped(void) {
     size_t i;
 
     ev_seed(&in, NOW_EVENT_MODULE_FAILED);
-    snprintf(in.module, sizeof(in.module), "src/main/c/remote.c");
 
-    /* Every byte escapes to two, so a detail field that fits in the
-     * struct still does not fit in a datagram. Plain filler would not
-     * reach the truncation path at all — the bound that bites is the
-     * one after escaping, not the one before it. */
-    for (i = 0; i < sizeof(in.detail) - 1; i++) in.detail[i] = '"';
+    /* A blob costs nine bytes whatever it holds, so a full detail on its
+     * own now fits and this path is only reached when a long path and a
+     * long diagnostic arrive together — which is the ordinary case for a
+     * deep source tree, not a contrived one. Filling all three is what
+     * makes the bound bite; a detail alone would sail under it. */
+    for (i = 0; i < sizeof(in.module) - 1; i++)  in.module[i]  = 'm';
+    in.module[sizeof(in.module) - 1] = '\0';
+    for (i = 0; i < sizeof(in.project) - 1; i++) in.project[i] = 'p';
+    in.project[sizeof(in.project) - 1] = '\0';
+    for (i = 0; i < sizeof(in.detail) - 1; i++)  in.detail[i]  = '"';
     in.detail[sizeof(in.detail) - 1] = '\0';
 
-    size_t n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    size_t n = now_event_render(buf, sizeof(buf), &in, "basta");
     ASSERT_EQ(n > 0, 1);
     /* Never fragment: §3 makes this a hard bound, not a target. */
     ASSERT_EQ(n <= NOW_EVENTS_MAX_DATAGRAM, 1);
@@ -2095,20 +2099,29 @@ static void test_events_names_round_trip(void) {
     PASS();
 }
 
-static void test_events_pasta_carries_what_the_writer_cannot(void) {
-    TEST("events: Pasta carries the strings basta_write mangles");
+static void test_events_blob_carries_what_no_string_can(void) {
+    TEST("events: a blob detail arrives byte-exact, whatever is in it");
 
-    /* Measured 2026-08-21: basta_writer.c's write_string() only reaches
-     * for the """ form when a string contains a newline, so each of
-     * these comes back out of pasta_write() as text that will not
-     * re-parse. They are the reason this module writes its own Pasta.
-     * If that writer is fixed and this module is switched over, these
-     * are the cases that must keep passing. */
+    /* Every one of these used to arrive altered-and-flagged, and the
+     * first four of them are what the hand-written Pasta writer existed
+     * to handle. On the blob path they must all be byte-exact with
+     * detail_lossy CLEAR: a blob has a byte count and no delimiter, so
+     * there is nothing for the writer to work around.
+     *
+     * The last three are the cases no string form reaches at any size —
+     * a compiler quoting a Java text block back at us, a fence that
+     * would have to escalate, and bytes that are not UTF-8 at all
+     * because the compiler ran under a different locale. */
     static const char *hard[] = {
         "error: unknown type name \"u64\"",   /* quote, no newline */
         "ends with a quote\"",                 /* would close early */
-        "line one\nline two",                  /* the easy one */
+        "line one\nline two",
         "multi\nline with \"quotes\" inside",
+        "contains \"\"\" a delimiter",
+        "Main.java:12: error: incompatible types\n"
+        "    String s = \"\"\"\n        hello\n        \"\"\";",
+        "the fence itself: \"\"\"# and \"\"\"##",
+        "latin-1 from a foreign locale: \xe9\xff\xfe",
         NULL
     };
     int i;
@@ -2121,41 +2134,52 @@ static void test_events_pasta_carries_what_the_writer_cannot(void) {
         ev_seed(&in, NOW_EVENT_MODULE_FAILED);
         snprintf(in.detail, sizeof(in.detail), "%s", hard[i]);
 
-        n = now_event_render(buf, sizeof(buf), &in, "pasta");
+        n = now_event_render(buf, sizeof(buf), &in, "basta");
         ASSERT_EQ(n > 0, 1);
         ASSERT_EQ(now_event_decode(&out, buf, n), 0);
-
-        if (out.detail_lossy) {
-            /* Only the trailing-quote case may be altered, and it must
-             * say so rather than change the bytes quietly. */
-            ASSERT_EQ(strncmp(out.detail, hard[i], strlen(hard[i])) == 0, 1);
-        } else {
-            ASSERT_SAME_STR(out.detail, hard[i]);
-        }
-    }
-
-    /* A detail containing the delimiter itself cannot be carried
-     * verbatim by any """ string. It must arrive altered AND flagged,
-     * never altered in silence. */
-    {
-        NowEvent in, out;
-        char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
-        size_t n;
-
-        ev_seed(&in, NOW_EVENT_MODULE_FAILED);
-        snprintf(in.detail, sizeof(in.detail), "contains \"\"\" a delimiter");
-
-        n = now_event_render(buf, sizeof(buf), &in, "pasta");
-        ASSERT_EQ(n > 0, 1);
-        ASSERT_EQ(now_event_decode(&out, buf, n), 0);
-        ASSERT_EQ(out.detail_lossy, 1);
+        ASSERT_SAME_STR(out.detail, hard[i]);
+        ASSERT_EQ(out.detail_lossy, 0);
         ASSERT_EQ((int)out.event, (int)NOW_EVENT_MODULE_FAILED);
     }
     PASS();
 }
 
+static void test_events_a_blob_cannot_forge_a_field(void) {
+    TEST("events: a diagnostic that looks like a field is not read as one");
+
+    /* The reader finds fields by scanning for `key:`, so a value that is
+     * somebody else's bytes could otherwise write its own envelope: a
+     * compiler error quoting a line of Pasta would do it by accident,
+     * and that is before anyone tries on purpose. The scan steps over a
+     * blob rather than through it, which is the whole defence. */
+    NowEvent in, out;
+    char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
+    size_t n;
+    const char *forgery =
+        "x.c:1: error in { v: 1, run: \"ffffffffffff\", seq: 99, "
+        "module: \"innocent.c\", ok: true, code: 0 }";
+
+    ev_seed(&in, NOW_EVENT_MODULE_FAILED);
+    in.ok = 0;
+    in.code = -1;
+    snprintf(in.module, sizeof(in.module), "src/main/c/guilty.c");
+    snprintf(in.detail, sizeof(in.detail), "%s", forgery);
+
+    n = now_event_render(buf, sizeof(buf), &in, "basta");
+    ASSERT_EQ(n > 0, 1);
+    ASSERT_EQ(now_event_decode(&out, buf, n), 0);
+
+    ASSERT_SAME_STR(out.detail, forgery);
+    ASSERT_STR(out.module, "src/main/c/guilty.c");
+    ASSERT_SAME_STR(out.run, in.run);
+    ASSERT_EQ((int)out.seq, (int)in.seq);
+    ASSERT_EQ(out.ok, 0);
+    ASSERT_EQ(out.code, -1);
+    PASS();
+}
+
 static void test_events_formats_do_not_read_each_other(void) {
-    TEST("events: a Pasta reader will not half-read JSON, or the reverse");
+    TEST("events: a Basta reader will not half-read JSON, or the reverse");
 
     NowEvent in, out;
     char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
@@ -2168,15 +2192,15 @@ static void test_events_formats_do_not_read_each_other(void) {
     /* Each decoder must refuse the other's output outright. If one could
      * partially read the other, the dispatching decoder would be a guess
      * rather than a dispatch. */
-    n = now_event_render(buf, sizeof(buf), &in, "pasta");
+    n = now_event_render(buf, sizeof(buf), &in, "basta");
     ASSERT_EQ(n > 0, 1);
-    ASSERT_EQ(now_event_decode_pasta(&out, buf, n), 0);
+    ASSERT_EQ(now_event_decode_basta(&out, buf, n), 0);
     ASSERT_EQ(now_event_decode_json(&out, buf, n) != 0, 1);
 
     n = now_event_render(buf, sizeof(buf), &in, "json");
     ASSERT_EQ(n > 0, 1);
     ASSERT_EQ(now_event_decode_json(&out, buf, n), 0);
-    ASSERT_EQ(now_event_decode_pasta(&out, buf, n) != 0, 1);
+    ASSERT_EQ(now_event_decode_basta(&out, buf, n) != 0, 1);
     PASS();
 }
 
@@ -2566,6 +2590,71 @@ static void test_events_every_started_phase_is_finished(void) {
 
         ASSERT_EQ(started, 2);
         ASSERT_EQ(finished, 2);
+    }
+    PASS();
+}
+
+static void test_events_the_late_phases_bracket_themselves(void) {
+    TEST("events: package, publish and procure open and close a phase");
+
+    /* The three phases that ran under run.started/run.finished with no
+     * bracket of their own until now.
+     *
+     * Each body is handed arguments it refuses, so it returns from its
+     * very first line. That is deliberately the case the wrapper exists
+     * for: the pair has to hold for the earliest return, not only for
+     * the path where everything works. */
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19481", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    now_events_open("udp://127.0.0.1:19481", NULL, NULL);
+
+    now_events_run_started("publish", "dev.iridium:demo:1.0.0");
+    now_procure(NULL, NULL, &res);
+    now_package(NULL, NULL, 0, &res);
+    now_publish(NULL, NULL, NULL, 0, &res);
+    now_events_run_finished(1, NULL);
+    now_events_close();
+
+    {
+        NowEvent ev;
+        int started = 0, finished = 0, guard;
+        int saw_procure = 0, saw_package = 0, saw_publish = 0;
+        int first_finish_ok = -1;
+        long last = -1;
+
+        for (guard = 0; guard < 32; guard++) {
+            int rc = now_event_source_recv(src, &ev, 1200);
+            if (rc != 1) break;
+            if (ev.seq == last) continue;
+            last = ev.seq;
+            if (ev.event == NOW_EVENT_PHASE_STARTED) {
+                started++;
+                if (strcmp(ev.phase, "procure") == 0) saw_procure = 1;
+                if (strcmp(ev.phase, "package") == 0) saw_package = 1;
+                if (strcmp(ev.phase, "publish") == 0) saw_publish = 1;
+            }
+            if (ev.event == NOW_EVENT_PHASE_FINISHED) {
+                finished++;
+                if (first_finish_ok < 0) first_finish_ok = ev.ok;
+            }
+            if (ev.event == NOW_EVENT_RUN_FINISHED) break;
+        }
+        now_event_source_close(src);
+
+        ASSERT_EQ(started, 3);
+        ASSERT_EQ(finished, 3);
+        ASSERT_EQ(saw_procure && saw_package && saw_publish, 1);
+        /* Only the FIRST finish is evidence that a wrapper passed its
+         * body's result along. `ok` is the run's flag, not the phase's
+         * (§4: false once anything in the run has failed), so once
+         * procure has cleared it every later event reads false whatever
+         * its own wrapper said. Asserting on all three would look like a
+         * stronger check and be a weaker one. */
+        ASSERT_EQ(first_finish_ok, 0);
     }
     PASS();
 }
@@ -9004,11 +9093,13 @@ int main(void) {
     test_events_over_a_real_socket();
     test_events_listener_refuses_untrusted_addresses();
     test_events_names_round_trip();
-    test_events_pasta_carries_what_the_writer_cannot();
+    test_events_blob_carries_what_no_string_can();
+    test_events_a_blob_cannot_forge_a_field();
     test_events_formats_do_not_read_each_other();
     test_events_emitter_end_to_end();
     test_events_off_by_default();
     test_events_every_started_phase_is_finished();
+    test_events_the_late_phases_bracket_themselves();
     test_events_test_failed_carries_the_case();
     test_pasta_writer_output_always_reparses();
     test_build_java_hello();

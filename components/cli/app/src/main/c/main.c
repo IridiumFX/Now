@@ -1214,7 +1214,7 @@ skip_header:
                 "error: events:listen needs a URL\n"
                 "usage: now events:listen <udp://host:port> [--filter e1,e2]\n"
                 "                         [--until <event>] [--timeout <sec>]\n"
-                "                         [--output json|pasta|text] [--insecure]\n"
+                "                         [--output json|basta|text] [--insecure]\n"
                 "\n"
                 "  Waiting for a build to land:\n"
                 "    now events:listen udp://127.0.0.1:9099 \\\n"

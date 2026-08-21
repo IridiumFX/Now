@@ -15,6 +15,7 @@
 #include "now_auth.h"
 #include "now_trust.h"
 #include "pico_http.h"
+#include "now_events.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -618,7 +619,23 @@ NOW_API int now_repo_install(const char *repo_root,
     return 0;
 }
 
+static int procure_body(const NowProject *project, const NowProcureOpts *opts,
+                        NowResult *result);
+
+/* Phase wrapper — see the note at now_package(). Procure runs before
+ * compile whether it was asked for directly or reached through
+ * now_build()'s dependency step, so this phase never opens inside
+ * another one. */
 NOW_API int now_procure(const NowProject *project, const NowProcureOpts *opts,
+                        NowResult *result) {
+    int rc;
+    now_events_phase_started("procure");
+    rc = procure_body(project, opts, result);
+    now_events_phase_finished("procure", rc == 0, NULL);
+    return rc;
+}
+
+static int procure_body(const NowProject *project, const NowProcureOpts *opts,
                         NowResult *result) {
     if (!project) {
         if (result) snprintf(result->message, sizeof(result->message),

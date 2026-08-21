@@ -13,6 +13,7 @@
 #include "now_procure.h"
 #include "now_auth.h"
 #include "now_trust.h"
+#include "now_events.h"
 #include "pico_http.h"
 #include "pasta.h"
 #include "basta.h"
@@ -227,7 +228,25 @@ static BastaValue *collect_headers(const char *basedir, const char *hdr_dir) {
 
 /* ---- Package phase ---- */
 
+/* Phase wrappers, the same shape as now_build_link()'s and for the same
+ * reason: these bodies return from a dozen places each, and a
+ * `phase.started` with no matching `phase.finished` reads to a listener
+ * exactly like a phase still running. Bracketing the call rather than
+ * hunting every return is what makes the pairing a guarantee instead of
+ * a habit. */
+static int package_body(const NowProject *project, const char *basedir,
+                        int verbose, NowResult *result);
+
 NOW_API int now_package(const NowProject *project, const char *basedir,
+                        int verbose, NowResult *result) {
+    int rc;
+    now_events_phase_started("package");
+    rc = package_body(project, basedir, verbose, result);
+    now_events_phase_finished("package", rc == 0, NULL);
+    return rc;
+}
+
+static int package_body(const NowProject *project, const char *basedir,
                         int verbose, NowResult *result) {
     if (!project || !basedir) {
         if (result) {
@@ -893,7 +912,19 @@ static int publish_put(const char *host, int port, const char *path_prefix,
     return 0;
 }
 
+static int publish_body(const NowProject *project, const char *basedir,
+                        const char *repo_url, int verbose, NowResult *result);
+
 NOW_API int now_publish(const NowProject *project, const char *basedir,
+                        const char *repo_url, int verbose, NowResult *result) {
+    int rc;
+    now_events_phase_started("publish");
+    rc = publish_body(project, basedir, repo_url, verbose, result);
+    now_events_phase_finished("publish", rc == 0, NULL);
+    return rc;
+}
+
+static int publish_body(const NowProject *project, const char *basedir,
                         const char *repo_url, int verbose, NowResult *result) {
     if (!project || !basedir) {
         if (result) {

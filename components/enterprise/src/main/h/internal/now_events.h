@@ -1,8 +1,9 @@
 /*
  * now_events.h — optional build lifecycle event stream (specs/now-events-v1.md)
  *
- * A structured alternative to tailing a build log for a string: one JSON
- * object per UDP datagram, emitted as the run progresses, so a waiting
+ * A structured alternative to tailing a build log for a string: one
+ * structured event per UDP datagram, emitted as the run progresses, so a
+ * waiting
  * process learns that a module failed while the build is still running
  * rather than when the process exits.
  *
@@ -68,10 +69,11 @@ typedef struct {
     char            project[192];
     char            module[256];
     char            detail[768];
-    /* Set when `detail` is not byte-exact: shortened to fit the
-     * datagram, or altered because the wire format could not carry it
-     * verbatim. One flag for both, because a consumer's question is
-     * "can I trust these bytes", not "which way did they change". */
+    /* Set when `detail` is not byte-exact. Since detail became a blob
+     * the only thing that can raise it is shortening to fit the
+     * datagram: there is no longer any content the wire form has to
+     * alter to carry. A consumer's question is "can I trust these
+     * bytes", so one flag answers it either way. */
     int             detail_lossy;
     int             code;
     NowEventCounts  counts;
@@ -89,22 +91,31 @@ NOW_API int          now_event_is_terminal(NowEventType e);
 
 /* ---- wire form ---- */
 
-/* ---- Pasta is the default wire format ----
+/* ---- Basta is the default wire format ----
  *
- * Not JSON: Pasta has a stricter grammar and one implementation behind
- * it, so there is much less room for two readers to disagree about the
- * same bytes. JSON's ambiguities — number precision, duplicate keys,
- * encoding — are real and this stream is meant to be acted on.
+ * Not JSON: Basta is Pasta's grammar plus blobs, so it has a stricter
+ * grammar and one implementation behind it, and there is much less room
+ * for two readers to disagree about the same bytes. JSON's ambiguities
+ * — number precision, duplicate keys, encoding — are real and this
+ * stream is meant to be acted on.
  *
- * Free text goes in a """...""" string, which carries quotes and
- * newlines without escaping at all.
+ * `detail` is a blob: a length-prefixed run of bytes with no delimiter
+ * to collide with, so no captured process output can fail to be
+ * written. That matters more here than anywhere else in `now` — a
+ * refused value in a config file is a diagnostic a human fixes, but a
+ * refused event is a dropped one, and the watcher never finds out what
+ * broke. Blessed by the format owner as the intended use of a blob
+ * (2026-08-21).
  *
- * Encode as Pasta. Returns bytes written, 0 on error. */
-NOW_API size_t now_event_encode_pasta(char *out, size_t out_cap,
+ * The datagram therefore contains raw bytes and is not text. Its length
+ * is the return value; nothing may treat it as a C string.
+ *
+ * Encode as Basta. Returns bytes written, 0 on error. */
+NOW_API size_t now_event_encode_basta(char *out, size_t out_cap,
                                       const NowEvent *ev);
 
-/* Decode a Pasta event. Returns 0 on success. */
-NOW_API int now_event_decode_pasta(NowEvent *ev, const char *doc, size_t len);
+/* Decode a Basta event. Returns 0 on success. */
+NOW_API int now_event_decode_basta(NowEvent *ev, const char *doc, size_t len);
 
 /* Encode `ev` as one JSON object into `out` (no trailing newline).
  * Keys are written in the order specs/now-events-v1.md §4 fixes, which
@@ -124,21 +135,20 @@ NOW_API size_t now_event_encode_json(char *out, size_t out_cap,
  * story (§11). */
 NOW_API int now_event_decode_json(NowEvent *ev, const char *json, size_t len);
 
-/* Decode an event in whichever of the two textual formats arrived.
+/* Decode an event in whichever of the two forms arrived.
  *
- * This is not sniffing: the two forms are mutually exclusive by
- * construction. A Pasta event's first key is bare (`{ v: 1`), a JSON
- * event's is quoted (`{"v":1`), so each decoder rejects the other's
- * output outright rather than half-reading it. Returns 0 on success. */
+ * This is not sniffing: the two are mutually exclusive by construction.
+ * A Basta event's first key is bare (`{ v: 1`), a JSON event's is
+ * quoted (`{"v":1`), so each decoder rejects the other's output
+ * outright rather than half-reading it. Returns 0 on success. */
 NOW_API int now_event_decode(NowEvent *ev, const char *buf, size_t len);
 
 /* Render a decoded event for a human or for a pipe. `fmt` is one of
- * "pasta" (default), "json", "text". Returns bytes written, 0 on error.
+ * "basta" (default), "json", "text". Returns bytes written, 0 on error.
  *
- * "basta" is named in specs/now-events-v1.md and not implemented here:
- * its value is carrying bytes that no text form can (a small binary
- * payload, a credential for a chained step), and that is a v1.1 job with
- * its own design rather than a fourth spelling of the same map. */
+ * "basta" output contains a blob and is therefore bytes, not text: use
+ * the returned length. "text" is the readable one and is what
+ * `now events:listen` prints unless asked otherwise. */
 NOW_API size_t now_event_render(char *out, size_t out_cap,
                                 const NowEvent *ev, const char *fmt);
 
@@ -148,7 +158,7 @@ typedef struct NowEventSink NowEventSink;
 
 /* Open a sink for a destination URL ("udp://host:port").
  *
- * `wire` is "pasta" (the default when NULL), "json" or "text". Returns
+ * `wire` is "basta" (the default when NULL), "json" or "text". Returns
  * NULL if the URL is unusable — which the caller treats as "do not
  * emit", never as a build failure. */
 NOW_API NowEventSink *now_event_sink_open(const char *url, const char *wire);
@@ -229,7 +239,7 @@ NOW_API void now_events_close(void);
 typedef struct {
     const char *url;
     const char *filter;      /* comma-separated event names, NULL = all */
-    const char *output;      /* json | pasta | text */
+    const char *output;      /* json | basta | text */
     const char *until;       /* stop when this event arrives, NULL = never */
     int         timeout_sec; /* 0 = no timeout */
     int         insecure;
