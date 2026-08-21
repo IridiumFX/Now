@@ -9,10 +9,11 @@
  * every failure is discarded.
  *
  * The UDP shim at the bottom is written against raw sockets because
- * apennines has no datagram primitive yet; only dns.c uses SOCK_DGRAM
- * and it does so privately. A `t3/net/udp.h` is the natural home and
- * has been raised with them — until it exists this mirrors dns.c's
- * platform guards rather than inventing a different shape.
+ * apennines has no datagram primitive: it exposes tcp.h but nothing for
+ * SOCK_DGRAM, and only dns.c uses one, privately. A `t3/net/udp.h` is
+ * the natural home for this and is worth asking them for — that request
+ * has NOT been sent yet. Until it exists this mirrors dns.c's platform
+ * guards rather than inventing a third shape.
  */
 #include "now_events.h"
 #include "now_fs.h"
