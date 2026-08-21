@@ -43,6 +43,7 @@ add_library(now
     # now-enterprise module
     components/enterprise/src/main/c/now_auth.c
     components/enterprise/src/main/c/now_audit.c
+    components/enterprise/src/main/c/now_events.c
     components/enterprise/src/main/c/now_remote.c
     components/enterprise/src/main/c/now_graph.c
     components/enterprise/src/main/c/now_trust.c

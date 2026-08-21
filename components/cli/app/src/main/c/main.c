@@ -35,6 +35,7 @@
 #include "now_advisory.h"
 #include "now_cache.h"
 #include "now_audit.h"
+#include "now_events.h"
 #include "now_watch.h"
 #include "now_tui.h"
 #include "pasta.h"
@@ -196,6 +197,7 @@ static void usage(void) {
         "  trust:list   List trusted keys\n"
         "  trust:add    Add key: trust:add <scope> <key> [comment]\n"
         "  keys:register Register your signing key with a registry\n"
+        "  events:listen Watch a build event stream: events:listen <udp://host:port>\n"
         "  verify       Verify archive signature\n"
         "  reproducible:check  Build twice and compare output hashes\n"
         "  advisory:check      Check deps against advisory database\n"
@@ -1170,6 +1172,58 @@ skip_header:
         now_project_free(imported);
         free(pom_path);
         return rc;
+    }
+
+    /* events:listen needs no project at all — it is the other side of a
+     * build that may not even be on this machine. */
+    if (strcmp(phase, "events:listen") == 0) {
+        NowEventListenOpts eopts;
+        NowResult eres;
+        int i, erc;
+
+        memset(&eopts, 0, sizeof(eopts));
+        eopts.output = output_fmt ? output_fmt : "text";
+
+        for (i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc)
+                eopts.filter = argv[++i];
+            else if (strcmp(argv[i], "--until") == 0 && i + 1 < argc)
+                eopts.until = argv[++i];
+            else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
+                eopts.timeout_sec = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--insecure") == 0)
+                eopts.insecure = 1;
+            /* --output is parsed by the global loop too, but this one has
+             * to consume its value or the bare-word branch below takes
+             * "json" for the URL. */
+            else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc)
+                eopts.output = argv[++i];
+            else if (strncmp(argv[i], "--", 2) != 0)
+                eopts.url = argv[i];
+        }
+
+        if (!eopts.url) eopts.url = getenv("NOW_EVENTS");
+        if (!eopts.url) {
+            fprintf(stderr,
+                "error: events:listen needs a URL\n"
+                "usage: now events:listen <udp://host:port> [--filter e1,e2]\n"
+                "                         [--until <event>] [--timeout <sec>]\n"
+                "                         [--output json|pasta|text] [--insecure]\n"
+                "\n"
+                "  Waiting for a build to land:\n"
+                "    now events:listen udp://127.0.0.1:9099 \\\n"
+                "        --until run.finished --timeout 1800\n"
+                "  exits with the build's own exit code.\n"
+                "\n"
+                "  Schema and guarantees: specs/now-events-v1.md\n");
+            return 1;
+        }
+
+        memset(&eres, 0, sizeof(eres));
+        erc = now_events_listen(&eopts, &eres);
+        if (erc != 0 && eres.message[0])
+            fprintf(stderr, "error: %s\n", eres.message);
+        return erc;
     }
 
     /* keys:register wants a project for its defaults but does not need
