@@ -6,6 +6,7 @@
 #include "now_pom.h"
 #include "now.h"
 #include "now_arch.h"
+#include "now_schema.h"  /* the diagnostic collector schema:check installs */
 #include "now_fs.h"   /* now_path_join — machine-level config lookup */
 
 #include "pasta.h"
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* ---- String array ---- */
 
@@ -574,14 +576,47 @@ static const NowDeadNested k_dead_nested[] = {
     { NULL, 0, NULL }
 };
 
+/* ---- diagnostic sink ----
+ *
+ * Every key diagnostic below goes through this. With no collector
+ * installed it prints exactly what it always printed, so a build is
+ * unchanged; with one installed it is captured and nothing reaches
+ * stderr, which is what `schema:check` needs and what finally makes
+ * these warnings testable — until now the only way to observe one was
+ * to read a build log. */
+static NowDiagList *g_pom_diags = NULL;
+
+NOW_API void now_pom_set_diag_collector(NowDiagList *warnings) {
+    g_pom_diags = warnings;
+}
+
+static void pom_warn(const char *code, const char *field,
+                     const char *where, const char *fmt, ...) {
+    char msg[NOW_DIAG_TEXT_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    if (g_pom_diags) {
+        now_diaglist_push(g_pom_diags, code, field, 0, 0, msg, "");
+        return;
+    }
+    fprintf(stderr, "warning: %s: %s\n", where ? where : "now.pasta", msg);
+}
+
 static void warn_dead_map(const PastaValue *m, const char *const *dead,
                            const char *section, const char *where) {
     if (!m || pasta_type(m) != PASTA_MAP) return;
     for (size_t i = 0; dead[i]; i++) {
         if (!pasta_map_get(m, dead[i])) continue;
-        fprintf(stderr,
-                "warning: %s: '%s.%s' is parsed but has no effect in this "
-                "build - it is ignored\n", where, section, dead[i]);
+        {
+            char fld[NOW_DIAG_PATH_MAX];
+            snprintf(fld, sizeof(fld), "%s.%s", section, dead[i]);
+            pom_warn("NOW-W0003", fld, where,
+                     "'%s' is parsed but has no effect in this build "
+                     "- it is ignored", fld);
+        }
     }
 }
 
@@ -610,11 +645,15 @@ static void warn_dead_nested_keys(const PastaValue *root, const char *path) {
                     if (said[k]) continue;
                     if (!pasta_map_get(el, k_dead_nested[s].dead[k])) continue;
                     said[k] = 1;
-                    fprintf(stderr,
-                            "warning: %s: '%s[].%s' is parsed but has no "
-                            "effect in this build - it is ignored\n",
-                            where, k_dead_nested[s].section,
-                            k_dead_nested[s].dead[k]);
+                    {
+                        char fld[NOW_DIAG_PATH_MAX];
+                        snprintf(fld, sizeof(fld), "%s[].%s",
+                                 k_dead_nested[s].section,
+                                 k_dead_nested[s].dead[k]);
+                        pom_warn("NOW-W0003", fld, where,
+                                 "'%s' is parsed but has no effect in this "
+                                 "build - it is ignored", fld);
+                    }
                 }
             }
             free(said);
@@ -634,12 +673,11 @@ static void warn_descriptor_keys(const PastaValue *root, const char *path) {
         if (!k || !*k) continue;
         if (str_in_list(k_known_keys, k)) continue;
         if (str_in_list(k_inert_keys, k)) {
-            fprintf(stderr,
-                    "warning: %s: '%s' is recognized but not implemented "
-                    "in this build - it is ignored\n", where, k);
+            pom_warn("NOW-W0002", k, where,
+                     "'%s' is recognized but not implemented in this build "
+                     "- it is ignored", k);
         } else {
-            fprintf(stderr,
-                    "warning: %s: unknown key '%s' - ignored\n", where, k);
+            pom_warn("NOW-W0001", k, where, "unknown key '%s' - ignored", k);
         }
     }
 }
