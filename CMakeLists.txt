@@ -102,6 +102,13 @@ target_sources(now PRIVATE
     lib/apennines/src/main/c/t3/net/tcp_resolve.c
     lib/apennines/src/main/c/t3/net/tls.c
     lib/apennines/src/main/c/t3/net/dns.c
+    # now_events.c's datagram sink and source. It carried an 80-line raw
+    # socket shim until 2026-08-24 because a grep over this vendored
+    # subset found no SOCK_DGRAM outside dns.c — true of the subset,
+    # and wrong about apennines, which has shipped t3/net/udp.h since
+    # 2026-04-10. Same as tcp_resolve.c above: `now build` walks the
+    # tree and finds it, CMake has to be told.
+    lib/apennines/src/main/c/t3/net/udp.c
     lib/apennines/src/main/c/t3/net/http.c
     lib/apennines/src/main/c/t3/net/h2.c
     lib/apennines/src/main/c/t4/net/http_client.c
