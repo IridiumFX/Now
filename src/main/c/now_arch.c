@@ -174,6 +174,26 @@ NOW_API int now_triple_is_native(const NowTriple *target) {
     return now_triple_cmp(target, now_host_triple_parsed()) == 0;
 }
 
+/* ---- The effective target of this invocation ---- */
+
+static NowTriple g_effective_target;
+static int       g_effective_target_set = 0;
+
+NOW_API void now_arch_set_effective_target(const NowTriple *t) {
+    if (t) {
+        g_effective_target     = *t;
+        g_effective_target_set = 1;
+    } else {
+        memset(&g_effective_target, 0, sizeof(g_effective_target));
+        g_effective_target_set = 0;
+    }
+}
+
+NOW_API const NowTriple *now_arch_effective_target(void) {
+    return g_effective_target_set ? &g_effective_target
+                                  : now_host_triple_parsed();
+}
+
 /* ---- Active tag set ---- */
 
 NOW_API void now_tagset_init(NowTagSet *s) {

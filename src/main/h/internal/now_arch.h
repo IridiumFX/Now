@@ -49,6 +49,24 @@ NOW_API const NowTriple *now_host_triple_parsed(void);
 /* Returns 1 if target == host (native build), 0 if cross. */
 NOW_API int now_triple_is_native(const NowTriple *target);
 
+/* ---- The effective target of this invocation ----
+ *
+ * The triple every phase of one `now` run agrees it is building for:
+ * whatever `--target` named, filled from the host, or the host itself
+ * when nothing named one.
+ *
+ * It lives here rather than in now_build.c because the descriptor
+ * loader needs it too — `target_flags` (§11.9) is merged while the
+ * project is being read, and now_pom.c must not depend on the build
+ * engine to find out what it is building. now_build_set_default_target()
+ * publishes it; nothing else may.
+ *
+ * Passing NULL clears it back to "the host". */
+NOW_API void now_arch_set_effective_target(const NowTriple *t);
+
+/* Never NULL: the set target, or the host triple. */
+NOW_API const NowTriple *now_arch_effective_target(void);
+
 /* ---- Active tag set (path-based platform variants) ----
  *
  * The active tag set drives the now_fs source-discovery gate: a

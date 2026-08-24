@@ -340,6 +340,18 @@ Built-in properties:
 | `${now.triple}` | Active platform triple, e.g. `linux:x86_64:gnu` |
 | `${env.NAME}` | Value of environment variable `NAME` |
 
+**None of this table is implemented**, because `properties:` itself is
+not (§2 status table). A `${...}` in a descriptor value reaches the
+compiler as that literal string — measured 2026-08-24 by aurora, who
+also showed the run was a *cache hit* with the variable unset, which
+proves the field is opaque rather than interpolated-to-empty.
+
+One exception, and it is deliberately not from this table:
+`${project.dir}` is expanded in `tests.defines`, so a fixture path can
+be written portably instead of machine-absolute. It exists because a
+relative path in a define is re-resolved by whoever consumes it, and a
+nested build resolves it against the wrong base. See §26.10.
+
 Properties marked `volatile: true` do not flow to dependent modules or
 downstream consumers (§1.11).
 
@@ -469,7 +481,9 @@ because they appear in this specification, not because they work:
 | Field | Type | Intended | Status |
 |-------|------|----------|--------|
 | `build_options` | map? | Advanced build phase options | Not implemented. |
-| `target` / `targets` | map? | Per-triple compile overrides | Not implemented. The `--target` flag and `arch:` tag gating do work; the descriptor block does not. |
+| `target` / `targets` | map? | Per-triple compile overrides | Not implemented. Use `target_flags` (§11.9), which is — as is the `--target` flag and `arch:` tag gating. |
+| `target_flags` | map? | Per-triple compile/link flags, defines, includes and libs | **Implemented** (§11.9). Keyed by triple pattern with `*` wildcards; matching entries merge into `compile`/`link` in declaration order, arrays appending and scalars replacing. Merged at descriptor load, so the incremental freshness hash sees them and a target switch rebuilds. |
+| `toolchains` | map? | Per-triple compiler selection (§11.8) | Not implemented. Only `CC`/`CXX`/`AR`/`AS` and a PATH lookup — see §7.1. Cross-compiling today means putting `--target=` in a `target_flags` entry's `compile.flags`. |
 | `toolchain` | map/string? | Toolchain selection, incl. `cross:<triple>` presets | Not implemented. Only `CC`/`CXX`/`AR`/`AS` environment variables and a PATH lookup are honoured — see §7.1. |
 | `parent` | string? | Published parent descriptor coordinate | Not implemented. |
 | `profiles` | map? | Named build profiles | Not implemented; no `-p` flag exists. |
@@ -4813,6 +4827,41 @@ target_flags: {
 using the same rules as profiles (scalars replace, arrays append).
 Multiple entries may match a triple; they are applied in declaration order.
 
+**Implemented.** Notes on what the implementation commits to:
+
+- **An empty pattern component means the same as `*`.** `"linux"` and
+  `"linux:*:*"` are the same pattern. This is not new — the toolchain
+  matcher has always read a triple that way.
+- **Declaration order, not specificity.** An exact entry declared after
+  a wildcard one is applied after it, and therefore wins a scalar. If
+  you want the specific entry to win, declare it last.
+- **The merge happens once, when the descriptor is read**, against the
+  triple that invocation is building for. Everything downstream sees
+  one merged `compile` block: the compile argv, the link argv,
+  `--explain`, and — the reason it matters — the incremental freshness
+  hash. Switching `--target` in one tree therefore rebuilds rather than
+  relinking the other target's objects, even though `target/` itself is
+  not namespaced per triple (§11.7 is not implemented).
+- **A target matching no entry warns.** `now` cannot check a triple
+  against a list of real ones — `freestanding:riscv64:none` is a valid
+  target it has never heard of, and a closed list would reject exactly
+  the projects this feature exists for. What it can report is that the
+  target selected nothing, which is what a typo in a CI matrix actually
+  changes:
+
+  ```
+  warning: target 'linux:amd64:gnuu' matches no target_flags entry -
+           building with none of them
+           declared: linux:*:gnu
+           declared: freestanding:riscv64:none
+  ```
+
+  A project with no `target_flags` block makes no claim about its
+  target and is never warned.
+- **One `--target` per invocation, so one architecture per invocation.**
+  There is no module-local `target:`, so a workspace cannot build one
+  module for riscv64 and another for the host in the same run.
+
 ---
 
 ## 11.10 Dependency Resolution Across Triples
@@ -8981,12 +9030,49 @@ then `exclude` patterns are applied.
 | `sources.pattern` | `sources.dir` | Primary source selection |
 | `sources.exclude` | `sources.dir` | Post-selection exclusion |
 | `sources.include` | project root | Explicit additions — no glob expansion, literal paths only |
-| `tests.pattern` | `tests.dir` | Test source selection |
+| `tests.pattern` | `tests.dir` | Test source selection. **Not implemented** — parsed and ignored |
+| `tests.exclude` | `tests.dir` | Post-selection exclusion, same matcher as `sources.exclude`. Implemented |
+| `tests.include` | project root | Explicit additions, same rule as `sources.include` |
 | `assembly.include[].src` | project root | Assembly include source paths |
 | `assembly.include[].exclude` | project root | Assembly include exclusions |
 | `sources.generators[].pattern` | project root | Generator input files |
 | `langs[].types[].pattern` | N/A | File type classification — matched against full relative path from source root |
 | `private_groups` | N/A | Not a file glob — dotted prefix matching (doc 25) |
+
+The `tests:` block is read by the same loader as `sources:`, so every
+field listed for one is accepted in the other. That is why
+`tests.exclude` works, and it is worth stating because the reverse also
+holds: `tests.headers` and `tests.private` parse and do nothing, for
+the same reason.
+
+---
+
+## 26.10 `${project.dir}` in `tests.defines`
+
+A define whose value is a path is only useful if it can name a
+location. A relative path is resolved by whoever consumes it — fine for
+a test that opens a fixture from its own working directory, wrong for
+one that hands the path to a nested build, which resolves it against
+its own base. Writing the absolute path instead makes the descriptor
+machine-specific, and descriptors are committed.
+
+`${project.dir}` in a `tests.defines` value expands to the project root
+at compile time:
+
+```pasta
+tests: {
+  dir: "src/test/c",
+  defines: { TEST_RESOURCES: """${project.dir}/src/test/resources""" }
+}
+```
+
+The expansion emits forward slashes even on Windows, because the common
+use is a `-D` whose value lands inside a C string literal, where a
+native separator would be read as an escape sequence.
+
+This is not `${...}` interpolation in general — §1.8's property table
+is unimplemented — and it is deliberately narrow: `tests.defines` is
+where the problem occurs.
 
 
 

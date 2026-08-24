@@ -78,6 +78,31 @@ typedef struct {
     int   inherit_target;
 } NowLink;
 
+/* Per-triple compile/link overrides (§11.9).
+ *
+ * One entry per `target_flags:` key. The key is a triple pattern —
+ * "os:arch:variant" with `*` accepted in any position — and the value
+ * carries `compile:` and `link:` sub-blocks read by the same loaders
+ * the top-level blocks use, so every field they understand is
+ * understood here.
+ *
+ * The pattern is kept as written rather than as a parsed NowTriple.
+ * Matching re-parses it, which costs nothing at the scale of a
+ * descriptor and keeps the string available for diagnostics — a
+ * pattern that matched nothing is the thing a user needs to see
+ * spelled the way they typed it. */
+typedef struct {
+    char      *pattern;
+    NowCompile compile;
+    NowLink    link;
+} NowTargetFlags;
+
+typedef struct {
+    NowTargetFlags *items;
+    size_t          count;
+    size_t          cap;
+} NowTargetFlagsArray;
+
 /* Output configuration (§1.4) */
 typedef struct {
     char *type;            /* executable | static | shared | header-only */
@@ -239,6 +264,14 @@ struct NowProject {
     /* Compile & link (§1.5) */
     NowCompile compile;
     NowLink    link;
+
+    /* Per-triple overrides (§11.9). Merged into `compile` and `link`
+     * above at load time, once, against the target the invocation is
+     * building for — so everything downstream of the loader, including
+     * the freshness hash and `--explain`, sees one set of flags and
+     * cannot disagree with another. The array is kept after merging
+     * for diagnostics only. */
+    NowTargetFlagsArray target_flags;
 
     /* Dependencies (§1.6) */
     NowDepArray deps;

@@ -5318,6 +5318,199 @@ static void test_triple_is_native(void) {
     PASS();
 }
 
+/* ---- Per-triple compile/link overrides (§11.9, `target_flags`) ----
+ *
+ * One descriptor drives every test below: four entries, two of which
+ * match a riscv64 freestanding build and two of which must not. Using
+ * one fixture for all of them is deliberate — the interesting failures
+ * are entries leaking into a build they do not describe, and that is
+ * only visible when the non-matching entries are present.
+ *
+ * The base blocks carry a flag and a scalar of their own so "appended
+ * after the base" and "replaced the base" are distinguishable from
+ * "the base was dropped". */
+static const char *TFLAGS_POM =
+    "{ group: \"org.test\", artifact: \"tflags\", version: \"1.0\","
+    "  langs: [\"c\"],"
+    "  compile: { flags: [\"-base\"], defines: [\"BASE\"], opt: \"speed\" },"
+    "  link:    { flags: [\"-Lbase\"], libs: [\"baselib\"] },"
+    "  target_flags: {"
+    "    \"freestanding:riscv64:none\": {"
+    "      compile: { flags: [\"--target=riscv64-unknown-elf\", \"-mabi=lp64\"],"
+    "                 defines: [\"RV64\"], opt: \"size\" },"
+    "      link:    { flags: [\"-nostdlib\"], libs: [\"rvlib\"] } },"
+    "    \"freestanding:*:*\": {"
+    "      compile: { flags: [\"-ffreestanding\"], defines: [\"FREESTANDING\"] } },"
+    "    \"freestanding:arm64:none\": {"
+    "      compile: { flags: [\"-mgeneral-regs-only\"], defines: [\"ARM64\"] },"
+    "      link:    { flags: [\"-armlink\"] } },"
+    "    \"linux:*:gnu\": {"
+    "      compile: { flags: [\"-pthread\"], defines: [\"GLIBC\"] } }"
+    "  } }";
+
+/* Load TFLAGS_POM as if `--target <triple>` had been given. Restores
+ * nothing — every caller must clear the effective target, because it
+ * is process-wide and a leak into the next test is exactly the kind of
+ * cross-test coupling that makes a suite lie. */
+static NowProject *load_tflags_for(const char *triple) {
+    NowTriple t;
+    now_triple_parse(&t, triple);
+    now_arch_set_effective_target(&t);
+    NowResult res;
+    NowProject *p = now_project_load_string(TFLAGS_POM, strlen(TFLAGS_POM), &res);
+    now_arch_set_effective_target(NULL);
+    return p;
+}
+
+/* Index of `s` in `a`, or -1. Order matters in §11.9 and a `contains`
+ * cannot see it. */
+static int strarray_index(const NowStrArray *a, const char *s) {
+    for (size_t i = 0; i < a->count; i++)
+        if (strcmp(a->items[i], s) == 0) return (int)i;
+    return -1;
+}
+
+static void test_target_flags_match_in_declaration_order(void) {
+    TEST("target_flags: matching entries append in declaration order");
+    NowProject *p = load_tflags_for("freestanding:riscv64:none");
+    ASSERT_NOT_NULL(p);
+
+    int base = strarray_index(&p->compile.flags, "-base");
+    int exact = strarray_index(&p->compile.flags, "--target=riscv64-unknown-elf");
+    int wild  = strarray_index(&p->compile.flags, "-ffreestanding");
+
+    if (base != 0)          { now_project_free(p); FAIL("base flag not first"); return; }
+    if (exact < 0 || wild < 0) { now_project_free(p); FAIL("a matching entry contributed nothing"); return; }
+    /* The exact entry is declared before the wildcard one, so it must
+     * appear first — not because either is "more specific", but
+     * because §11.9 orders by declaration and nothing else. */
+    if (exact > wild)       { now_project_free(p); FAIL("declaration order not preserved"); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+/* The invariant, rather than a list of flags that must be absent: NO
+ * string contributed by an entry whose pattern does not match the
+ * effective target may appear anywhere in the merged blocks.
+ *
+ * Written this way because the case list can only catch the leaks we
+ * already suspect. This walks the descriptor's own entries, so an
+ * entry added to the fixture later is covered without the assertion
+ * being touched — and a matcher that silently degrades to "match
+ * everything" fails here even though every positive test still
+ * passes. */
+static void test_target_flags_unmatched_entries_contribute_nothing(void) {
+    TEST("target_flags: nothing from a non-matching pattern reaches the build");
+    NowProject *p = load_tflags_for("freestanding:riscv64:none");
+    ASSERT_NOT_NULL(p);
+
+    NowTriple target;
+    now_triple_parse(&target, "freestanding:riscv64:none");
+
+    int checked = 0;
+    for (size_t i = 0; i < p->target_flags.count; i++) {
+        const NowTargetFlags *e = &p->target_flags.items[i];
+        NowTriple pattern;
+        now_triple_parse(&pattern, e->pattern);
+        if (now_triple_match(&pattern, &target)) continue;
+        checked++;
+        for (size_t f = 0; f < e->compile.flags.count; f++) {
+            if (strarray_index(&p->compile.flags, e->compile.flags.items[f]) >= 0) {
+                now_project_free(p); FAIL("a non-matching compile flag leaked"); return;
+            }
+        }
+        for (size_t d = 0; d < e->compile.defines.count; d++) {
+            if (strarray_index(&p->compile.defines, e->compile.defines.items[d]) >= 0) {
+                now_project_free(p); FAIL("a non-matching define leaked"); return;
+            }
+        }
+        for (size_t f = 0; f < e->link.flags.count; f++) {
+            if (strarray_index(&p->link.flags, e->link.flags.items[f]) >= 0) {
+                now_project_free(p); FAIL("a non-matching link flag leaked"); return;
+            }
+        }
+    }
+    /* A test that examined no non-matching entry proved nothing. */
+    if (checked != 2) { now_project_free(p); FAIL("expected 2 non-matching entries"); return; }
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_target_flags_follow_the_target(void) {
+    TEST("target_flags: the same descriptor differs by target");
+    NowProject *rv = load_tflags_for("freestanding:riscv64:none");
+    ASSERT_NOT_NULL(rv);
+    NowProject *arm = load_tflags_for("freestanding:arm64:none");
+    if (!arm) { now_project_free(rv); FAIL("arm64 load failed"); return; }
+
+    int rv_has_rv   = strarray_index(&rv->compile.defines,  "RV64") >= 0;
+    int rv_has_arm  = strarray_index(&rv->compile.defines,  "ARM64") >= 0;
+    int arm_has_arm = strarray_index(&arm->compile.defines, "ARM64") >= 0;
+    int arm_has_rv  = strarray_index(&arm->compile.defines, "RV64") >= 0;
+    /* Both get the wildcard entry — which is what proves the two loads
+     * differ by target rather than by one of them having failed. */
+    int both_wild = strarray_index(&rv->compile.defines,  "FREESTANDING") >= 0 &&
+                    strarray_index(&arm->compile.defines, "FREESTANDING") >= 0;
+
+    now_project_free(rv);
+    now_project_free(arm);
+
+    if (!rv_has_rv || !arm_has_arm) { FAIL("exact entry missed its own target"); return; }
+    if (rv_has_arm || arm_has_rv)   { FAIL("exact entry crossed targets"); return; }
+    if (!both_wild)                 { FAIL("wildcard entry missed one of them"); return; }
+    PASS();
+}
+
+static void test_target_flags_scalars_replace(void) {
+    TEST("target_flags: scalars replace the base, arrays append to it");
+    NowProject *p = load_tflags_for("freestanding:riscv64:none");
+    ASSERT_NOT_NULL(p);
+
+    /* opt: base says "speed", the matching entry says "size". A
+     * freestanding target that cannot honour the base's choice has to
+     * be able to overrule it, which is why this one replaces. */
+    if (!p->compile.opt || strcmp(p->compile.opt, "size") != 0) {
+        now_project_free(p); FAIL("opt was not replaced"); return;
+    }
+    /* ...while the base's own define survives beside the new ones. */
+    if (strarray_index(&p->compile.defines, "BASE") != 0) {
+        now_project_free(p); FAIL("base define lost or reordered"); return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
+static void test_target_flags_link_block(void) {
+    TEST("target_flags: the link block merges too");
+    NowProject *p = load_tflags_for("freestanding:riscv64:none");
+    ASSERT_NOT_NULL(p);
+    if (strarray_index(&p->link.flags, "-Lbase")   != 0 ||
+        strarray_index(&p->link.flags, "-nostdlib") < 0 ||
+        strarray_index(&p->link.libs,  "baselib")  != 0 ||
+        strarray_index(&p->link.libs,  "rvlib")     < 0) {
+        now_project_free(p); FAIL("link block not merged"); return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
+static void test_target_flags_absent_is_inert(void) {
+    TEST("target_flags: a descriptor without the block is unchanged");
+    static const char *POM =
+        "{ group: \"org.test\", artifact: \"plain\", version: \"1.0\","
+        "  langs: [\"c\"], compile: { flags: [\"-base\"] } }";
+    NowResult res;
+    NowProject *p = now_project_load_string(POM, strlen(POM), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ((int)p->target_flags.count, 0);
+    ASSERT_EQ((int)p->compile.flags.count, 1);
+    ASSERT_STR(p->compile.flags.items[0], "-base");
+    now_project_free(p);
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -8997,6 +9190,14 @@ int main(void) {
     test_triple_match_wildcard();
     test_triple_host_detect();
     test_triple_is_native();
+
+    printf("\n  Per-triple compile/link overrides (target_flags):\n");
+    test_target_flags_match_in_declaration_order();
+    test_target_flags_unmatched_entries_contribute_nothing();
+    test_target_flags_follow_the_target();
+    test_target_flags_scalars_replace();
+    test_target_flags_link_block();
+    test_target_flags_absent_is_inert();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();

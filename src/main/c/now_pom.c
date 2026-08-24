@@ -476,7 +476,7 @@ static const char *const k_known_keys[] = {
     "lang", "langs", "std", "sources", "tests", "output", "compile", "link",
     "deps", "depends", "repos", "convergence", "private_groups", "resolve",
     "plugins",
-    "components", "vendored", "modules", "java", "arch",
+    "components", "vendored", "modules", "java", "arch", "target_flags",
     /* Read out-of-band from the raw Pasta tree rather than into
      * NowProject, so they have no struct field to grep for — but they
      * are live config and must not be reported as unknown:
@@ -503,9 +503,15 @@ static const char *const k_inert_keys[] = {
      *                    and arch: tags exist; the descriptor block does not)
      *   toolchain     — named presets, incl. cross:<triple>; only the CC/CXX
      *                   environment variables and PATH lookup are implemented
+     *   toolchains    — the §11.8 per-triple compiler map. Its sibling
+     *                   `target_flags` (§11.9) is implemented and lives in
+     *                   the known list above; this one is not, and reporting
+     *                   it as a typo told a cross-compiling user their
+     *                   spelling was wrong when it was the build's coverage
+     *                   that was.
      *   parent        — published parent descriptor coordinate
      */
-    "build_options", "target", "targets", "toolchain", "parent",
+    "build_options", "target", "targets", "toolchain", "toolchains", "parent",
     "publish", "assembly", NULL
 };
 
@@ -827,6 +833,145 @@ static void now_link_free(NowLink *l) {
     free(l->script_body);
 }
 
+/* ---- Per-triple compile/link overrides (§11.9) ---- */
+
+static void now_target_flags_free(NowTargetFlagsArray *a) {
+    if (!a) return;
+    for (size_t i = 0; i < a->count; i++) {
+        free(a->items[i].pattern);
+        now_compile_free(&a->items[i].compile);
+        now_link_free(&a->items[i].link);
+    }
+    free(a->items);
+    a->items = NULL;
+    a->count = a->cap = 0;
+}
+
+/* Read `target_flags: { "<pattern>": { compile: {...}, link: {...} } }`.
+ *
+ * Order is the descriptor's order — Pasta maps preserve it and §11.9
+ * makes the merge order-dependent, so this cannot be a lookup table. */
+static void load_target_flags(NowTargetFlagsArray *dst, const PastaValue *src) {
+    if (!dst || !src || pasta_type(src) != PASTA_MAP) return;
+    size_t n = pasta_count(src);
+    for (size_t i = 0; i < n; i++) {
+        const char       *k = pasta_map_key(src, i);
+        const PastaValue *v = pasta_map_value(src, i);
+        if (!k || !*k || !v || pasta_type(v) != PASTA_MAP) continue;
+
+        if (dst->count == dst->cap) {
+            size_t cap = dst->cap ? dst->cap * 2 : 4;
+            NowTargetFlags *grown =
+                (NowTargetFlags *)realloc(dst->items, cap * sizeof(*grown));
+            if (!grown) return;
+            dst->items = grown;
+            dst->cap   = cap;
+        }
+
+        NowTargetFlags *e = &dst->items[dst->count];
+        memset(e, 0, sizeof(*e));
+        now_compile_init(&e->compile);
+        now_link_init(&e->link);
+        e->pattern = strdup(k);
+        if (!e->pattern) {
+            now_compile_free(&e->compile);
+            now_link_free(&e->link);
+            return;
+        }
+        load_compile(&e->compile, pasta_map_get(v, "compile"));
+        load_link(&e->link,       pasta_map_get(v, "link"));
+        dst->count++;
+    }
+}
+
+static void append_strarray(NowStrArray *dst, const NowStrArray *src) {
+    for (size_t i = 0; i < src->count; i++)
+        now_strarray_push(dst, src->items[i]);
+}
+
+/* Scalars replace; a pattern that does not state one leaves the base
+ * alone. `replace` rather than `fill if empty` is what §11.9 says, and
+ * it is the only useful reading: a base `opt: "speed"` that a
+ * freestanding target cannot honour has to be overridable by the
+ * entry that knows better. */
+static void replace_str(char **dst, const char *src) {
+    if (!src) return;
+    char *copy = strdup(src);
+    if (!copy) return;
+    free(*dst);
+    *dst = copy;
+}
+
+/* Merge every entry matching this invocation's target into the base
+ * blocks, in declaration order (§11.9): arrays append, scalars replace.
+ *
+ * Done once, at load, so that the freshness hash, `--explain`, the
+ * compile argv and the link argv are all reading one merged block and
+ * cannot disagree about what the build's flags are. The cost of the
+ * alternative — merging at each emit site — is not the duplication but
+ * that the hash is one of those sites, and a flag that changes the
+ * compile without changing the hash is a stale object.
+ *
+ * An entry whose pattern matches nothing is not an error: a descriptor
+ * naming four architectures is *expected* to have three inert entries
+ * on any given run. */
+static void apply_target_flags(NowProject *p) {
+    if (!p || p->target_flags.count == 0) return;
+    const NowTriple *target = now_arch_effective_target();
+    if (!target) return;
+
+    int matched = 0;
+    for (size_t i = 0; i < p->target_flags.count; i++) {
+        NowTargetFlags *e = &p->target_flags.items[i];
+        NowTriple pattern;
+        now_triple_parse(&pattern, e->pattern);
+        /* An empty component matches anything, same as `*` — so
+         * "linux" alone is "any linux", and the three-component form
+         * is not mandatory. now_triple_match() already reads it that
+         * way for the toolchain map. */
+        if (!now_triple_match(&pattern, target)) continue;
+        matched++;
+
+        append_strarray(&p->compile.flags,    &e->compile.flags);
+        append_strarray(&p->compile.warnings, &e->compile.warnings);
+        append_strarray(&p->compile.defines,  &e->compile.defines);
+        append_strarray(&p->compile.includes, &e->compile.includes);
+        replace_str(&p->compile.std, e->compile.std);
+        replace_str(&p->compile.opt, e->compile.opt);
+
+        append_strarray(&p->link.flags,    &e->link.flags);
+        append_strarray(&p->link.libs,     &e->link.libs);
+        append_strarray(&p->link.libdirs,  &e->link.libdirs);
+        append_strarray(&p->link.archives, &e->link.archives);
+        replace_str(&p->link.script,      e->link.script);
+        replace_str(&p->link.script_body, e->link.script_body);
+        if (e->link.inherit_target) p->link.inherit_target = 1;
+    }
+
+    /* A descriptor that declares per-triple flags and then matches none
+     * of them is the CI-matrix typo: `--target linux:amd64:gnuu` builds
+     * successfully, silently, with none of the configuration the author
+     * wrote for it. `now` cannot validate a triple against a list of
+     * real ones — `freestanding:riscv64:none` is a perfectly good target
+     * it has never heard of, and a closed list would refuse exactly the
+     * users this feature is for. What it CAN say is that the target
+     * selected nothing, which is the observable the typo actually
+     * changes.
+     *
+     * Only warned when entries exist: a project with no target_flags is
+     * not making a claim about its target and must stay silent. */
+    if (matched == 0) {
+        char t[NOW_TRIPLE_MAX * 3 + 3];
+        now_triple_format(target, t, sizeof(t));
+        fprintf(stderr,
+                "warning: target '%s' matches no target_flags entry - "
+                "building with none of them\n", t);
+        for (size_t i = 0; i < p->target_flags.count; i++)
+            fprintf(stderr, "         declared: %s\n",
+                    p->target_flags.items[i].pattern);
+    }
+}
+
 NOW_API NowProject *now_project_new(void) {
     NowProject *p = calloc(1, sizeof(NowProject));
     if (!p) return NULL;
@@ -866,6 +1011,7 @@ NOW_API void now_project_free(NowProject *p) {
     free(p->output.dir);
     now_compile_free(&p->compile);
     now_link_free(&p->link);
+    now_target_flags_free(&p->target_flags);
     now_deparray_free(&p->deps);
     now_repoarray_free(&p->repos);
     now_pluginarray_free(&p->plugins);
@@ -978,6 +1124,11 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
     load_compile(&p->compile, pasta_map_get(root, "compile"));
     load_link(&p->link,       pasta_map_get(root, "link"));
 
+    /* Per-triple overrides (§11.9) — read here, merged into the two
+     * blocks above by apply_target_flags() once the whole descriptor
+     * is in. */
+    load_target_flags(&p->target_flags, pasta_map_get(root, "target_flags"));
+
     /* Dependencies (§1.6). Accept `depends:` as a Maven-friendly
      * alias for `deps:` — `deps:` wins when both are present. */
     {
@@ -1033,6 +1184,7 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
     load_arch(&p->arch, pasta_map_get(root, "arch"));
 
     apply_maven_defaults(p);
+    apply_target_flags(p);
 
     warn_descriptor_keys(root, path);
     warn_dead_nested_keys(root, path);
@@ -1100,6 +1252,7 @@ NOW_API NowProject *now_project_load_string(const char *input, size_t len,
     load_output(&p->output, pasta_map_get(root, "output"));
     load_compile(&p->compile, pasta_map_get(root, "compile"));
     load_link(&p->link,       pasta_map_get(root, "link"));
+    load_target_flags(&p->target_flags, pasta_map_get(root, "target_flags"));
     {
         const PastaValue *dv = pasta_map_get(root, "deps");
         if (!dv) dv = pasta_map_get(root, "depends");
@@ -1138,6 +1291,7 @@ NOW_API NowProject *now_project_load_string(const char *input, size_t len,
     load_arch(&p->arch, pasta_map_get(root, "arch"));
 
     apply_maven_defaults(p);
+    apply_target_flags(p);
 
     if (result) {
         result->code = NOW_OK;
