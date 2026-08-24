@@ -164,6 +164,40 @@ NOW_API void now_build_set_default_target(const char *triple,
 NOW_API int now_compile_db(const NowProject *project, const char *basedir,
                             NowResult *result);
 
+/* ---- introspection, for `now tell` (§19) ----
+ *
+ * These exist so `now tell` and `compile_commands.json` cannot disagree
+ * about what the compiler would be given. They are the same builders
+ * compile-db uses; a second implementation of "what is the command for
+ * this file" is precisely the shape that has produced a defect a week
+ * in this tree.
+ *
+ * now_query_sources: every file the build would compile, in build order.
+ *   Caller frees with now_filelist_free.
+ *
+ * now_query_compile_argv: the full invocation for ONE source file, as a
+ *   NULL-terminated argv. `flags_only` drops the tool and the file, for
+ *   callers that want to splice the flags into their own command.
+ *   Returns a malloc'd array of malloc'd strings; free with
+ *   now_query_argv_free. Returns NULL if the file is not one the build
+ *   would compile — which is the honest answer for a path that is not
+ *   in the source set, rather than a plausible command nobody would run.
+ *
+ * now_query_includes: the include search path the compile would use. */
+NOW_API int now_query_sources(const NowProject *project, const char *basedir,
+                              NowFileList *out, NowResult *result);
+
+NOW_API char **now_query_compile_argv(const NowProject *project,
+                                       const char *basedir,
+                                       const char *src_rel,
+                                       int flags_only,
+                                       NowResult *result);
+
+NOW_API void now_query_argv_free(char **argv);
+
+NOW_API int now_query_includes(const NowProject *project, const char *basedir,
+                               NowStrArray *out, NowResult *result);
+
 /* Run a subprocess and capture exit code. Returns exit code. */
 NOW_API int now_exec(const char *const *argv, int verbose);
 

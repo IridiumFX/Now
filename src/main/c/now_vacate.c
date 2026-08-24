@@ -313,14 +313,21 @@ NOW_API int now_vacate(const NowVacateOpts *opts, NowResult *result) {
      *    actions. Refuse unless the operator said --force, which is
      *    exactly the flag for "I know what I am doing". */
     if (rs.locks_seen == 0 && !opts->force) {
-        fprintf(stderr,
-                "error: no now.lock.pasta found under any scanned root, so "
-                "nothing can be shown to be unreferenced\n");
-        for (size_t i = 0; i < opts->scan_count; i++)
-            fprintf(stderr, "       scanned: %s\n", opts->scan_roots[i]);
-        fprintf(stderr,
-                "       pass --scan <dir> to point at your projects, or "
-                "--force to remove regardless\n");
+        /* The refusal explains itself, because a user who runs this from
+         * the wrong directory needs to know WHICH directories were
+         * searched. Suppressed under `quiet` — a caller passing that is
+         * saying it will read the return value instead, and a test
+         * asserting on a refusal should not print a paragraph. */
+        if (!opts->quiet) {
+            fprintf(stderr,
+                    "error: no now.lock.pasta found under any scanned root, so "
+                    "nothing can be shown to be unreferenced\n");
+            for (size_t i = 0; i < opts->scan_count; i++)
+                fprintf(stderr, "       scanned: %s\n", opts->scan_roots[i]);
+            fprintf(stderr,
+                    "       pass --scan <dir> to point at your projects, or "
+                    "--force to remove regardless\n");
+        }
         cs_free(&installed); cs_free(&refs); cs_free(&doomed);
         free(repo_root);
         if (result) {
