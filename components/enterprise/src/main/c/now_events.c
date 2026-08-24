@@ -8,16 +8,23 @@
  * to change what the build does. Every send here is best effort and
  * every failure is discarded.
  *
- * The UDP shim at the bottom is written against raw sockets because
- * apennines has no datagram primitive: it exposes tcp.h but nothing for
- * SOCK_DGRAM, and only dns.c uses one, privately. `t3/net/udp.h` is the
- * natural home for it and has been requested (to-apennines.md,
- * 2026-08-21). Until it exists this mirrors dns.c's platform guards
- * rather than inventing a third shape; when it lands, this section is
- * what should be deleted.
+ * The datagram work goes through apennines' `t3/net/udp.h`. It used to
+ * be an eighty-line raw-socket shim here, written because a grep for
+ * SOCK_DGRAM over `lib/apennines/` found only dns.c's private one and we
+ * concluded apennines had no datagram primitive. It has had one since
+ * 2026-04-10; `now` had simply never vendored the file. The grep was
+ * over our vendored subset — 29 of apennines' 372 headers — and "is it
+ * in the library" is not the question a subset can answer. Shim deleted
+ * 2026-08-24.
  */
 #include "now_events.h"
 #include "now_fs.h"
+
+/* On Windows t3/net/udp.h pulls in <winsock2.h>, and that has to happen
+ * before <windows.h> below — the other order drags in winsock 1.1 and
+ * the two conflict. */
+#include "apennines/t2/net/addr.h"
+#include "apennines/t3/net/udp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,29 +35,20 @@
 #ifdef _WIN32
   #include <io.h>
   #include <fcntl.h>
+  #include <windows.h>   /* Sleep — after udp.h's <winsock2.h>, see above */
 #endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
-#ifdef _WIN32
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #include <windows.h>
-  typedef SOCKET now_sock;
-  #define NOW_SOCK_BAD  INVALID_SOCKET
-  #define now_sock_close closesocket
-#else
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-  #include <unistd.h>
-  #include <errno.h>
-  typedef int now_sock;
-  #define NOW_SOCK_BAD  (-1)
-  #define now_sock_close close
-#endif
+/* How often the receive poll wakes while waiting out its timeout.
+ * apennines' udp_socket_recv takes no timeout and there is no
+ * set_recv_timeout beside the other setsockopt knobs, so SO_RCVTIMEO
+ * became non-blocking plus this. Small enough that the shortest caller
+ * in the tree (250 ms) still gets fifty chances; large enough that the
+ * longest (3000 ms) is not a busy loop. */
+#define NOW_EVENTS_POLL_MS 5
 
 /* ==== names ==== */
 
@@ -761,18 +759,6 @@ NOW_API int now_event_decode_basta(NowEvent *ev, const char *doc, size_t len) {
 
 /* ==== UDP ==== */
 
-static int sockets_up(void) {
-#ifdef _WIN32
-    static int done = 0;
-    if (!done) {
-        WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
-        done = 1;
-    }
-#endif
-    return 0;
-}
-
 /* Parse "udp://host:port". Returns 0 on success. */
 static int parse_events_url(const char *url, char *host, size_t host_cap,
                             int *port) {
@@ -808,40 +794,50 @@ static int addr_is_multicast(const char *host) {
     return a >= 224 && a <= 239;
 }
 
+/* Resolve the host half of an events URL to an address apennines can
+ * use. `addr_sockaddr_create` parses IP LITERALS only — it does not
+ * resolve names, and returns hatch 3 for anything that is not one.
+ *
+ * "localhost" is mapped to 127.0.0.1 here rather than resolved, which
+ * is what the raw-socket code it replaced did (INADDR_LOOPBACK) and is
+ * deliberately not the same as calling a resolver: `localhost` answers
+ * AAAA `::1` first on this machine, and an events v1 socket is IPv4.
+ * Going through `addr_resolve` would reintroduce exactly the ordering
+ * bug that `tcp_conn_create_host` exists to paper over. */
+static unsigned long events_addr(net_sock_addr *out, const char *host,
+                                 int port) {
+    if (strcmp(host, "localhost") == 0)
+        return addr_sockaddr_create(out, "127.0.0.1", (u16)port);
+    return addr_sockaddr_create(out, host, (u16)port);
+}
+
 struct NowEventSink {
-    now_sock           fd;
-    struct sockaddr_in to;
-    char               wire[16];
+    udp_socket    sock;
+    net_sock_addr to;
+    int           open;
+    char          wire[16];
 };
 
 NOW_API NowEventSink *now_event_sink_open(const char *url, const char *wire) {
     char host[128];
     int port;
     NowEventSink *s;
+    net_sock_addr any;
 
     if (parse_events_url(url, host, sizeof(host), &port) != 0) return NULL;
-    if (sockets_up() != 0) return NULL;
 
     s = (NowEventSink *)calloc(1, sizeof(*s));
     if (!s) return NULL;
 
     snprintf(s->wire, sizeof(s->wire), "%s", (wire && *wire) ? wire : "basta");
 
-    s->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s->fd == NOW_SOCK_BAD) { free(s); return NULL; }
+    if (events_addr(&s->to, host, port) != 0) { free(s); return NULL; }
 
-    s->to.sin_family = AF_INET;
-    s->to.sin_port = htons((unsigned short)port);
-    if (strcmp(host, "localhost") == 0)
-        s->to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    else
-        s->to.sin_addr.s_addr = inet_addr(host);
-
-    if (s->to.sin_addr.s_addr == INADDR_NONE) {
-        now_sock_close(s->fd);
-        free(s);
-        return NULL;
-    }
+    /* Bind an ephemeral local port: udp_socket_create binds, and a
+     * sender wants any port rather than a chosen one. */
+    if (addr_sockaddr_create(&any, "0.0.0.0", 0) != 0) { free(s); return NULL; }
+    if (udp_socket_create(&s->sock, &any) != 0) { free(s); return NULL; }
+    s->open = 1;
     return s;
 }
 
@@ -861,40 +857,41 @@ NOW_API void now_event_sink_send(NowEventSink *sink, const NowEvent *ev) {
     size_t n;
     int repeats, i;
 
-    if (!sink || !ev) return;
+    if (!sink || !sink->open || !ev) return;
 
     n = now_event_render(buf, sizeof(buf), ev, sink->wire);
     if (n == 0) return;
 
     repeats = now_event_is_terminal(ev->event) ? NOW_EVENTS_TERMINAL_REPEATS : 1;
     for (i = 0; i < repeats; i++) {
-        /* The return value is deliberately ignored. There is nothing a
-         * build could usefully do about a datagram that did not leave,
-         * and specs/now-events-v1.md §7 makes that a requirement rather
+        /* The result is deliberately ignored. There is nothing a build
+         * could usefully do about a datagram that did not leave, and
+         * specs/now-events-v1.md §7 makes that a requirement rather
          * than an oversight. */
-        (void)sendto(sink->fd, buf, (int)n, 0,
-                     (struct sockaddr *)&sink->to, sizeof(sink->to));
+        u64 sent = 0;
+        (void)udp_socket_send(&sent, &sink->sock, buf, (u64)n, &sink->to);
         if (i + 1 < repeats) sleep_ms(50);
     }
 }
 
 NOW_API void now_event_sink_close(NowEventSink *sink) {
     if (!sink) return;
-    if (sink->fd != NOW_SOCK_BAD) now_sock_close(sink->fd);
+    if (sink->open) (void)udp_socket_destroy(&sink->sock);
     free(sink);
 }
 
 /* ---- listening ---- */
 
 struct NowEventSource {
-    now_sock fd;
+    udp_socket sock;
+    int        open;
+    int        nonblocking;
 };
 
 NOW_API NowEventSource *now_event_source_open(const char *url, int insecure,
                                               NowResult *result) {
     char host[128];
     int port;
-    struct sockaddr_in me;
     NowEventSource *s;
 
     if (parse_events_url(url, host, sizeof(host), &port) != 0) {
@@ -934,87 +931,91 @@ NOW_API NowEventSource *now_event_source_open(const char *url, int insecure,
         return NULL;
     }
 
-    if (sockets_up() != 0) {
-        if (result) {
-            result->code = NOW_ERR_IO;
-            snprintf(result->message, sizeof(result->message),
-                     "cannot initialise sockets");
-        }
-        return NULL;
-    }
-
     s = (NowEventSource *)calloc(1, sizeof(*s));
     if (!s) return NULL;
 
-    s->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s->fd == NOW_SOCK_BAD) {
-        free(s);
-        if (result) {
-            result->code = NOW_ERR_IO;
-            snprintf(result->message, sizeof(result->message),
-                     "cannot create a UDP socket");
-        }
-        return NULL;
-    }
-
+    /* SO_REUSEADDR before bind, which is what the raw-socket version
+     * did and what `_reusable` exists for. */
     {
-        int yes = 1;
-        setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR,
-                   (const char *)&yes, sizeof(yes));
-    }
-
-    memset(&me, 0, sizeof(me));
-    me.sin_family = AF_INET;
-    me.sin_port = htons((unsigned short)port);
-    me.sin_addr.s_addr = addr_is_loopback(host)
-                       ? htonl(INADDR_LOOPBACK)
-                       : htonl(INADDR_ANY);
-
-    if (bind(s->fd, (struct sockaddr *)&me, sizeof(me)) != 0) {
-        now_sock_close(s->fd);
-        free(s);
-        if (result) {
-            result->code = NOW_ERR_IO;
-            snprintf(result->message, sizeof(result->message),
-                     "cannot bind udp %s:%d — is something already listening?",
-                     host, port);
+        net_sock_addr me;
+        const char *bind_host = addr_is_loopback(host) ? "127.0.0.1" : "0.0.0.0";
+        if (addr_sockaddr_create(&me, bind_host, (u16)port) != 0) {
+            free(s);
+            if (result) {
+                result->code = NOW_ERR_IO;
+                snprintf(result->message, sizeof(result->message),
+                         "cannot form a bind address for %s:%d", host, port);
+            }
+            return NULL;
         }
-        return NULL;
+        if (udp_socket_create_reusable(&s->sock, &me) != 0) {
+            free(s);
+            if (result) {
+                result->code = NOW_ERR_IO;
+                snprintf(result->message, sizeof(result->message),
+                         "cannot bind udp %s:%d — is something already listening?",
+                         host, port);
+            }
+            return NULL;
+        }
+        s->open = 1;
     }
     return s;
 }
 
+/* apennines' `udp_socket_recv` has no timeout parameter and there is no
+ * `udp_socket_set_recv_timeout` beside the other setsockopt knobs, so
+ * the SO_RCVTIMEO this replaced becomes non-blocking plus a poll. The
+ * observable contract is unchanged: 0 on timeout, 1 on a decoded event,
+ * -1 on a datagram that did not decode, -2 on bad arguments.
+ *
+ * A negative or zero timeout still means "block until something
+ * arrives", so the socket is left blocking in that case rather than
+ * spun on. */
 NOW_API int now_event_source_recv(NowEventSource *src, NowEvent *ev,
                                   int timeout_ms) {
     char buf[NOW_EVENTS_MAX_DATAGRAM + 1];
-    int n;
+    u64 got = 0;
+    int waited;
 
-    if (!src || !ev) return -2;
+    if (!src || !src->open || !ev) return -2;
 
-    if (timeout_ms > 0) {
-#ifdef _WIN32
-        DWORD tv = (DWORD)timeout_ms;
-        setsockopt(src->fd, SOL_SOCKET, SO_RCVTIMEO,
-                   (const char *)&tv, sizeof(tv));
-#else
-        struct timeval tv;
-        tv.tv_sec = (long)(timeout_ms / 1000);
-        tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
-        setsockopt(src->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
+    if (timeout_ms <= 0) {
+        if (src->nonblocking) {
+            if (udp_socket_set_nonblocking(&src->sock, 0) != 0) return 0;
+            src->nonblocking = 0;
+        }
+        if (udp_socket_recv(&got, buf, (u64)sizeof(buf) - 1, NULL, &src->sock) != 0)
+            return 0;
+        if (got == 0) return 0;
+        buf[got] = '\0';
+        if (now_event_decode(ev, buf, (size_t)got) != 0) return -1;
+        return 1;
     }
 
-    n = recvfrom(src->fd, buf, (int)sizeof(buf) - 1, 0, NULL, NULL);
-    if (n <= 0) return 0;      /* timeout, or an empty datagram */
-    buf[n] = '\0';
+    if (!src->nonblocking) {
+        if (udp_socket_set_nonblocking(&src->sock, 1) != 0) return 0;
+        src->nonblocking = 1;
+    }
 
-    if (now_event_decode(ev, buf, (size_t)n) != 0) return -1;
-    return 1;
+    /* NOW_EVENTS_POLL_MS is small enough that a 250 ms caller — the
+     * shortest in the tree — still gets fifty chances, and large enough
+     * that a 3000 ms one is not a busy loop. */
+    for (waited = 0; ; waited += NOW_EVENTS_POLL_MS) {
+        if (udp_socket_recv(&got, buf, (u64)sizeof(buf) - 1, NULL,
+                            &src->sock) == 0 && got > 0) {
+            buf[got] = '\0';
+            if (now_event_decode(ev, buf, (size_t)got) != 0) return -1;
+            return 1;
+        }
+        if (waited >= timeout_ms) return 0;
+        sleep_ms(NOW_EVENTS_POLL_MS);
+    }
 }
 
 NOW_API void now_event_source_close(NowEventSource *src) {
     if (!src) return;
-    if (src->fd != NOW_SOCK_BAD) now_sock_close(src->fd);
+    if (src->open) (void)udp_socket_destroy(&src->sock);
     free(src);
 }
 

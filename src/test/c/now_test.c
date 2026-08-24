@@ -2025,6 +2025,96 @@ static void test_events_version_and_unknown_fields(void) {
     PASS();
 }
 
+/* Both of these exist because a negative control stayed green.
+ *
+ * The datagram path moved from a raw-socket shim to apennines'
+ * t3/net/udp.h on 2026-08-24. Breaking the send, or binding the wrong
+ * port, turned five tests red — but breaking the RECEIVE POLL did not
+ * turn anything red, and neither did deleting the localhost mapping.
+ * Two pieces of hand-written logic with nothing watching them. */
+
+/* apennines' udp_socket_recv takes no timeout and there is no
+ * set_recv_timeout beside the other setsockopt knobs, so what used to be
+ * SO_RCVTIMEO is now a hand-written non-blocking poll. **A poll that
+ * gives up immediately and a poll that never returns both look like
+ * `rc == 0` to a caller that does not measure the clock.** Every other
+ * events test sends before it receives, so the datagram is already
+ * waiting on the first try and the loop never runs. */
+static void test_events_recv_waits_out_its_timeout(void) {
+    TEST("events: a receive with nothing to read waits out its timeout");
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19482", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    NowEvent ev;
+    double t0 = now_clock_secs();
+    int rc = now_event_source_recv(src, &ev, 400);
+    double elapsed = now_clock_secs() - t0;
+    now_event_source_close(src);
+
+    if (rc != 0) { FAIL("expected a timeout, got an event"); return; }
+    if (elapsed < 0.25) { FAIL("gave up long before the timeout"); return; }
+    if (elapsed > 4.0)  { FAIL("did not come back near the timeout"); return; }
+
+    /* And a non-positive timeout must NOT spin: it means block, and the
+     * socket is put back into blocking mode for it. Only the argument
+     * check is exercised here — a blocking recv with nothing to read
+     * would hang the suite, which is the whole reason the poll exists. */
+    ASSERT_EQ(now_event_source_recv(NULL, &ev, 400), -2);
+    PASS();
+}
+
+/* `addr_sockaddr_create` parses IP literals only — it returns a hatch
+ * for "localhost" rather than resolving it. The sink maps that name to
+ * 127.0.0.1 itself, deliberately, because going through a resolver
+ * would hand back AAAA ::1 first on this machine and an events v1
+ * socket is IPv4. Nothing tested it: every other events test spells the
+ * literal, so deleting the mapping left the suite at 374/374 while
+ * `now build --events udp://localhost:PORT` silently sent nothing. */
+static void test_events_localhost_reaches_the_loopback_socket(void) {
+    TEST("events: udp://localhost reaches the same socket as 127.0.0.1");
+
+    NowResult res;
+    memset(&res, 0, sizeof(res));
+
+    /* literal on the listening side, name on the sending side */
+    NowEventSource *src = now_event_source_open("udp://127.0.0.1:19483", 0, &res);
+    if (!src) { FAIL(res.message); return; }
+
+    NowEventSink *sink = now_event_sink_open("udp://localhost:19483", NULL);
+    if (!sink) { now_event_source_close(src); FAIL("sink open on localhost"); return; }
+
+    NowEvent in, out;
+    ev_seed(&in, NOW_EVENT_RUN_STARTED);
+    now_event_sink_send(sink, &in);
+
+    int rc = now_event_source_recv(src, &out, 3000);
+    now_event_sink_close(sink);
+    now_event_source_close(src);
+
+    if (rc != 1) { FAIL("nothing arrived from udp://localhost"); return; }
+    ASSERT_EQ((int)out.event, (int)NOW_EVENT_RUN_STARTED);
+
+    /* and the name works on the listening side too, which reaches the
+     * bind path rather than the send path */
+    memset(&res, 0, sizeof(res));
+    NowEventSource *src2 = now_event_source_open("udp://localhost:19484", 0, &res);
+    if (!src2) { FAIL(res.message); return; }
+    NowEventSink *sink2 = now_event_sink_open("udp://127.0.0.1:19484", NULL);
+    if (!sink2) { now_event_source_close(src2); FAIL("sink open"); return; }
+
+    now_event_sink_send(sink2, &in);
+    rc = now_event_source_recv(src2, &out, 3000);
+    now_event_sink_close(sink2);
+    now_event_source_close(src2);
+
+    if (rc != 1) { FAIL("nothing arrived at a listener bound by name"); return; }
+    PASS();
+}
+
 static void test_events_over_a_real_socket(void) {
     TEST("events: a datagram crosses loopback and decodes");
 
@@ -9091,6 +9181,8 @@ int main(void) {
     test_events_decode_reads_spaced_json();
     test_events_version_and_unknown_fields();
     test_events_over_a_real_socket();
+    test_events_recv_waits_out_its_timeout();
+    test_events_localhost_reaches_the_loopback_socket();
     test_events_listener_refuses_untrusted_addresses();
     test_events_names_round_trip();
     test_events_blob_carries_what_no_string_can();
