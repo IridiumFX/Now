@@ -8052,6 +8052,29 @@ fast, no build required, just graph interrogation.
 > the shape that produces stale-object bugs, and a long-running daemon
 > caching a build graph is where it would bite hardest.
 >
+> ### It WALKS; it does not hold a list
+>
+> `now` finds sources by walking `sources.dir`, not from an enumerated
+> list, and the watcher works the same way: it re-walks the roots each
+> poll and diffs the listing. So a file being **created** or **deleted**
+> registers, not only a file being edited — which a watcher holding a
+> fixed file list could not do, because the new file was not in the list
+> when the list was made.
+>
+> What it walks *for* was the bug. The extension set was hardcoded in
+> the watcher, separate from the language registry the build asks, and
+> the two had drifted: no `.go`, no `.jl`, no `.hh`/`.hxx`/`.i`/`.inc`.
+> **`now watch` on a Go or Julia project therefore watched nothing and
+> reported no changes, indefinitely**, and a C++ project using `.hh`
+> headers had a watcher that ignored header edits the build would have
+> acted on. Fixed in rc10 by asking `now_lang_all_exts()` — the registry
+> is the single statement of what a source file is.
+>
+> **This is the rule to carry into `stay`**: watch the ROOTS the build
+> walks, and ask the registry what counts as an input. A trigger table
+> that restates either is a second source of truth, and the one that
+> already existed had been wrong for at least two languages.
+>
 > ### What it buys over re-running the whole chain
 >
 > Measured on a project with no dependencies:

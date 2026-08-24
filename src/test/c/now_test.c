@@ -6198,6 +6198,159 @@ static void test_convert_refuses_json5(void) {
     PASS();
 }
 
+
+/* ---- watch: what counts as an input ----
+ *
+ * `now watch` re-walks the source roots each poll and diffs the listing,
+ * so it catches a file being created or deleted and not just edited.
+ * That is the right model — `now` finds sources by walking, so a
+ * watcher holding a fixed file list would miss the file you just added.
+ *
+ * What it got wrong was WHICH extensions to walk for. That was a
+ * hardcoded list, separate from the language registry the build uses,
+ * and it had drifted: no `.go`, no `.jl`, no `.hh`/`.hxx`. A Go project
+ * under `now watch` therefore watched nothing at all and reported no
+ * changes, forever.
+ *
+ * These tests assert the two lists cannot drift again, by asserting
+ * there is only one.
+ */
+
+static int wt_has_ext(const char **exts, const char *e) {
+    if (!exts) return 0;
+    for (size_t i = 0; exts[i]; i++)
+        if (strcmp(exts[i], e) == 0) return 1;
+    return 0;
+}
+
+/* The registry is the single statement of what a source file is. If a
+ * language claims an extension, a watcher that walks for that language
+ * has to walk for it — the alternative is a build that reacts to a file
+ * the watcher cannot see. */
+static void test_watch_asks_the_registry_for_extensions(void) {
+    TEST("watch: every language's extensions come from the registry");
+    now_lang_registry_init();
+
+    {
+        const char *go[]   = { "go" };
+        const char *jl[]   = { "julia" };
+        const char *cpp[]  = { "c++" };
+        const char **e;
+
+        /* The two that were missing entirely — a watcher without these
+         * sits idle while the project changes under it. */
+        e = now_lang_all_exts(go, 1);
+        if (!wt_has_ext(e, ".go")) { free((void *)e); FAIL("go has no .go"); return; }
+        free((void *)e);
+
+        e = now_lang_all_exts(jl, 1);
+        if (!wt_has_ext(e, ".jl")) { free((void *)e); FAIL("julia has no .jl"); return; }
+        free((void *)e);
+
+        /* And the quiet one: a C++ project using .hh headers. The build
+         * reacts to those; the old watcher did not. */
+        e = now_lang_all_exts(cpp, 1);
+        if (!wt_has_ext(e, ".hh") || !wt_has_ext(e, ".hxx")) {
+            free((void *)e); FAIL("c++ is missing .hh/.hxx"); return;
+        }
+        free((void *)e);
+    }
+    PASS();
+}
+
+/* The snapshot must actually pick a language's files up. This is the
+ * end of the chain the previous test only checks the start of: a
+ * registry that knows about .go is worth nothing if the snapshot still
+ * walks for a hardcoded set. */
+static void test_watch_snapshot_sees_a_go_source(void) {
+    NowResult r;
+    NowProject *p;
+    NowWatchSnapshot snap;
+    int found = 0;
+
+    TEST("watch: a .go source is in the snapshot");
+
+    now_mkdir_p("target/wt/src/main/go");
+    {
+        FILE *f = fopen("target/wt/now.pasta", "wb");
+        if (!f) { FAIL("no scratch"); return; }
+        fputs("{ group: \"org.t\", artifact: \"g\", version: \"1.0.0\","
+              "  langs: [\"go\"],"
+              "  sources: { dir: \"src/main/go\" } }", f);
+        fclose(f);
+        f = fopen("target/wt/src/main/go/main.go", "wb");
+        if (!f) { FAIL("no scratch"); return; }
+        fputs("package main\nfunc main() {}\n", f);
+        fclose(f);
+    }
+
+    memset(&r, 0, sizeof(r));
+    p = now_project_load("target/wt/now.pasta", &r);
+    ASSERT_NOT_NULL(p);
+
+    memset(&snap, 0, sizeof(snap));
+    if (now_watch_snapshot(p, "target/wt", &snap) != 0) {
+        now_project_free(p);
+        FAIL("snapshot failed");
+        return;
+    }
+    for (size_t i = 0; i < snap.count; i++)
+        if (strstr(snap.entries[i].path, "main.go")) { found = 1; break; }
+
+    now_watch_snapshot_free(&snap);
+    now_project_free(p);
+
+    if (!found) { FAIL("a .go source was not watched"); return; }
+    PASS();
+}
+
+/* Walking rather than listing is what makes a NEW file visible. Assert
+ * it, because the difference only shows up on creation and that is
+ * exactly the case a file-list watcher gets wrong. */
+static void test_watch_notices_a_file_that_did_not_exist(void) {
+    NowResult r;
+    NowProject *p;
+    NowWatchSnapshot before, after;
+
+    TEST("watch: a newly created source changes the snapshot");
+
+    now_mkdir_p("target/wt2/src/main/c");
+    {
+        FILE *f = fopen("target/wt2/now.pasta", "wb");
+        if (!f) { FAIL("no scratch"); return; }
+        fputs("{ group: \"org.t\", artifact: \"w\", version: \"1.0.0\","
+              "  langs: [\"c\"], sources: { dir: \"src/main/c\" } }", f);
+        fclose(f);
+        f = fopen("target/wt2/src/main/c/a.c", "wb");
+        if (!f) { FAIL("no scratch"); return; }
+        fputs("int a(void){return 1;}\n", f);
+        fclose(f);
+    }
+    memset(&r, 0, sizeof(r));
+    p = now_project_load("target/wt2/now.pasta", &r);
+    ASSERT_NOT_NULL(p);
+
+    memset(&before, 0, sizeof(before));
+    now_watch_snapshot(p, "target/wt2", &before);
+
+    {
+        FILE *f = fopen("target/wt2/src/main/c/b.c", "wb");
+        if (f) { fputs("int b(void){return 2;}\n", f); fclose(f); }
+    }
+    memset(&after, 0, sizeof(after));
+    now_watch_snapshot(p, "target/wt2", &after);
+
+    {
+        int changed = now_watch_diff(&before, &after);
+        now_watch_snapshot_free(&before);
+        now_watch_snapshot_free(&after);
+        now_project_free(p);
+        remove("target/wt2/src/main/c/b.c");
+        if (!(changed & 1)) { FAIL("a new file did not register"); return; }
+    }
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -9914,6 +10067,9 @@ int main(void) {
     test_tool_list_and_run();
     test_convert_round_trips_through_json();
     test_convert_refuses_json5();
+    test_watch_asks_the_registry_for_extensions();
+    test_watch_snapshot_sees_a_go_source();
+    test_watch_notices_a_file_that_did_not_exist();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();

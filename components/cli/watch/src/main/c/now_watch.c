@@ -105,12 +105,23 @@ NOW_API int now_watch_snapshot(const NowProject *project,
     if (!project || !basedir || !snap) return -1;
     memset(snap, 0, sizeof(*snap));
 
-    /* Source + header extensions to watch */
-    static const char *all_exts[] = {
-        ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
-        ".cppm", ".ixx", ".ccm", ".java", ".rs",
-        ".s", ".S", ".asm", NULL
-    };
+    /* Which extensions count as an input — ASKED, not restated.
+     *
+     * This was a hardcoded list here, and it had drifted from the
+     * language registry that decides what the build actually compiles:
+     * it was missing `.go` and `.jl` entirely, so `now watch` on a Go or
+     * Julia project watched nothing and sat there reporting no changes
+     * forever. It also missed `.hh`, `.hxx`, `.i` and `.inc`, so a C++
+     * project using `.hh` headers got a watcher that silently ignored
+     * header edits — the worst version, because the build it eventually
+     * ran WOULD have picked the change up.
+     *
+     * The registry already answers this question for the build. Two
+     * statements of what a source file is could only ever agree by
+     * accident, and this one had stopped. */
+    const char **all_exts = now_lang_all_exts(
+        (const char *const *)project->langs.items, project->langs.count);
+    if (!all_exts) return -1;
 
     /* Watch source dir */
     if (project->sources.dir)
@@ -123,6 +134,8 @@ NOW_API int now_watch_snapshot(const NowProject *project,
     /* Watch private headers */
     if (project->sources.private_headers)
         snap_dir(snap, basedir, project->sources.private_headers, all_exts);
+
+    free((void *)all_exts);
 
     /* Sort for stable diffing */
     if (snap->count > 1)
