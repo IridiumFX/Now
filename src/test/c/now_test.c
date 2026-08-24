@@ -25,6 +25,8 @@
 #include "now_workspace.h"
 #include "now_schema.h"
 #include "now_vacate.h"
+#include "now_convert.h"
+#include "now_tell.h"
 #include "now_plugin.h"
 #include "now_plugin_registry.h"
 #include "now_ci.h"
@@ -5950,6 +5952,252 @@ static void test_vacate_force_takes_the_referenced_too(void) {
     PASS();
 }
 
+
+/* ---- tell / tool: / convert ----
+ *
+ * The spec had these as one `tool:` family of nine. They are two
+ * features that shared a prefix — asking `now` something, and running
+ * something you declared — plus a format converter that was filed
+ * beside them for no reason. Splitting them is the change under test as
+ * much as the code is, so the tests are organised the same way.
+ */
+
+static void tc_write(const char *path, const char *body) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(body, 1, strlen(body), f);
+    fclose(f);
+}
+
+static NowProject *tc_project(const char *body) {
+    NowResult r;
+    now_mkdir_p("target/tc/src/main/c");
+    tc_write("target/tc/now.pasta", body);
+    /* A real source file, because `tell source-files` asks the build
+     * where the sources are and a project with none is an error there —
+     * correctly, since `now_build_init` cannot tell "this project has no
+     * sources" from "this directory would not read". */
+    tc_write("target/tc/src/main/c/one.c", "int one(void) { return 1; }\n");
+    memset(&r, 0, sizeof(r));
+    return now_project_load("target/tc/now.pasta", &r);
+}
+
+/* Capture what `tell` writes, so the assertion is on the bytes a script
+ * would receive rather than on a return code. */
+static int tc_tell(char *out, size_t cap, const NowProject *p,
+                   const char *what, const char *const *argv, int argc,
+                   const char *fmt) {
+    FILE *f = fopen("target/tc/out.txt", "w+b");
+    int rc;
+    NowResult r;
+    size_t n;
+    if (!f) return -1;
+    memset(&r, 0, sizeof(r));
+    rc = now_tell(f, p, "target/tc", what, argv, argc, fmt, &r);
+    fflush(f);
+    fseek(f, 0, SEEK_SET);
+    n = fread(out, 1, cap - 1, f);
+    out[n] = '\0';
+    fclose(f);
+    return rc;
+}
+
+static const char *TC_POM =
+    "{ group: \"org.t\", artifact: \"demo\", version: \"1.0.0\","
+    "  langs: [\"c\"],"
+    "  compile: { flags: [\"-O2\", \"-Wall\"] },"
+    "  tools: { hello: { description: \"hi\", run: \"echo hi\" } } }";
+
+static void test_tell_reads_the_effective_value(void) {
+    char buf[512];
+    NowProject *p = tc_project(TC_POM);
+    TEST("tell: a field the descriptor never wrote still answers");
+    ASSERT_NOT_NULL(p);
+
+    /* sources.dir was not written. The loader defaults it, and the
+     * useful answer is the effective one — a caller asking where the
+     * sources are wants src/main/c, not an empty line. */
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "sources.dir", NULL, 0, "text"), 0);
+    ASSERT_STR(buf, "src/main/c\n");
+
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "artifact", NULL, 0, "text"), 0);
+    ASSERT_STR(buf, "demo\n");
+
+    now_project_free(p);
+    PASS();
+}
+
+/* A scalar prints BARE in text mode. `$(now tell sources.dir)` is the
+ * overwhelmingly common use and a quoted string there is a bug. */
+static void test_tell_text_is_unquoted_and_json_is_not(void) {
+    char buf[512];
+    NowProject *p = tc_project(TC_POM);
+    TEST("tell: text is bare, json is quoted");
+    ASSERT_NOT_NULL(p);
+
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "artifact", NULL, 0, "text"), 0);
+    ASSERT_STR(buf, "demo\n");
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "artifact", NULL, 0, "json"), 0);
+    ASSERT_STR(buf, "\"demo\"\n");
+
+    now_project_free(p);
+    PASS();
+}
+
+/* THE NAMING RULE, which is the whole reason there can be no ambiguity:
+ * hyphenated is a computed query, anything else is a descriptor field.
+ * The spec's `tool:query sources` / `tool:sources` pair could not tell
+ * those apart; this cannot fail to. */
+static void test_tell_hyphen_separates_the_two_namespaces(void) {
+    char buf[4096];
+    NowProject *p = tc_project(TC_POM);
+    TEST("tell: hyphen means computed, dot means descriptor");
+    ASSERT_NOT_NULL(p);
+
+    /* A descriptor field. */
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "compile.flags", NULL, 0, "text"), 0);
+    if (!strstr(buf, "-O2")) { now_project_free(p); FAIL("compile.flags empty"); return; }
+
+    /* A computed query with a name that is NOT a descriptor field, and
+     * it must actually answer — an empty success would prove only that
+     * the name routed somewhere. */
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "source-files", NULL, 0, "text"), 0);
+    if (!strstr(buf, "one.c")) {
+        now_project_free(p); FAIL("source-files listed nothing"); return;
+    }
+
+    /* And neither namespace answers for the other: a hyphenated name
+     * that is not a query fails as a query, not as a field. */
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "no-such-query", NULL, 0, "text") != 0, 1);
+    ASSERT_EQ(tc_tell(buf, sizeof(buf), p, "sources.nope", NULL, 0, "text") != 0, 1);
+
+    now_project_free(p);
+    PASS();
+}
+
+/* An unknown field must be an ERROR. Printing nothing is how a script
+ * ends up branching on "" and believing the field was unset. */
+static void test_tell_a_typo_is_an_error_not_an_empty_answer(void) {
+    char buf[512];
+    NowProject *p = tc_project(TC_POM);
+    TEST("tell: an unknown field fails rather than printing nothing");
+    ASSERT_NOT_NULL(p);
+    if (tc_tell(buf, sizeof(buf), p, "sources.dirr", NULL, 0, "text") == 0) {
+        now_project_free(p);
+        FAIL("a typo was answered successfully");
+        return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
+static void test_tool_list_and_run(void) {
+    NowProject *p = tc_project(TC_POM);
+    NowResult r;
+    TEST("tool: a declared tool is listed and runs");
+    ASSERT_NOT_NULL(p);
+    memset(&r, 0, sizeof(r));
+
+    {
+        FILE *f = fopen("target/tc/tools.txt", "w+b");
+        char buf[512];
+        size_t n;
+        if (!f) { now_project_free(p); FAIL("no scratch file"); return; }
+        now_tool_list(f, p, "target/tc", &r);
+        fflush(f); fseek(f, 0, SEEK_SET);
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        if (!strstr(buf, "hello")) {
+            now_project_free(p); FAIL("declared tool not listed"); return;
+        }
+    }
+
+    /* An unknown tool is an error, not a silent success — the shape
+     * that would let `now tool:run lint` in CI pass by doing nothing. */
+    if (now_tool_run(p, "target/tc", "nosuchtool", 0, &r) >= 0) {
+        now_project_free(p);
+        FAIL("an undeclared tool ran successfully");
+        return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
+/* convert: the round trip has to preserve the data, and the one thing
+ * it cannot preserve has to be known. */
+static void test_convert_round_trips_through_json(void) {
+    NowResult r;
+    NowProject *a, *b;
+    TEST("convert: pasta -> json -> pasta keeps the descriptor");
+
+    now_mkdir_p("target/tc");
+    tc_write("target/tc/rt.pasta",
+             "{ group: \"org.t\", artifact: \"rt\", version: \"2.3.4\","
+             "  langs: [\"c\"], compile: { flags: [\"-O2\"] } }");
+
+    memset(&r, 0, sizeof(r));
+    {
+        FILE *j = fopen("target/tc/rt.json", "wb");
+        int rc;
+        if (!j) { FAIL("no scratch file"); return; }
+        rc = now_convert("target/tc/rt.pasta", "json", 0, j, &r);
+        fclose(j);
+        if (rc != 0) { FAIL("convert to json failed"); return; }
+    }
+
+    a = now_project_load("target/tc/rt.pasta", &r);
+    b = now_project_load("target/tc/rt.json", &r);
+    if (!a || !b) { FAIL("one side did not load"); return; }
+
+    /* Compared field by field against the ORIGINAL rather than against
+     * a literal: the assertion is that the round trip preserved the
+     * descriptor, and hard-coding the expected values would let both
+     * sides drift together without the test noticing.
+     *
+     * ASSERT_STR takes a literal — it pastes its second argument into
+     * the failure message — so these are written out. */
+    if (strcmp(b->group, a->group) != 0 ||
+        strcmp(b->artifact, a->artifact) != 0 ||
+        strcmp(b->version, a->version) != 0) {
+        now_project_free(a); now_project_free(b);
+        FAIL("identity did not survive the round trip");
+        return;
+    }
+    if (b->compile.flags.count != a->compile.flags.count ||
+        (a->compile.flags.count &&
+         strcmp(b->compile.flags.items[0], a->compile.flags.items[0]) != 0)) {
+        now_project_free(a); now_project_free(b);
+        FAIL("compile.flags did not survive the round trip");
+        return;
+    }
+
+    now_project_free(a);
+    now_project_free(b);
+    PASS();
+}
+
+/* json5 is refused rather than approximated: JSON5 permits trailing
+ * commas, Pasta does not, so emitting it would produce a file we could
+ * not read back. A one-way conversion is worse than a refusal. */
+static void test_convert_refuses_json5(void) {
+    NowResult r;
+    TEST("convert: json5 is refused, with the reason");
+    memset(&r, 0, sizeof(r));
+    now_mkdir_p("target/tc");
+    tc_write("target/tc/j5.pasta",
+             "{ group: \"org.t\", artifact: \"j\", version: \"1.0.0\" }");
+    if (now_convert("target/tc/j5.pasta", "json5", 0, NULL, &r) == 0) {
+        FAIL("json5 was accepted");
+        return;
+    }
+    if (!strstr(r.message, "trailing")) {
+        FAIL("refused without saying why");
+        return;
+    }
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -9657,6 +9905,15 @@ int main(void) {
      * returns without restoring, and a leaked HOME would redirect
      * every later test that reads ~/.now. */
     vac_restore_home();
+
+    printf("\n  tell / tool: / convert:\n");
+    test_tell_reads_the_effective_value();
+    test_tell_text_is_unquoted_and_json_is_not();
+    test_tell_hyphen_separates_the_two_namespaces();
+    test_tell_a_typo_is_an_error_not_an_empty_answer();
+    test_tool_list_and_run();
+    test_convert_round_trips_through_json();
+    test_convert_refuses_json5();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();

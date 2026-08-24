@@ -40,6 +40,8 @@ add_library(now
     src/main/c/now_arch.c
     src/main/c/now_schema.c
     src/main/c/now_vacate.c
+    src/main/c/now_tell.c
+    src/main/c/now_convert.c
     src/main/c/now_module.c
     src/main/c/now_cache.c
     # now-enterprise module

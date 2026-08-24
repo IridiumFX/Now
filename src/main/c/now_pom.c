@@ -484,8 +484,12 @@ static const char *const k_known_keys[] = {
      * NowProject, so they have no struct field to grep for — but they
      * are live config and must not be reported as unknown:
      *   reproducible -> now_repro.c   trust -> now_trust.c
-     *   advisories   -> now_advisory.c */
-    "reproducible", "trust", "advisories",
+     *   advisories   -> now_advisory.c
+     *   tools        -> now_tell.c (`tool:list` / `tool:run`); nothing in
+     *                   the build reads it, which is exactly why it must
+     *                   be listed here — it was reported as a TYPO until
+     *                   2026-08-24 */
+    "reproducible", "trust", "advisories", "tools",
     "inherit_defaults", "inherit", "workspace_mode", NULL
 };
 

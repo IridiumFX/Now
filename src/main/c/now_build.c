@@ -5416,3 +5416,152 @@ NOW_API void now_build_set_default_target(const char *triple,
         }
     }
 }
+
+/* ---- introspection, for `now tell` (§19) ----
+ *
+ * Deliberately built on the same build_compile_job* the compile-db
+ * writer calls. `now tell compile-cmd F` and the entry for F in
+ * compile_commands.json are the same bytes from the same builder, and
+ * the only way to keep them that way is to have one builder.
+ */
+
+NOW_API int now_query_sources(const NowProject *project, const char *basedir,
+                              NowFileList *out, NowResult *result) {
+    NowBuildCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (now_build_init(&ctx, project, basedir, result) != 0) return -1;
+
+    now_filelist_init(out);
+    for (size_t i = 0; i < ctx.sources.count; i++)
+        now_filelist_push(out, ctx.sources.paths[i]);
+
+    now_build_free(&ctx);
+    return (int)out->count;
+}
+
+NOW_API void now_query_argv_free(char **argv) {
+    if (!argv) return;
+    for (size_t i = 0; argv[i]; i++) free(argv[i]);
+    free(argv);
+}
+
+NOW_API char **now_query_compile_argv(const NowProject *project,
+                                       const char *basedir,
+                                       const char *src_rel,
+                                       int flags_only,
+                                       NowResult *result) {
+    NowBuildCtx ctx;
+    char **out = NULL;
+    const char *match = NULL;
+
+    memset(&ctx, 0, sizeof(ctx));
+    if (now_build_init(&ctx, project, basedir, result) != 0) return NULL;
+
+    /* Accept the path as the build spells it, or as the user typed it
+     * with either separator — a caller pasting a path out of an editor
+     * should not have to know which slash we store. */
+    for (size_t i = 0; i < ctx.sources.count; i++) {
+        const char *s = ctx.sources.paths[i];
+        size_t a = 0, b = 0;
+        int same = 1;
+        while (s[a] && src_rel[b]) {
+            char ca = s[a] == '\\' ? '/' : s[a];
+            char cb = src_rel[b] == '\\' ? '/' : src_rel[b];
+            if (ca != cb) { same = 0; break; }
+            a++; b++;
+        }
+        if (same && !s[a] && !src_rel[b]) { match = s; break; }
+    }
+    if (!match) {
+        if (result) {
+            result->code = NOW_ERR_NOT_FOUND;
+            snprintf(result->message, sizeof(result->message),
+                     "'%s' is not in this project's source set", src_rel);
+        }
+        now_build_free(&ctx);
+        return NULL;
+    }
+
+    {
+        const NowLangDef *lang = NULL;
+        const NowLangType *type = now_lang_classify(
+            match, (const char *const *)project->langs.items,
+            project->langs.count, &lang);
+        NowCompileJob job;
+        int jrc;
+
+        if (!type || type->role != NOW_ROLE_SOURCE) {
+            if (result) {
+                result->code = NOW_ERR_NOT_FOUND;
+                snprintf(result->message, sizeof(result->message),
+                         "'%s' is not a compiled source", src_rel);
+            }
+            now_build_free(&ctx);
+            return NULL;
+        }
+
+        memset(&job, 0, sizeof(job));
+        jrc = ctx.toolchain.is_msvc
+                  ? build_compile_job_msvc(&ctx, match, type, lang, &job)
+                  : build_compile_job(&ctx, match, type, lang, &job);
+        if (jrc != 0) {
+            if (result) {
+                result->code = NOW_ERR_TOOL;
+                snprintf(result->message, sizeof(result->message),
+                         "could not build a compile command for '%s'", src_rel);
+            }
+            now_build_free(&ctx);
+            return NULL;
+        }
+
+        {
+            int n = 0, k;
+            /* flags_only drops argv[0] (the tool) and any argument that
+             * is the source file or the -o output — what is left is what
+             * a caller can splice into their own invocation. */
+            out = (char **)calloc((size_t)job.argc + 1, sizeof(char *));
+            if (out) {
+                for (k = 0; k < job.argc; k++) {
+                    const char *a = job.argv[k];
+                    if (flags_only) {
+                        if (k == 0) continue;
+                        if (strcmp(a, match) == 0) continue;
+                        if (job.obj_path && strcmp(a, job.obj_path) == 0) continue;
+                        if (strcmp(a, "-o") == 0 || strcmp(a, "/Fo") == 0) continue;
+                    }
+                    out[n] = strdup(a);
+                    if (!out[n]) break;
+                    n++;
+                }
+                out[n] = NULL;
+            }
+        }
+        compile_job_free(&job);
+    }
+
+    now_build_free(&ctx);
+    return out;
+}
+
+NOW_API int now_query_includes(const NowProject *project, const char *basedir,
+                               NowStrArray *out, NowResult *result) {
+    NowBuildCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (now_build_init(&ctx, project, basedir, result) != 0) return -1;
+
+    now_strarray_init(out);
+    /* The project's own, then whatever procure resolved for its deps —
+     * the order the compiler is given them, because a caller reproducing
+     * a build needs the order and not just the set. */
+    if (project->sources.headers)
+        now_strarray_push(out, project->sources.headers);
+    if (project->sources.private_headers)
+        now_strarray_push(out, project->sources.private_headers);
+    for (size_t i = 0; i < project->compile.includes.count; i++)
+        now_strarray_push(out, project->compile.includes.items[i]);
+    for (size_t i = 0; i < ctx.dep_includes.count; i++)
+        now_strarray_push(out, ctx.dep_includes.paths[i]);
+
+    now_build_free(&ctx);
+    return (int)out->count;
+}

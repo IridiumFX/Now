@@ -621,6 +621,9 @@ clean → vacate
 | Phase | Description | Status |
 |-------|-------------|--------|
 | `clean` | Delete `target/`. Forces full rebuild. | Implemented. |
+| `tell` | Answer a question about the project without building it. Descriptor fields are dotted (`tell sources.dir`), computed answers are hyphenated (`tell source-files`, `tell compile-cmd FILE`). |
+| `tool:list` · `tool:run` | List and run the project-local scripts declared in a `tools:` block. |
+| `convert` | Convert a descriptor between Pasta and JSON. |
 | `vacate` | Remove installed dep artifacts from `~/.now/repo/`. | Implemented (rc10). |
 
 `vacate` is never run automatically — it must be invoked explicitly.
@@ -3924,12 +3927,55 @@ tools: {
 }
 ```
 
+> **Implemented in rc10, and the family was SPLIT.** The nine `tool:*`
+> commands in earlier revisions were two unrelated features sharing a
+> prefix: asking `now` something, and running something you declared.
+> They are now two commands.
+>
+> **`now tell` — asking.** Replaces `tool:query`, `tool:sources`,
+> `tool:includes`, `tool:compile-cmd`, `tool:compile-flags` and
+> `tool:dep-path`. It is a verb, like `build` and `test`, and it changes
+> nothing.
+>
+> ```sh
+> now tell sources.dir            ; a descriptor field, effective value
+> now tell deps
+> now tell compile.flags
+> now tell source-files           ; every file the build would compile
+> now tell include-paths
+> now tell compile-cmd src/main/c/parser.c
+> now tell compile-flags src/main/c/parser.c
+> now tell dep-path org.zlib:zlib:1.3.0 h
+> now tell langs --output json
+> ```
+>
+> **Dotted names are descriptor fields; hyphenated names are computed
+> answers.** Descriptor keys are `[a-z_]+` throughout the format, so a
+> hyphen can never be one and the two namespaces cannot collide — which
+> the earlier `tool:query sources` / `tool:sources` pair could not
+> promise. A scalar prints bare in text mode, because `$(now tell
+> sources.dir)` is the common use; `--output json|pasta` quotes.
+>
+> **An unknown field is an error, not an empty answer.** Printing
+> nothing for a typo is how a script ends up branching on `""` and
+> believing the field was unset.
+>
+> `now tell compile-cmd` and `compile_commands.json` are produced by the
+> same builder, so they cannot disagree.
+>
+> **`now tool:*` — running.** Keeps the prefix and now means exactly one
+> thing: tooling this project declares.
+
 ```sh
 now tool:run fmt
 now tool:run lint
 now tool:run genkeys
 now tool:list          ; show all declared tools with descriptions
 ```
+
+The tool's own exit code is `now`'s exit code. An undeclared name is an
+error rather than a silent success — `now tool:run lint` in CI must not
+pass by doing nothing.
 
 ### Tool Variable Expansion
 
@@ -8418,6 +8464,25 @@ regardless of which file is present.
 
 ## 23.4 `now convert` — Format Migration
 
+> **Implemented in rc10, for `--to pasta` and `--to json`.**
+>
+> The reading half needed nothing new: **Pasta already parses strict
+> JSON.** Quoted keys, `[...]`, `{...}`, comma separators and
+> double-quoted strings are common to both grammars, so a `.json`
+> descriptor loads through the ordinary parser. Only a JSON *writer* was
+> added.
+>
+> **`--to json5` is refused, deliberately.** JSON5 permits trailing
+> commas and Pasta does not (§23.1), so emitting JSON5 would mean
+> emitting a dialect this tool cannot read back. A conversion that only
+> works in one direction is worse than a refusal, and the refusal says
+> so.
+>
+> **Two things a conversion loses, both reported by `--in-place`:**
+> comments, which neither parse tree carries; and the radix of numeric
+> literals, because JSON has decimal and nothing else — a Pasta `0xFF`
+> becomes `255` and converting back gives `255`.
+
 ```sh
 ; Convert between formats — output to stdout by default
 now convert now.pasta --to json         ; Pasta → strict JSON
@@ -12722,7 +12787,7 @@ frame. `now` does not suppress or reformat compiler messages.
 
 **Phase**: publish  
 **Message**: `No signing key found for group '<group>'`  
-**Remediation**: Run `now trust:key --generate` or `now trust:key --import`.
+**Remediation**: Run `now keygen` to create a signing keypair, then `now keys:register` to register its public half with the registry. (Earlier revisions named `now trust:key --generate` / `--import`; no such command has ever existed. `trust:add` adds a key you already trust to the local trust store, which is a different operation.)
 
 ---
 

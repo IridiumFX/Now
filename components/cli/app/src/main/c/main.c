@@ -15,6 +15,8 @@
 #include "now_pom.h"
 #include "now_schema.h"
 #include "now_vacate.h"
+#include "now_tell.h"
+#include "now_convert.h"
 #include "now.h"
 #include "now_build.h"
 #include "now_fs.h"
@@ -179,6 +181,14 @@ static void usage(void) {
         "  publish    Upload package to remote registry\n"
         "  yank       Yank a published version: yank <g:a:v> --repo URL\n"
         "  compile-db   Generate compile_commands.json for IDE/LSP\n"
+        "  tell       Answer a question about the project:\n"
+        "             tell sources.dir | deps | compile.flags\n"
+        "             tell source-files | include-paths | compile-cmd FILE\n"
+        "             tell dep-path g:a:v [h|lib]   [--output text|json|pasta]\n"
+        "  tool:list  List tools declared in the `tools:` block\n"
+        "  tool:run   Run one: tool:run <name>\n"
+        "  convert    Descriptor between formats:\n"
+        "             convert [file] --to pasta|json [--in-place]\n"
         "  dep:updates  Check dependencies for newer versions\n"
         "  cache:clean  Remove all cached build objects\n"
         "  cache:stats  Show build cache statistics\n"
@@ -339,6 +349,104 @@ int main(int argc, char *argv[]) {
         || strcmp(phase, "help") == 0) {
         usage();
         return 0;
+    }
+
+    /* convert — descriptor format migration (§23.4). */
+    if (strcmp(phase, "convert") == 0) {
+        NowResult cres;
+        const char *file = NULL;
+        const char *to = NULL;
+        int in_place = 0, crc;
+
+        memset(&cres, 0, sizeof(cres));
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) to = argv[++i];
+            else if (strcmp(argv[i], "--in-place") == 0)      in_place = 1;
+            else if (argv[i][0] != '-')                       file = argv[i];
+        }
+        if (!to) {
+            fprintf(stderr,
+                    "usage: now convert [file] --to pasta|json [--in-place]\n");
+            return 1;
+        }
+        crc = now_convert(file, to, in_place, stdout, &cres);
+        if (crc != 0 && cres.message[0])
+            fprintf(stderr, "error: %s\n", cres.message);
+        return crc == 0 ? 0 : 1;
+    }
+
+    /* tell / tool:* — the two halves of the spec's `tool:` family.
+     *
+     * `tell` answers questions and changes nothing; `tool:` runs what
+     * the project declared. They were one prefix in the spec and are
+     * two unrelated features, so they are two commands. See
+     * now_tell.h. */
+    if (strcmp(phase, "tell") == 0 || strcmp(phase, "tool:list") == 0
+        || strcmp(phase, "tool:run") == 0) {
+        NowResult tres;
+        NowProject *tp;
+        const char *fmt = "text";
+        const char *rest[8];
+        int nrest = 0;
+        const char *what = NULL;
+        char cwd[PATH_MAX];
+        int trc;
+
+        memset(&tres, 0, sizeof(tres));
+        for (int i = 2; i < argc; i++) {
+            if ((strcmp(argv[i], "--output") == 0
+                 || strcmp(argv[i], "-o") == 0) && i + 1 < argc) {
+                fmt = argv[++i];
+            } else if (argv[i][0] != '-') {
+                if (!what) what = argv[i];
+                else if (nrest < (int)(sizeof(rest) / sizeof(rest[0])))
+                    rest[nrest++] = argv[i];
+            }
+        }
+
+        if (!getcwd_compat(cwd, sizeof(cwd))) {
+            fprintf(stderr, "error: cannot determine working directory\n");
+            return 1;
+        }
+        tp = now_project_load("now.pasta", &tres);
+        if (!tp) {
+            fprintf(stderr, "error: %s\n",
+                    tres.message[0] ? tres.message : "no now.pasta here");
+            return 1;
+        }
+
+        if (strcmp(phase, "tool:list") == 0) {
+            trc = now_tool_list(stdout, tp, cwd, &tres);
+        } else if (strcmp(phase, "tool:run") == 0) {
+            if (!what) {
+                fprintf(stderr, "error: tool:run needs a tool name\n");
+                now_project_free(tp);
+                return 1;
+            }
+            trc = now_tool_run(tp, cwd, what, verbose, &tres);
+            /* A tool's own exit code is the answer, not ours. */
+            now_project_free(tp);
+            if (trc < 0 && tres.message[0])
+                fprintf(stderr, "error: %s\n", tres.message);
+            return trc < 0 ? 1 : trc;
+        } else {
+            if (!what) {
+                fprintf(stderr,
+                        "usage: now tell <field|query> [args] [--output fmt]\n"
+                        "  fields are dotted:      sources.dir  compile.flags  deps\n"
+                        "  queries are hyphenated: source-files  includes\n"
+                        "                          compile-cmd FILE  compile-flags FILE\n"
+                        "                          dep-path g:a:v [h|lib]\n");
+                now_project_free(tp);
+                return 1;
+            }
+            trc = now_tell(stdout, tp, cwd, what, rest, nrest, fmt, &tres);
+        }
+
+        if (trc != 0 && tres.message[0])
+            fprintf(stderr, "error: %s\n", tres.message);
+        now_project_free(tp);
+        return trc == 0 ? 0 : 1;
     }
 
     /* vacate — the only thing that removes from ~/.now/repo (§2.2).
