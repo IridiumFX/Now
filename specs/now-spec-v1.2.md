@@ -621,17 +621,39 @@ clean → vacate
 | Phase | Description | Status |
 |-------|-------------|--------|
 | `clean` | Delete `target/`. Forces full rebuild. | Implemented. |
-| `vacate` | Remove installed dep artifacts from `~/.now/repo/` (and optionally cache). | **Not implemented.** |
+| `vacate` | Remove installed dep artifacts from `~/.now/repo/`. | Implemented (rc10). |
 
 `vacate` is never run automatically — it must be invoked explicitly.
 
-> **`vacate` does not exist (verified 2026-08-12).** `now vacate` exits 1
-> with "unknown phase", and neither the refcounting policy described in
-> §3.4 nor the `--gc` / `--force` / `--purge` / `--all` flags shown
-> elsewhere in this document are implemented — nothing anywhere removes
-> anything from `~/.now/repo`. **There is currently no supported way to
-> prune the local repo**; it grows without bound and must be pruned by
-> hand.
+> **Implemented in rc10**, with two deliberate departures from §3.4.
+>
+> **There is no `.refcount` file.** §3.4 specifies a stored count that
+> `procure` increments and `vacate` decrements. A stored count is a
+> cache of a derivable fact and every way it drifts ends badly: a
+> project deleted without vacating leaves a permanent +1 and its
+> artifacts become immortal; a repeated procure double-counts; a crash
+> between write and use leaves it torn. §3.4 concedes the point by
+> specifying `--gc` as *"rebuilds refcounts from scratch by scanning"*.
+> So references are derived by reading lock files, every time, and there
+> is nothing to drift. `procure` is unchanged, which means adding
+> deletion could not break installation.
+>
+> **An empty scan refuses.** If no `now.lock.pasta` is found, "nothing
+> references this" and "I looked nowhere" produce identical evidence and
+> call for opposite actions. `vacate` therefore removes nothing and says
+> which roots it searched. Pass `--scan <dir>` to point it at your
+> projects, or `--force` to remove regardless.
+>
+> ```
+> now vacate                      ; this project's deps, if nothing else wants them
+> now vacate --gc                 ; every artifact no lock file references
+> now vacate --dry-run            ; print what would go, remove nothing
+> now vacate --scan DIR           ; where to look for lock files (repeatable)
+> now vacate --force              ; ignore references; still confined to the repo
+> ```
+>
+> Removal is confined to `~/.now/repo` by a prefix check on every path,
+> made in the function that deletes rather than promised by its caller.
 >
 > `cache:clean` is not a substitute: it clears the compiled-object cache
 > under `~/.now/cache`, which is a different store. Nor is `yank`, which
@@ -697,7 +719,7 @@ which nothing else can satisfy, was documented in detail.
 | `procure` | Resolve and install dependencies. |
 | `generate` | Run plugin generate hooks. |
 | `package` · `publish` | Assemble an archive; upload it. Signing happens inside `package`. |
-| `yank` † | Mark a published version yanked in a registry. Not to be confused with `vacate` (§2.2), which is unimplemented. |
+| `yank` † | Mark a published version yanked in a registry. Not to be confused with `vacate` (§2.2), which prunes the *local* repo. |
 | `install` | Install the built artifact to the local repo. |
 | `ci` | Run the lifecycle with CI-shaped output (`--output json\|pasta`). |
 | `init` · `sketch` · `fmt` | Scaffold a project; scaffold a snippet; format a descriptor. |
@@ -717,6 +739,7 @@ which nothing else can satisfy, was documented in detail.
 | `plugin:list` † · `plugin:info` † · `plugin:search` † · `plugin:install` † | Plugin registry operations. |
 | `export:cmake` † · `export:make` † · `export:meson` † · `export:bazel` † · `export:maven` † | Emit a build file for another system. |
 | `import:cmake` † · `import:maven` † | Derive a `now.pasta` from another system's build file. |
+| `vacate` | Remove unreferenced dep artifacts from `~/.now/repo`. `--gc`, `--dry-run`, `--scan`, `--force`. |
 | `schema:check` | Validate a descriptor without building it. Exit 1 on error, 2 if not found. |
 | `reproducible:check` † | Build twice and compare outputs. |
 | `version` · `help` | — |
@@ -1869,10 +1892,11 @@ vacate policy:
   machine references it.
 ```
 
-`now` maintains a reference count file at
-`~/.now/repo/{group-path}/{artifact}/{version}/.refcount`. Each
-`now procure` increments it; each `now vacate` decrements it. When the
-count reaches zero, the files are removed.
+**Not as implemented.** rc10 keeps no `.refcount` file and `procure`
+writes nothing extra. References are derived on demand by reading every
+`now.lock.pasta` under the scanned roots, so the count cannot drift out
+of step with reality — see the note in §2.2 for why a stored counter was
+rejected.
 
 ```sh
 now vacate --force    ; ignore refcount, remove regardless

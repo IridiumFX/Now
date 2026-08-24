@@ -14,6 +14,7 @@
 
 #include "now_pom.h"
 #include "now_schema.h"
+#include "now_vacate.h"
 #include "now.h"
 #include "now_build.h"
 #include "now_fs.h"
@@ -213,6 +214,8 @@ static void usage(void) {
         "  watch      Watch sources and rebuild on changes (Ctrl+C to stop)\n"
         "  ci         Build, test, report (CI mode with structured output)\n"
         "  clean      Delete target/ directory\n"
+        "  vacate     Remove unreferenced deps from ~/.now/repo:\n"
+        "             vacate [--dry-run] [--gc] [--scan DIR] [--force]\n"
         "  version    Print version and exit\n\n"
         "Options:\n"
         "  -v              Verbose output\n"
@@ -336,6 +339,71 @@ int main(int argc, char *argv[]) {
         || strcmp(phase, "help") == 0) {
         usage();
         return 0;
+    }
+
+    /* vacate — the only thing that removes from ~/.now/repo (§2.2).
+     *
+     * Destructive, and the local repo is shared by every project on the
+     * machine, so the default is the conservative one: remove only what
+     * no lock file references, and refuse outright if the scan found no
+     * lock files at all — "I looked nowhere" and "nothing needs it"
+     * produce the same evidence and call for opposite actions. */
+    if (strcmp(phase, "vacate") == 0) {
+        NowVacateOpts vo;
+        NowResult vres;
+        const char *scans[16];
+        size_t nscan = 0;
+        char cwd_buf[PATH_MAX];
+        char parent[PATH_MAX];
+        int gc = 0, rc;
+
+        memset(&vo, 0, sizeof(vo));
+        memset(&vres, 0, sizeof(vres));
+
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--dry-run") == 0)      vo.dry_run = 1;
+            else if (strcmp(argv[i], "--force") == 0)   vo.force = 1;
+            else if (strcmp(argv[i], "--gc") == 0)      gc = 1;
+            else if (strcmp(argv[i], "--scan") == 0 && i + 1 < argc) {
+                if (nscan < sizeof(scans) / sizeof(scans[0]))
+                    scans[nscan++] = argv[++i];
+                else
+                    i++;
+            }
+        }
+
+        /* Default scan root: the directory holding this project, so a
+         * sibling checkout's lock file counts. Deliberately not the
+         * whole drive — a scan that misses a project must be visible as
+         * a scan that was too narrow, not as a deletion. */
+        if (nscan == 0) {
+            if (getcwd_compat(cwd_buf, sizeof(cwd_buf))) {
+                char *slash;
+                snprintf(parent, sizeof(parent), "%s", cwd_buf);
+                slash = strrchr(parent, '/');
+                { char *bs = strrchr(parent, '\\');
+                  if (bs && (!slash || bs > slash)) slash = bs; }
+                if (slash) *slash = '\0';
+                scans[nscan++] = parent;
+            }
+        }
+        vo.scan_roots = scans;
+        vo.scan_count = nscan;
+
+        /* Without --gc this vacates the CURRENT project's deps, so its
+         * own lock file must not be what keeps them alive. */
+        if (!gc) {
+            static char own[PATH_MAX];
+            if (getcwd_compat(cwd_buf, sizeof(cwd_buf))) {
+                snprintf(own, sizeof(own), "%s/now.lock.pasta", cwd_buf);
+                vo.exclude_lock = own;
+            }
+        }
+
+        rc = now_vacate(&vo, &vres);
+        if (rc != 0 && vres.message[0])
+            fprintf(stderr, "error: %s\n", vres.message);
+        return rc == 0 ? 0 : 1;
     }
 
     /* schema:check — validate the descriptor and exit (§31.19).
