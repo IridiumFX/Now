@@ -326,6 +326,11 @@ NOW_API int now_glob_match(const char *pattern, const char *path) {
 /* ---- Source discovery ---- */
 
 static int ext_matches(const char *path, const char **exts) {
+    /* NULL means "every file", for callers that select by something
+     * other than extension — `assembly:` matches whole paths against a
+     * glob, and a packaged crt0.o, .S or LICENSE has no extension the
+     * language registry would claim. */
+    if (!exts) return 1;
     const char *ext = now_path_ext(path);
     for (const char **e = exts; *e; e++) {
         if (strcmp(ext, *e) == 0) return 1;

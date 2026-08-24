@@ -6246,6 +6246,30 @@ goes into it. `now` drives the appropriate tool.
 
 ## 17.1 The Assembly Descriptor
 
+> **Implementation status (DRAFT, 2026-08-24).** The `include:` list is
+> honoured; `id:`, `format:` and `out:` are parsed and ignored, and say
+> so on stderr. There is one output artifact — the `.basta` package —
+> so several assembly definitions merge their include lists into it
+> rather than producing several files. A bare map is accepted as the
+> single-assembly shorthand.
+>
+> The files land in the package under `dest` plus the matched path with
+> the glob's fixed leading directories removed, so `src: "prebuilt/**"`
+> with `dest: "lib/"` stores `prebuilt/crt0.o` as `lib/crt0.o`. `now
+> install` reproduces the same layout under the dep root. A `src` that
+> matches no directory, or matches a directory but no files, warns —
+> an SDK that ships without its libraries is the failure this exists to
+> prevent, and it is silent by nature.
+>
+> **What is deliberately unanswered: how a CONSUMER reaches these
+> files.** A packaged `crt0.o` is worth nothing unless a dependent
+> build's link line can name where it landed, and deciding that is
+> deciding what an SDK dependency is — whether `link.archives` grows a
+> way to name a dep's assembly path, whether `dest` is interpreted on
+> the consuming side, or whether procure exports variables. That is a
+> question for the teams shipping SDKs, not one to settle from here.
+> Raised with aurora on 2026-08-24.
+
 Packaging is declared under `assembly:` in `now.pasta`. Multiple assemblies
 may be declared — each produces a separate artifact.
 

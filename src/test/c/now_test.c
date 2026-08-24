@@ -5511,6 +5511,70 @@ static void test_target_flags_absent_is_inert(void) {
     PASS();
 }
 
+
+/* ---- assembly: extra files a package carries (§24, DRAFT) ----
+ *
+ * The block parsed and was ignored for as long as it has existed, and
+ * `warn_descriptor_keys` said so — which is the right behaviour for an
+ * unimplemented field and the reason aurora found out by reading a
+ * warning rather than by shipping a broken SDK.
+ *
+ * These lock the parse. The packaging and install behaviour is exercised
+ * end to end rather than here, because what it produces is a file
+ * layout and asserting on a layout from inside this suite would mean
+ * reimplementing the layout. */
+
+static const char *ASM_POM =
+    "{ group: \"org.test\", artifact: \"sdk\", version: \"1.0\","
+    "  langs: [\"c\"],"
+    "  output: { type: \"header-only\" },"
+    "  assembly: {"
+    "    include: ["
+    "      { src: \"prebuilt/**\", dest: \"lib/\", exclude: [\"**/*.tmp\"] },"
+    "      { src: \"src/main/asm/**\", dest: \"asm/\" },"
+    "      { dest: \"nowhere/\" }"
+    "    ]"
+    "  } }";
+
+static void test_assembly_parses_its_includes(void) {
+    TEST("assembly: include entries parse in order");
+    NowResult res;
+    NowProject *p = now_project_load_string(ASM_POM, strlen(ASM_POM), &res);
+    ASSERT_NOT_NULL(p);
+
+    /* Three entries were written and one has no `src`. An entry that
+     * selects nothing is dropped at load rather than carried as an
+     * empty rule, because a rule that cannot match is indistinguishable
+     * from one that matched nothing — and only one of those is worth
+     * warning about later. */
+    ASSERT_EQ((int)p->assembly.count, 2);
+
+    ASSERT_STR(p->assembly.items[0].src,  "prebuilt/**");
+    ASSERT_STR(p->assembly.items[0].dest, "lib/");
+    ASSERT_EQ((int)p->assembly.items[0].exclude.count, 1);
+    ASSERT_STR(p->assembly.items[0].exclude.items[0], "**/*.tmp");
+
+    ASSERT_STR(p->assembly.items[1].src,  "src/main/asm/**");
+    ASSERT_STR(p->assembly.items[1].dest, "asm/");
+    ASSERT_EQ((int)p->assembly.items[1].exclude.count, 0);
+
+    now_project_free(p);
+    PASS();
+}
+
+static void test_assembly_absent_is_inert(void) {
+    TEST("assembly: a descriptor without the block carries nothing");
+    static const char *POM =
+        "{ group: \"org.test\", artifact: \"plain\", version: \"1.0\","
+        "  langs: [\"c\"] }";
+    NowResult res;
+    NowProject *p = now_project_load_string(POM, strlen(POM), &res);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ((int)p->assembly.count, 0);
+    now_project_free(p);
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -9198,6 +9262,8 @@ int main(void) {
     test_target_flags_scalars_replace();
     test_target_flags_link_block();
     test_target_flags_absent_is_inert();
+    test_assembly_parses_its_includes();
+    test_assembly_absent_is_inert();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();

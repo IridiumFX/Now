@@ -226,6 +226,107 @@ static BastaValue *collect_headers(const char *basedir, const char *hdr_dir) {
     return hmap;
 }
 
+/* ---- Assembly: extra files the author chose to ship (§24, DRAFT) ----
+ *
+ * Separate from @files on purpose. @files is what this project BUILT —
+ * one artifact, named and placed by output type and triple. @assembly is
+ * what the author decided to carry alongside it, and the two answer
+ * different questions: a consumer asking "what did you build" and a
+ * consumer asking "what do I need in my tree". An SDK is mostly the
+ * second: headers (already @headers), prebuilt archives, a crt0.o, an
+ * .S, sometimes sources.
+ *
+ * DRAFT, and the open question is not this half. Putting the bytes in
+ * the archive is contained; the half that decides whether this is
+ * useful is PLACEMENT ON THE CONSUMING SIDE — a crt0.o is worth nothing
+ * unless a dependent build's link line can name where it landed, and
+ * that is a decision about what an SDK dependency IS. Deliberately not
+ * answered here. */
+
+/* The leading directories of a glob, before the first wildcard. Used as
+ * both the walk root and the prefix stripped from stored names, so
+ * `src: "prebuilt/**"` stores "crt0.o" rather than "prebuilt/crt0.o".
+ * Returns a malloc'd string, possibly empty (walk the project root). */
+static char *glob_fixed_prefix(const char *pattern) {
+    size_t cut = 0, i;
+    for (i = 0; pattern[i]; i++) {
+        char c = pattern[i];
+        if (c == '*' || c == '?' || c == '[') break;
+        if (c == '/') cut = i + 1;
+    }
+    char *out = (char *)malloc(cut + 1);
+    if (!out) return NULL;
+    memcpy(out, pattern, cut);
+    out[cut] = '\0';
+    return out;
+}
+
+static int assembly_excluded(const NowAssemblyInclude *inc, const char *rel) {
+    for (size_t i = 0; i < inc->exclude.count; i++)
+        if (now_glob_match(inc->exclude.items[i], rel)) return 1;
+    return 0;
+}
+
+/* Returns the number of files added, or -1 on a hard error. */
+static int collect_assembly(BastaValue *out, const NowProject *project,
+                            const char *basedir, int verbose) {
+    int added = 0;
+
+    for (size_t e = 0; e < project->assembly.count; e++) {
+        const NowAssemblyInclude *inc = &project->assembly.items[e];
+        char *prefix = glob_fixed_prefix(inc->src);
+        if (!prefix) return -1;
+
+        /* Walk from the fixed prefix rather than the whole project: a
+         * `src` of "prebuilt/**" should not stat the build output. */
+        const char *walk_dir = prefix[0] ? prefix : ".";
+        NowFileList files;
+        now_filelist_init(&files);
+        if (now_discover_sources(basedir, walk_dir, NULL, &files) != 0) {
+            /* A pattern that names no directory contributes nothing.
+             * Say so — an SDK silently shipping without its libraries
+             * is the failure this whole section exists to prevent. */
+            fprintf(stderr,
+                    "warning: assembly: src '%s' matched no directory - "
+                    "nothing from it is in the package\n", inc->src);
+            now_filelist_free(&files);
+            free(prefix);
+            continue;
+        }
+
+        size_t plen = strlen(prefix);
+        int from_this_entry = 0;
+        for (size_t i = 0; i < files.count; i++) {
+            const char *rel = files.paths[i];
+            if (!now_glob_match(inc->src, rel)) continue;
+            if (assembly_excluded(inc, rel)) continue;
+
+            const char *tail = rel;
+            if (plen && strncmp(rel, prefix, plen) == 0) tail = rel + plen;
+
+            char key[1024];
+            snprintf(key, sizeof(key), "%s%s",
+                     inc->dest ? inc->dest : "", tail);
+
+            char *full = now_path_join(basedir, rel);
+            if (!full) continue;
+            if (add_file_blob(out, key, full) == 0) {
+                added++;
+                from_this_entry++;
+                if (verbose) fprintf(stderr, "  assembly %s\n", key);
+            }
+            free(full);
+        }
+        if (from_this_entry == 0)
+            fprintf(stderr,
+                    "warning: assembly: src '%s' matched no files\n", inc->src);
+
+        now_filelist_free(&files);
+        free(prefix);
+    }
+    return added;
+}
+
 /* ---- Package phase ---- */
 
 /* Phase wrappers, the same shape as now_build_link()'s and for the same
@@ -402,6 +503,16 @@ static int package_body(const NowProject *project, const char *basedir,
             free(bin_dir);
         }
         basta_set(root, "files", files);
+    }
+
+    /* @assembly section — extra files named by `assembly:` (§24, draft) */
+    if (project->assembly.count > 0) {
+        BastaValue *asm_sec = basta_new_map();
+        if (asm_sec) {
+            int n = collect_assembly(asm_sec, project, basedir, verbose);
+            if (n > 0) basta_set(root, "assembly", asm_sec);
+            else       basta_free(asm_sec);
+        }
     }
 
     /* @license section */
@@ -657,6 +768,52 @@ NOW_API int now_basta_extract(const char *basta_path, const char *dest_dir,
         }
     }
 
+    /* Extract @assembly section → dest_dir/<the path the author chose>
+     *
+     * Unlike @files these are NOT placed by output type and triple: the
+     * author already said where they go, and second-guessing that would
+     * make `dest:` decorative. The layout inside the package is the
+     * layout on disk. */
+    {
+        const BastaValue *asm_sec = basta_map_get(root, "assembly");
+        if (asm_sec && basta_type(asm_sec) == BASTA_MAP) {
+            for (size_t i = 0; i < basta_count(asm_sec); i++) {
+                const char *key = basta_map_key(asm_sec, i);
+                const BastaValue *val = basta_map_value(asm_sec, i);
+                if (!key || !val || basta_type(val) != BASTA_BLOB) continue;
+                /* A key is a path chosen by whoever built the package,
+                 * so it is untrusted the moment the package is. Refuse
+                 * anything that could leave dest_dir rather than
+                 * normalising it — the same rule gut's leech applies to
+                 * a ref name from a peer. */
+                if (key[0] == '/' || key[0] == '\\' || strstr(key, "..") ||
+                    (key[0] && key[1] == ':')) {
+                    fprintf(stderr,
+                            "warning: assembly entry '%s' is not a relative "
+                            "path inside the package - skipped\n", key);
+                    continue;
+                }
+                char *path = now_path_join(dest_dir, key);
+                if (!path) continue;
+                /* The key carries directories; make them. */
+                {
+                    char *slash = strrchr(path, '/');
+                    char *bslash = strrchr(path, '\\');
+                    if (bslash && (!slash || bslash > slash)) slash = bslash;
+                    if (slash) {
+                        char saved = *slash;
+                        *slash = '\0';
+                        now_mkdir_p(path);
+                        *slash = saved;
+                    }
+                }
+                if (verbose) fprintf(stderr, "  extract %s\n", key);
+                write_blob_file(path, val);
+                free(path);
+            }
+        }
+    }
+
     /* Extract @license section */
     const BastaValue *lic = basta_map_get(root, "license");
     if (lic && basta_type(lic) == BASTA_MAP) {
@@ -763,6 +920,59 @@ NOW_API int now_install(const NowProject *project, const char *basedir,
             copy_tree(basedir, hdr_dir, h_dst, hdr_exts);
             free(h_dst);
         }
+    }
+
+    /* Copy the assembly files into the dep root, at the paths the
+     * descriptor named (§24, draft).
+     *
+     * `install` copies from the project rather than unpacking the
+     * archive, so this is a second implementation of the same intent
+     * and they must not drift — the packaged layout and the installed
+     * layout are the same layout, and a consumer that learns one and
+     * gets the other has learned nothing. Both derive the stored name
+     * the same way: dest + the path with the glob's fixed prefix
+     * removed. */
+    for (size_t ai = 0; ai < project->assembly.count; ai++) {
+        const NowAssemblyInclude *inc = &project->assembly.items[ai];
+        char *prefix = glob_fixed_prefix(inc->src);
+        if (!prefix) continue;
+        const char *walk_dir = prefix[0] ? prefix : ".";
+        NowFileList afiles;
+        now_filelist_init(&afiles);
+        if (now_discover_sources(basedir, walk_dir, NULL, &afiles) == 0) {
+            size_t plen = strlen(prefix);
+            for (size_t i = 0; i < afiles.count; i++) {
+                const char *rel = afiles.paths[i];
+                if (!now_glob_match(inc->src, rel)) continue;
+                if (assembly_excluded(inc, rel)) continue;
+                const char *tail = rel;
+                if (plen && strncmp(rel, prefix, plen) == 0) tail = rel + plen;
+
+                char key[1024];
+                snprintf(key, sizeof(key), "%s%s",
+                         inc->dest ? inc->dest : "", tail);
+
+                char *src_full = now_path_join(basedir, rel);
+                char *dst_full = now_path_join(dep_path, key);
+                if (src_full && dst_full) {
+                    char *slash = strrchr(dst_full, '/');
+                    char *bs    = strrchr(dst_full, '\\');
+                    if (bs && (!slash || bs > slash)) slash = bs;
+                    if (slash) {
+                        char saved = *slash;
+                        *slash = '\0';
+                        now_mkdir_p(dst_full);
+                        *slash = saved;
+                    }
+                    now_file_copy(src_full, dst_full);
+                    if (verbose) fprintf(stderr, "  assembly %s\n", key);
+                }
+                free(src_full);
+                free(dst_full);
+            }
+        }
+        now_filelist_free(&afiles);
+        free(prefix);
     }
 
     /* Copy build output */
