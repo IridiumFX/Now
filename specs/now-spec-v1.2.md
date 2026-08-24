@@ -3310,7 +3310,39 @@ tests: {
 }
 ```
 
----
+**What of this block is implemented.** The `tests:` block is read by the
+same loader as `sources:`, so every field listed for one is accepted in the
+other — that is why `tests.exclude` and `tests.include` work. It is also why
+`tests.headers` and `tests.private` parse and do nothing.
+
+| field | state |
+|---|---|
+| `dir` | implemented |
+| `exclude` | implemented — same glob matcher as `sources.exclude` (§26.9) |
+| `include` | implemented — literal paths, same rule as `sources.include` |
+| `defines` | implemented, and the one place `${project.dir}` expands (§26.10) |
+| `mode` | implemented — see below |
+| `pattern` | parsed, ignored |
+| `headers` / `private` | parsed, ignored |
+| `runner` / `timeout` | not implemented |
+| `jobs` | not implemented; `-j` on the command line applies to compiles |
+
+### `tests.mode` — one binary, or one per file
+
+Default is one test binary for the whole suite, linked from every test
+source with a single `main()`. `mode: "each"` (or `"per-file"`) produces one
+binary per test source file, linked and run separately.
+
+The difference is visible beyond convenience, and it is the reason to state
+it here: **`now` cannot see inside a test binary.** In the default mode one
+process is one test, so a failing suite reports `1 failed` however many cases
+it holds, and the `test.failed` event
+(`specs/now-events-v1.md`) names the *binary* and carries `exit N`. In
+`mode: "each"` the granularity is the file, so a failure names the file that
+failed.
+
+Neither mode stops at the first failure. `--fail-fast` gates the compile
+scheduler and does not reach the test runner.
 
 ## 8.2 Test Build Model
 

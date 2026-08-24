@@ -211,6 +211,20 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
 - **Two loaders duplicate the parsing**: `now_project_load()` and
   `now_project_load_string()`. Only the former parses the workspace
   inheritance fields.
+- **`--fail-fast` is compile-only.** `g_fail_fast` is read in the parallel
+  compile scheduler and nowhere else — it does not stop a test run at the
+  first failing binary, in either test mode. The help wording ("stop
+  starting new compiles") is accurate; the flag name is not, and it read
+  as a test flag to a peer who needed one.
+- **`now test` runs ONE binary by default and counts it as one test.**
+  `tests: { mode: "each" }` / `"per-file"` builds one binary per test
+  source instead. This decides what a `test.failed` event can name — the
+  suite binary, or the file. Both were undocumented until 2026-08-24.
+- **Fields that work and were in no document** are as dangerous as fields
+  that are documented and do nothing. `tests.exclude` and `tests.mode`
+  were both live and unwritten while `tests.pattern` was written and
+  dead. A peer found `exclude` by trying it and then checking whether
+  the runners had really stopped being built.
 - **Paths inside `link.flags` are passed verbatim** and resolve against
   the *`now` process CWD*, not the module directory. `link.libdirs`,
   `link.archives` and `link.script` are resolved against the module
