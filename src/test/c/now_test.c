@@ -24,6 +24,7 @@
 #include "now_package.h"
 #include "now_workspace.h"
 #include "now_schema.h"
+#include "now_vacate.h"
 #include "now_plugin.h"
 #include "now_plugin_registry.h"
 #include "now_ci.h"
@@ -5746,6 +5747,209 @@ static void test_schema_syntax_error_carries_a_position(void) {
     PASS();
 }
 
+
+/* ---- vacate (§2.2) ----
+ *
+ * The first thing in `now` that deletes anything a user did not name,
+ * from a directory every project on the machine shares. So the tests
+ * are about the REFUSALS, not the removals: removing the right artifact
+ * is one assertion, and the other three are about not removing the
+ * wrong one.
+ *
+ * They run against a fake repo under target/, with HOME repointed, so
+ * a containment bug destroys a scratch directory rather than a home
+ * directory. That is the only way to test a delete honestly — a test
+ * that mocks the removal proves the caller's arithmetic and nothing
+ * about the thing that touches the disk.
+ */
+
+static void vac_write(const char *path, const char *body) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(body, 1, strlen(body), f);
+    fclose(f);
+}
+
+/* Build a disposable repo:  keep/1.0.0 (referenced), orphan/2.0.0 (not). */
+static int vac_setup(char *home_out, size_t cap) {
+    char p[512];
+    snprintf(home_out, cap, "target/vac_home");
+
+    now_mkdir_p("target/vac_projects");
+    now_mkdir_p("target/vac_home/.now/repo/org/example/keep/1.0.0");
+    vac_write("target/vac_home/.now/repo/org/example/keep/1.0.0/now.pasta",
+              "{ group: \"org.example\", artifact: \"keep\", "
+              "version: \"1.0.0\", langs: [\"c\"] }");
+
+    now_mkdir_p("target/vac_home/.now/repo/org/example/orphan/2.0.0");
+    vac_write("target/vac_home/.now/repo/org/example/orphan/2.0.0/now.pasta",
+              "{ group: \"org.example\", artifact: \"orphan\", "
+              "version: \"2.0.0\", langs: [\"c\"] }");
+
+    snprintf(p, sizeof(p), "target/vac_projects/now.lock.pasta");
+    vac_write(p, "{ entries: [ { group: \"org.example\", artifact: \"keep\", "
+                 "version: \"1.0.0\", triple: \"noarch\", sha256: \"0\" } ] }");
+    return 0;
+}
+
+static int vac_exists(const char *rel) {
+    return now_path_exists(rel);
+}
+
+/* Point HOME at the fake repo, and put it back afterwards.
+ *
+ * This is process-wide state. Leaving it pointed at target/vac_home
+ * would silently redirect every later test that reads ~/.now — the
+ * cross-test coupling that makes a suite lie about which run failed. */
+static char vac_home_saved[1024];
+static int  vac_home_have_saved = 0;
+
+static void vac_restore_home(void) {
+    char buf[1200];
+    if (!vac_home_have_saved) return;
+#ifdef _WIN32
+    snprintf(buf, sizeof(buf), "USERPROFILE=%s", vac_home_saved);
+    _putenv(buf);
+#else
+    setenv("HOME", vac_home_saved, 1);
+#endif
+}
+/* Point HOME at the fake repo for the duration of one call. */
+static void vac_set_home(const char *dir) {
+    char abs[1024];
+    char buf[1200];
+    if (!now_path_exists(dir)) return;
+    if (!vac_home_have_saved) {
+#ifdef _WIN32
+        const char *cur = getenv("USERPROFILE");
+#else
+        const char *cur = getenv("HOME");
+#endif
+        snprintf(vac_home_saved, sizeof(vac_home_saved), "%s", cur ? cur : "");
+        vac_home_have_saved = 1;
+    }
+#ifdef _WIN32
+    if (!_fullpath(abs, dir, sizeof(abs))) return;
+    snprintf(buf, sizeof(buf), "USERPROFILE=%s", abs);
+    _putenv(buf);
+#else
+    if (!realpath(dir, abs)) return;
+    setenv("HOME", abs, 1);
+#endif
+}
+
+static void test_vacate_removes_only_the_unreferenced(void) {
+    char home[256];
+    NowVacateOpts opts;
+    NowResult res;
+    const char *scans[1];
+
+    TEST("vacate: removes the unreferenced and keeps the rest");
+    vac_setup(home, sizeof(home));
+    vac_set_home(home);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    scans[0] = "target/vac_projects";
+    opts.scan_roots = scans;
+    opts.scan_count = 1;
+    opts.quiet = 1;
+
+    ASSERT_EQ(now_vacate(&opts, &res), 0);
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/keep/1.0.0"), 1);
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/orphan/2.0.0"), 0);
+    vac_restore_home();
+    PASS();
+}
+
+/* THE REFUSAL. A scan that found no lock files has not shown anything
+ * to be unreferenced — it has shown that it looked nowhere. Those two
+ * states produce identical evidence and call for opposite actions, so
+ * the empty scan must refuse. Without this, running vacate from a
+ * directory with no projects under it would empty the shared repo. */
+static void test_vacate_refuses_an_empty_scan(void) {
+    char home[256];
+    NowVacateOpts opts;
+    NowResult res;
+    const char *scans[1];
+
+    TEST("vacate: an empty scan refuses rather than removing everything");
+    vac_setup(home, sizeof(home));
+    vac_set_home(home);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    scans[0] = "target/vac_home";   /* holds the repo, but no lock files */
+    opts.scan_roots = scans;
+    opts.scan_count = 1;
+    opts.quiet = 1;
+
+    if (now_vacate(&opts, &res) == 0) {
+        vac_restore_home();
+        FAIL("empty scan was accepted");
+        return;
+    }
+    /* And nothing was touched. */
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/keep/1.0.0"), 1);
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/orphan/2.0.0"), 1);
+    vac_restore_home();
+    PASS();
+}
+
+static void test_vacate_dry_run_removes_nothing(void) {
+    char home[256];
+    NowVacateOpts opts;
+    NowResult res;
+    const char *scans[1];
+
+    TEST("vacate: --dry-run reports and removes nothing");
+    vac_setup(home, sizeof(home));
+    vac_set_home(home);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    scans[0] = "target/vac_projects";
+    opts.scan_roots = scans;
+    opts.scan_count = 1;
+    opts.quiet = 1;
+    opts.dry_run = 1;
+
+    ASSERT_EQ(now_vacate(&opts, &res), 0);
+    /* The orphan is still there — which is the whole assertion, and the
+     * one a reviewer would want to see before trusting the real run. */
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/orphan/2.0.0"), 1);
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/keep/1.0.0"), 1);
+    vac_restore_home();
+    PASS();
+}
+
+/* --force ignores references. It must still ignore only references —
+ * not the repo boundary. */
+static void test_vacate_force_takes_the_referenced_too(void) {
+    char home[256];
+    NowVacateOpts opts;
+    NowResult res;
+    const char *scans[1];
+
+    TEST("vacate: --force removes even what is referenced");
+    vac_setup(home, sizeof(home));
+    vac_set_home(home);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    scans[0] = "target/vac_projects";
+    opts.scan_roots = scans;
+    opts.scan_count = 1;
+    opts.quiet = 1;
+    opts.force = 1;
+
+    ASSERT_EQ(now_vacate(&opts, &res), 0);
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/keep/1.0.0"), 0);
+    ASSERT_EQ(vac_exists("target/vac_home/.now/repo/org/example/orphan/2.0.0"), 0);
+    vac_restore_home();
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -9443,6 +9647,16 @@ int main(void) {
     test_schema_std_is_per_language();
     test_schema_unimplemented_is_a_warning_not_an_error();
     test_schema_syntax_error_carries_a_position();
+
+    printf("\n  vacate (removes from ~/.now/repo):\n");
+    test_vacate_removes_only_the_unreferenced();
+    test_vacate_refuses_an_empty_scan();
+    test_vacate_dry_run_removes_nothing();
+    test_vacate_force_takes_the_referenced_too();
+    /* Unconditional: an ASSERT that fired inside one of those
+     * returns without restoring, and a leaked HOME would redirect
+     * every later test that reads ~/.now. */
+    vac_restore_home();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();
