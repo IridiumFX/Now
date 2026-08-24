@@ -36,6 +36,8 @@
   #include <io.h>
   #include <fcntl.h>
   #include <windows.h>   /* Sleep — after udp.h's <winsock2.h>, see above */
+#else
+  #include <unistd.h>    /* getpid — the run id's second half */
 #endif
 
 #ifndef PATH_MAX

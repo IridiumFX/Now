@@ -68,11 +68,25 @@ cd "$WORK" || die "cannot enter $WORK"
 # have to be installed and found alongside the binary; a single file that
 # can be copied anywhere is what a peer actually wants.
 CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF"
+# Objects from the PREVIOUS release survive here — `build/` is excluded
+# from the rsync above so it is never refreshed and never cleaned. That
+# is what turned a failed compile into a successful link against last
+# release's objects on 2026-08-24: the binary ran, answered `version`,
+# and reported the version of the source it was NOT built from. A
+# release build is not an incremental build; start from nothing.
+rm -rf build
 cmake -S . -B build -G Ninja $CMAKE_ARGS >/dev/null 2>&1 \
     || cmake -S . -B build $CMAKE_ARGS >/dev/null 2>&1 \
     || die "cmake configure"
-cmake --build build -j "$(nproc)" 2>&1 \
-    | grep -E "error|Linking C executable" | tail -3 | sed 's/^/  /'
+# NOT `cmake --build | grep`: a pipeline's exit status is the LAST
+# command's, so grep's success hid the compiler's failure completely.
+# Log first, then read the log.
+BUILD_LOG="$WORK/build-output.log"
+if ! cmake --build build -j "$(nproc)" > "$BUILD_LOG" 2>&1; then
+    grep -E "error|Error" "$BUILD_LOG" | head -10 | sed 's/^/  /'
+    die "build failed (full output: $BUILD_LOG)"
+fi
+grep -E "Linking C executable" "$BUILD_LOG" | tail -2 | sed 's/^/  /'
 
 BIN="$(find "$WORK/build" -name now -type f -perm -u+x 2>/dev/null | head -1)"
 [ -n "$BIN" ] || die "no binary produced"
@@ -80,7 +94,18 @@ say "built: $BIN"
 
 echo "== verify =="
 "$BIN" version >/dev/null 2>&1 || die "binary does not run"
-say "version: $("$BIN" version 2>&1)"
+BUILT_VER="$("$BIN" version 2>&1)"
+say "version: $BUILT_VER"
+# The control. Printing the version proves the binary runs; COMPARING it
+# against the source's own version is what proves the binary is this
+# source. Those look identical in a log right up to the day they differ,
+# and on 2026-08-24 they differed and nobody was reading.
+SRC_VER="$(sed -n 's/.*version: *"\([^"]*\)".*/\1/p' "$SRC/now.pasta" | head -1)"
+[ -n "$SRC_VER" ] || die "cannot read version from $SRC/now.pasta"
+case "$BUILT_VER" in
+    *"$SRC_VER"*) say "matches now.pasta: $SRC_VER" ;;
+    *) die "built binary reports '$BUILT_VER' but the source says '$SRC_VER' — stale objects or a partial build" ;;
+esac
 for cmd in build test procure package keygen; do
     "$BIN" --help 2>&1 | grep -qE "^[[:space:]]+$cmd[[:space:]]" \
         || die "'$cmd' missing from help"

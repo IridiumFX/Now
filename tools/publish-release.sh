@@ -56,6 +56,7 @@ fi
 
 echo
 echo "== 1/2  Windows =="
+set -o pipefail
 bash "$REPO/tools/install-toolkit.sh" ${SKIP:+$SKIP} 2>&1 | sed 's/^/  /' \
     || die "windows build/install failed"
 [ -f "$TOOLKIT/now.exe" ] || die "no now.exe in $TOOLKIT"
@@ -72,6 +73,11 @@ else
     # NOW_WSL_NAME keeps it from colliding with now.exe; NOW_WSL_NO_PATH
     # stops the peer-install script from putting a publication directory
     # on anyone's PATH or editing their dotfiles.
+    # `cmd | sed || die` can never fire: a pipeline's status is the LAST
+    # command's, and sed always succeeds. That is why a failed Linux
+    # build printed its error and was then reported as published on
+    # 2026-08-24. Keep the status of the thing being run.
+    set -o pipefail
     MSYS_NO_PATHCONV=1 wsl.exe -- \
         env NOW_WSL_PREFIX=/mnt/c/Users/Iridium/Projects/toolkit \
             NOW_WSL_NAME=now-linux-x64 \
@@ -89,6 +95,30 @@ else
         ldd /mnt/c/Users/Iridium/Projects/toolkit/now-linux-x64 2>&1 \
         | sed 's/^[[:space:]]*//; s/ (0x[0-9a-f]*)//' | paste -sd, - | sed 's/,/, /g')"
 fi
+
+echo
+echo "== cross-check =="
+# Two binaries built from one revision must report one version. When they
+# do not, at least one of them is not built from this tree — and the
+# stamp about to be written would say it was. This is the check that was
+# missing on 2026-08-24, when the table went out reading rc9 on one row
+# and rc8 on the other under a single revision, and neither the script
+# nor the operator stopped.
+#
+# Refusing here rather than warning is deliberate: a wrong stamp is worse
+# than no release, because a peer who takes the binary has no way left to
+# find out.
+case "$LIN_VER" in
+    "(not built"*) say "linux not built on this host — nothing to cross-check" ;;
+    *)
+        if [ "$WIN_VER" != "$LIN_VER" ]; then
+            say "windows: $WIN_VER"
+            say "linux:   $LIN_VER"
+            die "the two binaries report different versions from revision $REV"
+        fi
+        say "both report: $WIN_VER  (revision $REV)"
+        ;;
+esac
 
 echo
 echo "== record =="
