@@ -477,6 +477,7 @@ static const char *const k_known_keys[] = {
     "deps", "depends", "repos", "convergence", "private_groups", "resolve",
     "plugins",
     "components", "vendored", "modules", "java", "arch", "target_flags",
+    "assembly",
     /* Read out-of-band from the raw Pasta tree rather than into
      * NowProject, so they have no struct field to grep for — but they
      * are live config and must not be reported as unknown:
@@ -512,7 +513,7 @@ static const char *const k_inert_keys[] = {
      *   parent        — published parent descriptor coordinate
      */
     "build_options", "target", "targets", "toolchain", "toolchains", "parent",
-    "publish", "assembly", NULL
+    "publish", NULL
 };
 
 static int str_in_list(const char *const *list, const char *s) {
@@ -833,6 +834,94 @@ static void now_link_free(NowLink *l) {
     free(l->script_body);
 }
 
+/* ---- Assembly: extra files a package carries (§24, DRAFT) ---- */
+
+static void now_assembly_free(NowAssembly *a) {
+    if (!a) return;
+    for (size_t i = 0; i < a->count; i++) {
+        free(a->items[i].src);
+        free(a->items[i].dest);
+        now_strarray_free(&a->items[i].exclude);
+    }
+    free(a->items);
+    a->items = NULL;
+    a->count = a->cap = 0;
+}
+
+/* Read one assembly definition's `include:` list into dst. */
+static void load_assembly_includes(NowAssembly *dst, const PastaValue *asmdef,
+                                    const char *where) {
+    if (!asmdef || pasta_type(asmdef) != PASTA_MAP) return;
+
+    /* §17.1 gives an assembly an id, an output format and an output
+     * directory as well as its include list. Only the include list is
+     * implemented, and a format of "lha" silently producing a `.basta`
+     * would be worse than not accepting it — say so once, here, rather
+     * than let someone plan an Amiga distribution around it. */
+    {
+        static const char *const unimpl[] = { "id", "format", "out", NULL };
+        for (size_t k = 0; unimpl[k]; k++) {
+            if (pasta_map_get(asmdef, unimpl[k]))
+                fprintf(stderr,
+                        "warning: %s: assembly '%s' is recognized but not "
+                        "implemented in this build - the include list is "
+                        "honoured, everything else is ignored\n",
+                        where ? where : "now.pasta", unimpl[k]);
+        }
+    }
+
+    const PastaValue *inc = pasta_map_get(asmdef, "include");
+    if (!inc || pasta_type(inc) != PASTA_ARRAY) return;
+
+    size_t n = pasta_count(inc);
+    for (size_t i = 0; i < n; i++) {
+        const PastaValue *e = pasta_array_get(inc, i);
+        if (!e || pasta_type(e) != PASTA_MAP) continue;
+
+        char *s = dup_map_str(e, "src");
+        if (!s || !*s) { free(s); continue; }   /* an entry with no src selects nothing */
+
+        if (dst->count == dst->cap) {
+            size_t cap = dst->cap ? dst->cap * 2 : 4;
+            NowAssemblyInclude *grown =
+                (NowAssemblyInclude *)realloc(dst->items, cap * sizeof(*grown));
+            if (!grown) { free(s); return; }
+            dst->items = grown;
+            dst->cap   = cap;
+        }
+        NowAssemblyInclude *a = &dst->items[dst->count];
+        memset(a, 0, sizeof(*a));
+        now_strarray_init(&a->exclude);
+        a->src  = s;
+        a->dest = dup_map_str(e, "dest");
+        load_strarray(&a->exclude, pasta_map_get(e, "exclude"));
+        dst->count++;
+    }
+}
+
+/* §17.1 makes `assembly:` an ARRAY of assembly definitions, because
+ * multiple assemblies may be declared and each produces its own
+ * artifact. Only one artifact is produced in this build, so every
+ * definition's include list is merged into one — which is right for a
+ * tree with one assembly and wrong for a tree with two, and the second
+ * case will need `format:`/`out:` to exist before it can mean anything.
+ *
+ * A bare map is also accepted, and only because §17.1's own prose
+ * ("multiple assemblies MAY be declared") makes the single case the
+ * common one; it reads as the degenerate array. This is the one place a
+ * second spelling is tolerated, and it should not be copied. */
+static void load_assembly(NowAssembly *dst, const PastaValue *src,
+                           const char *where) {
+    if (!dst || !src) return;
+    if (pasta_type(src) == PASTA_ARRAY) {
+        size_t n = pasta_count(src);
+        for (size_t i = 0; i < n; i++)
+            load_assembly_includes(dst, pasta_array_get(src, i), where);
+    } else if (pasta_type(src) == PASTA_MAP) {
+        load_assembly_includes(dst, src, where);
+    }
+}
+
 /* ---- Per-triple compile/link overrides (§11.9) ---- */
 
 static void now_target_flags_free(NowTargetFlagsArray *a) {
@@ -1012,6 +1101,7 @@ NOW_API void now_project_free(NowProject *p) {
     now_compile_free(&p->compile);
     now_link_free(&p->link);
     now_target_flags_free(&p->target_flags);
+    now_assembly_free(&p->assembly);
     now_deparray_free(&p->deps);
     now_repoarray_free(&p->repos);
     now_pluginarray_free(&p->plugins);
@@ -1128,6 +1218,7 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
      * blocks above by apply_target_flags() once the whole descriptor
      * is in. */
     load_target_flags(&p->target_flags, pasta_map_get(root, "target_flags"));
+    load_assembly(&p->assembly, pasta_map_get(root, "assembly"), path);
 
     /* Dependencies (§1.6). Accept `depends:` as a Maven-friendly
      * alias for `deps:` — `deps:` wins when both are present. */
@@ -1253,6 +1344,7 @@ NOW_API NowProject *now_project_load_string(const char *input, size_t len,
     load_compile(&p->compile, pasta_map_get(root, "compile"));
     load_link(&p->link,       pasta_map_get(root, "link"));
     load_target_flags(&p->target_flags, pasta_map_get(root, "target_flags"));
+    load_assembly(&p->assembly, pasta_map_get(root, "assembly"), NULL);
     {
         const PastaValue *dv = pasta_map_get(root, "deps");
         if (!dv) dv = pasta_map_get(root, "depends");

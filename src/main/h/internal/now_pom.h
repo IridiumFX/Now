@@ -103,6 +103,37 @@ typedef struct {
     size_t          cap;
 } NowTargetFlagsArray;
 
+/* Assembly — extra files a package carries beyond what it built (§24).
+ *
+ * DRAFT. An SDK is not a library: it is headers, plus prebuilt link
+ * archives, plus startup objects (crt0.o), plus the odd .S, and
+ * sometimes sources. `output.type: "header-only"` already covers the
+ * headers; this covers the rest.
+ *
+ *   assembly: {
+ *     include: [
+ *       { src: "prebuilt/**", dest: "lib/" },
+ *       { src: "src/main/asm/**", dest: "asm/", exclude: ["**|*.tmp"] }
+ *     ]
+ *   }
+ *
+ * `src` is a glob rooted at the project directory. `dest` is a prefix
+ * inside the package; the path stored is `dest` plus the file's path
+ * with `src`'s fixed leading directories removed, so
+ * "prebuilt/crt0.o" under src "prebuilt/**" and dest "lib/" is stored
+ * as "lib/crt0.o" rather than "lib/prebuilt/crt0.o". */
+typedef struct {
+    char       *src;
+    char       *dest;
+    NowStrArray exclude;
+} NowAssemblyInclude;
+
+typedef struct {
+    NowAssemblyInclude *items;
+    size_t              count;
+    size_t              cap;
+} NowAssembly;
+
 /* Output configuration (§1.4) */
 typedef struct {
     char *type;            /* executable | static | shared | header-only */
@@ -272,6 +303,9 @@ struct NowProject {
      * cannot disagree with another. The array is kept after merging
      * for diagnostics only. */
     NowTargetFlagsArray target_flags;
+
+    /* Extra files to carry in the package (§24). Draft. */
+    NowAssembly assembly;
 
     /* Dependencies (§1.6) */
     NowDepArray deps;
