@@ -38,6 +38,7 @@ add_library(now
     src/main/c/now_workspace.c
     src/main/c/now_layer.c
     src/main/c/now_arch.c
+    src/main/c/now_schema.c
     src/main/c/now_module.c
     src/main/c/now_cache.c
     # now-enterprise module

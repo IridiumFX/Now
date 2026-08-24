@@ -717,6 +717,7 @@ which nothing else can satisfy, was documented in detail.
 | `plugin:list` † · `plugin:info` † · `plugin:search` † · `plugin:install` † | Plugin registry operations. |
 | `export:cmake` † · `export:make` † · `export:meson` † · `export:bazel` † · `export:maven` † | Emit a build file for another system. |
 | `import:cmake` † · `import:maven` † | Derive a `now.pasta` from another system's build file. |
+| `schema:check` | Validate a descriptor without building it. Exit 1 on error, 2 if not found. |
 | `reproducible:check` † | Build twice and compare outputs. |
 | `version` · `help` | — |
 
@@ -12095,8 +12096,21 @@ promotes `NOW-W0001` to `NOW-E0001`.
 
 ## 31.19 `now schema:check`
 
+> **Implemented (rc10).** Exit codes and the JSON shape below are
+> what the tool produces. Errors are descriptors that cannot mean
+> what they say — an unparseable version, a `std` the language does
+> not have, an unknown `output.type`, a dep that is not a
+> `group:artifact:version` coordinate, or a syntax error.
+> **Warnings never fail the check without `--strict`**, and that is
+> deliberate: an unknown or unimplemented key is how a descriptor
+> written against a newer spec looks, and refusing it would break
+> adoption at exactly the moment somebody is attempting it.
+>
+> Warning codes: `NOW-W0001` unknown key, `NOW-W0002` recognized
+> but not implemented, `NOW-W0003` parsed but read by nothing.
+
 ```
-now schema:check [--strict] [--format pasta|json|text]
+now schema:check [file] [--strict] [--format pasta|json|text]
 ```
 
 Validates the project descriptor and exits. Exit code:

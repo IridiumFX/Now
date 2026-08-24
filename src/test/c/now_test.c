@@ -23,6 +23,7 @@
 #include "now_build.h"
 #include "now_package.h"
 #include "now_workspace.h"
+#include "now_schema.h"
 #include "now_plugin.h"
 #include "now_plugin_registry.h"
 #include "now_ci.h"
@@ -5575,6 +5576,176 @@ static void test_assembly_absent_is_inert(void) {
     PASS();
 }
 
+
+/* ---- schema:check (§31.19) ----
+ *
+ * These are the first tests of the descriptor DIAGNOSTICS, as opposed
+ * to the descriptor loader. Until the collector existed the only way to
+ * observe an "unknown key" warning was to read a build log, so the key
+ * lists that decide what users are told had no coverage at all — the
+ * lists were edited by hand and verified by eye, twice this month.
+ *
+ * The distinction under test is the one that matters and the one most
+ * easily got backwards: an ERROR is a descriptor that cannot mean what
+ * it says; a WARNING is one this build does not fully implement. A
+ * descriptor written against a newer spec must still be usable, so
+ * warnings never fail the check — that is `--strict`'s job.
+ */
+
+static void write_file(const char *path, const char *body) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(body, 1, strlen(body), f);
+    fclose(f);
+}
+
+static int diag_has(const NowDiagList *l, const char *code) {
+    for (size_t i = 0; i < l->count; i++)
+        if (strcmp(l->items[i].code, code) == 0) return 1;
+    return 0;
+}
+
+/* Run schema:check over a descriptor written to a scratch file. */
+static NowSchemaResult schema_of(const char *body, NowDiagList *e,
+                                 NowDiagList *w) {
+    write_file("target/schema_t.pasta", body);
+    now_diaglist_init(e);
+    now_diaglist_init(w);
+    return now_schema_check("target/schema_t.pasta", e, w);
+}
+
+static void test_schema_accepts_a_good_descriptor(void) {
+    NowDiagList e, w;
+    TEST("schema: a valid descriptor is valid and quiet");
+    NowSchemaResult r = schema_of(
+        "{ group: \"org.t\", artifact: \"a\", version: \"1.2.3\","
+        "  langs: [\"c\"], std: \"c11\" }", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_VALID);
+    ASSERT_EQ((int)e.count, 0);
+    ASSERT_EQ((int)w.count, 0);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+    PASS();
+}
+
+static void test_schema_missing_file_is_two_not_one(void) {
+    NowDiagList e, w;
+    TEST("schema: a missing descriptor is 2, not invalid");
+    now_diaglist_init(&e); now_diaglist_init(&w);
+    /* §31.19 gives "not found" its own exit code precisely so a script
+     * can tell "you are in the wrong directory" from "your descriptor
+     * is wrong". Collapsing them would make the command useless in the
+     * case it is most often run by mistake. */
+    NowSchemaResult r = now_schema_check("target/definitely_absent.pasta",
+                                         &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_NOT_FOUND);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+    PASS();
+}
+
+static void test_schema_rejects_what_cannot_be_meant(void) {
+    NowDiagList e, w;
+    TEST("schema: version, std, output.type and dep coordinates");
+
+    NowSchemaResult r = schema_of(
+        "{ group: \"org.t\", artifact: \"a\", version: \"not-a-version\","
+        "  langs: [\"c\"] }", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_INVALID);
+    ASSERT_EQ(diag_has(&e, "NOW-E0103"), 1);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+
+    r = schema_of("{ group: \"org.t\", artifact: \"a\", version: \"1.0.0\","
+                  "  langs: [\"c\"], std: \"c14\" }", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_INVALID);
+    ASSERT_EQ(diag_has(&e, "NOW-E0102"), 1);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+
+    r = schema_of("{ group: \"org.t\", artifact: \"a\", version: \"1.0.0\","
+                  "  langs: [\"c\"], output: { type: \"libraryish\" } }", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_INVALID);
+    ASSERT_EQ(diag_has(&e, "NOW-E0104"), 1);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+
+    r = schema_of("{ group: \"org.t\", artifact: \"a\", version: \"1.0.0\","
+                  "  langs: [\"c\"], deps: [ { id: \"org.example\" } ] }", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_INVALID);
+    ASSERT_EQ(diag_has(&e, "NOW-E0105"), 1);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+    PASS();
+}
+
+/* The std table is per-language, so the control is that the SAME value
+ * is right in one language and wrong in another. A check that only ever
+ * saw one language could pass with the table ignored entirely. */
+static void test_schema_std_is_per_language(void) {
+    NowDiagList e, w;
+    TEST("schema: c++20 is valid for c++ and not for c");
+
+    NowSchemaResult r = schema_of(
+        "{ group: \"org.t\", artifact: \"a\", version: \"1.0.0\","
+        "  langs: [\"c++\"], std: \"c++20\" }", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_VALID);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+
+    r = schema_of("{ group: \"org.t\", artifact: \"a\", version: \"1.0.0\","
+                  "  langs: [\"c\"], std: \"c++20\" }", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_INVALID);
+    ASSERT_EQ(diag_has(&e, "NOW-E0102"), 1);
+    now_diaglist_free(&e); now_diaglist_free(&w);
+    PASS();
+}
+
+/* The three warning classes, and the assertion that they are WARNINGS.
+ *
+ * This is the first coverage the key lists have ever had. Getting the
+ * class wrong is not cosmetic: an unimplemented field promoted to an
+ * error would refuse every descriptor written against a newer spec,
+ * which is exactly the adoption case. */
+static void test_schema_unimplemented_is_a_warning_not_an_error(void) {
+    NowDiagList e, w;
+    TEST("schema: unknown, inert and dead fields warn but stay valid");
+    NowSchemaResult r = schema_of(
+        "{ group: \"org.t\", artifact: \"a\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  profiles: { debug: {} },"
+        "  compil: { flags: [\"-O2\"] },"
+        "  sources: { dir: \"src/main/c\", defines: { X: \"1\" } } }", &e, &w);
+
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_VALID);   /* still valid */
+    ASSERT_EQ((int)e.count, 0);
+    ASSERT_EQ(diag_has(&w, "NOW-W0002"), 1);    /* profiles: inert */
+    ASSERT_EQ(diag_has(&w, "NOW-W0001"), 1);    /* compil: typo */
+    ASSERT_EQ(diag_has(&w, "NOW-W0003"), 1);    /* sources.defines: dead */
+    now_diaglist_free(&e); now_diaglist_free(&w);
+    PASS();
+}
+
+/* A descriptor too broken to parse still has to produce a position, or
+ * the command cannot do the one thing it exists for. */
+static void test_schema_syntax_error_carries_a_position(void) {
+    NowDiagList e, w;
+    TEST("schema: a syntax error names a line and column");
+    NowSchemaResult r = schema_of(
+        "{ group: \"org.t\", artifact: \"a\", version: \"1.0.0\",", &e, &w);
+    ASSERT_EQ((int)r, (int)NOW_SCHEMA_INVALID);
+    ASSERT_EQ((int)e.count, 1);
+    ASSERT_EQ(diag_has(&e, "NOW-E0001"), 1);
+    if (e.items[0].line <= 0) {
+        now_diaglist_free(&e); now_diaglist_free(&w);
+        FAIL("syntax error reported no line");
+        return;
+    }
+    /* And the position must not be duplicated into the message, which
+     * the loader formats as "LINE:COL: text". */
+    if (strstr(e.items[0].message, ":") &&
+        e.items[0].message[0] >= '0' && e.items[0].message[0] <= '9') {
+        now_diaglist_free(&e); now_diaglist_free(&w);
+        FAIL("message repeats the position");
+        return;
+    }
+    now_diaglist_free(&e); now_diaglist_free(&w);
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -9264,6 +9435,14 @@ int main(void) {
     test_target_flags_absent_is_inert();
     test_assembly_parses_its_includes();
     test_assembly_absent_is_inert();
+
+    printf("\n  Descriptor validation (schema:check):\n");
+    test_schema_accepts_a_good_descriptor();
+    test_schema_missing_file_is_two_not_one();
+    test_schema_rejects_what_cannot_be_meant();
+    test_schema_std_is_per_language();
+    test_schema_unimplemented_is_a_warning_not_an_error();
+    test_schema_syntax_error_carries_a_position();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();

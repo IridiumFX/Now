@@ -13,6 +13,7 @@
  */
 
 #include "now_pom.h"
+#include "now_schema.h"
 #include "now.h"
 #include "now_build.h"
 #include "now_fs.h"
@@ -172,6 +173,8 @@ static void usage(void) {
         "  init       Scaffold a new project: init [lang] [--group G] [--artifact A]\n"
         "  sketch     Alias for init (§2.5)\n"
         "  fmt        Format .pasta files: fmt [file...] [--sorted]\n"
+        "  schema:check Validate a descriptor without building it:\n"
+        "               schema:check [file] [--strict] [--format text|json|pasta]\n"
         "  publish    Upload package to remote registry\n"
         "  yank       Yank a published version: yank <g:a:v> --repo URL\n"
         "  compile-db   Generate compile_commands.json for IDE/LSP\n"
@@ -333,6 +336,40 @@ int main(int argc, char *argv[]) {
         || strcmp(phase, "help") == 0) {
         usage();
         return 0;
+    }
+
+    /* schema:check — validate the descriptor and exit (§31.19).
+     *
+     * Deliberately before the build machinery starts: this command must
+     * work on a descriptor too broken to build with, which is exactly
+     * when it is useful. It touches no toolchain, resolves no
+     * dependency, and creates no target/. */
+    if (strcmp(phase, "schema:check") == 0) {
+        NowDiagList errors, warnings;
+        const char *fmt = "text";
+        const char *file = "now.pasta";
+        int strict = 0;
+
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--strict") == 0) strict = 1;
+            else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) fmt = argv[++i];
+            else if (argv[i][0] != '-') file = argv[i];
+        }
+
+        now_diaglist_init(&errors);
+        now_diaglist_init(&warnings);
+        NowSchemaResult r = now_schema_check(file, &errors, &warnings);
+        now_schema_report(stdout, file, r, &errors, &warnings, fmt);
+
+        int rc;
+        if (r == NOW_SCHEMA_NOT_FOUND)      rc = 2;
+        else if (r == NOW_SCHEMA_INVALID)   rc = 1;
+        else if (strict && warnings.count)  rc = 1;
+        else                                rc = 0;
+
+        now_diaglist_free(&errors);
+        now_diaglist_free(&warnings);
+        return rc;
     }
 
     /* Handle clean */
