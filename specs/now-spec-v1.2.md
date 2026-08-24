@@ -727,7 +727,7 @@ which nothing else can satisfy, was documented in detail.
 | `ci` | Run the lifecycle with CI-shaped output (`--output json\|pasta`). |
 | `init` · `sketch` · `fmt` | Scaffold a project; scaffold a snippet; format a descriptor. |
 | `compile-db` | Emit `compile_commands.json`. |
-| `watch` | Rebuild on source change. |
+| `watch` | Rebuild on source change. **Shorthand for `now stay build`** (§22.3); it is the same watcher, not a second one. Today `watch` is what ships and `stay` is not implemented — see §22.3. |
 | `sbom` † | Emit a software bill of materials. |
 | `keygen` † | Generate an Ed25519 publisher signing keypair. **Required to satisfy `require_signatures`.** |
 | `verify` | Verify an archive signature against the trust store. |
@@ -7904,6 +7904,12 @@ now graph:show --workspace  ; full workspace build graph (can be large)
 
 # Chapter 19 — IDE Integration and `now stay` Daemon
 
+> **Status.** The IDE integration in this chapter is served today by
+> `now compile-db` and `now tell` (§19, §31.19), both of which ship.
+> **The `now stay` daemon does not exist**; `now watch` is the shipped
+> watcher and is a foreground loop. Read §22.3 before planning against
+> anything in this chapter.
+
 > **Scope note — Post-v1 feature.** This chapter is fully specified but is
 > **not targeted for the initial open-source release**. It should be
 > implemented after the core build pipeline (Chapters 1–17) is stable and
@@ -8014,6 +8020,57 @@ fast, no build required, just graph interrogation.
 
 ## 22.3 `now stay` — The Watch Verb
 
+> **NOT IMPLEMENTED. `now watch` is what ships**, and it is a foreground
+> loop that re-runs `now build` — nothing else. It cannot run tests, it
+> cannot run a chain, and it does not detach. When `stay` lands, `watch`
+> becomes an alias for `now stay build` so nothing scripted against it
+> breaks; there will be one watcher, not two.
+>
+> ### What `stay` decides, and what it does not
+>
+> This is the distinction to hold on to, because everything else follows
+> from it:
+>
+> **`stay` chooses PHASES. The build manifest chooses FILES.**
+>
+> When you edit a header, `stay`'s trigger table says "build must
+> re-run". It says nothing about which translation units are affected —
+> that is decided inside `build`, by the per-file dependency records in
+> `target/.now-manifest`, and it already works today under `watch`:
+> editing `a.h` recompiles `a.c` and leaves `b.c` alone, and touching a
+> header without changing its bytes recompiles nothing, because the
+> manifest is content-hashed rather than mtime-driven.
+>
+> So `stay` is not a background compiler that compiles the file you just
+> saved. It is a scheduler that decides which phases to run; the phases
+> then do what they already do, precisely.
+>
+> **Consequence worth designing to:** the trigger table is a *second*
+> statement about what depends on what, and the manifest is the first.
+> The trigger table must therefore only ever decide *which phase*, never
+> *which file* — two sources of truth about file-level dependencies is
+> the shape that produces stale-object bugs, and a long-running daemon
+> caching a build graph is where it would bite hardest.
+>
+> ### What it buys over re-running the whole chain
+>
+> Measured on a project with no dependencies:
+>
+> | | |
+> |---|---|
+> | no-op `now build` (procure + generate + compile + link, all no-ops) | ~192 ms |
+> | `now procure` alone | ~57 ms |
+>
+> So skipping procure on a source edit saves roughly 57 ms. **That is
+> not the reason to build `stay`.** The reason is the chain: `now stay
+> build test` re-runs the suite on every edit, and `watch` cannot do
+> that at all. Anyone weighing the trigger table on its own should weigh
+> it against 57 ms.
+>
+> Unmeasured, and worth measuring before finalising the design: what
+> `procure` costs on a project with a populated lock file, where it has
+> real work to do.
+
 `stay` is a verb that can be prepended to any `now` command chain. It
 transforms a one-shot command into a persistent watch loop: the command
 runs once immediately, then re-runs automatically when the relevant inputs
@@ -8104,6 +8161,26 @@ are coalesced into a single rebuild pass.
 ---
 
 ## 22.4 `now stay --daemon` — Background Mode
+
+> **NOT IMPLEMENTED, and it is three features rather than one.** They
+> land independently and should be priced independently:
+>
+> 1. **`stay <chain>` foreground** — the trigger table and phase chains
+>    (§22.3). This is the part that replaces `watch`.
+> 2. **`--daemon`** — detaching, the PID file, the socket / named-pipe
+>    IPC, and the four `daemon:*` commands below.
+> 3. **The ancillary maintenance jobs** — `cache:gc`, `cache:verify`,
+>    `compile-db:refresh`, `build:warm`, `graph:rebuild`,
+>    `procure:refresh` and the rest. Most have nothing to do with
+>    watching; several are separate commands in their own right. A
+>    daemon may *schedule* them. Making them part of the daemon is how a
+>    watcher turns into a six-session feature.
+>
+> **`build:warm` deserves its own warning.** Speculatively compiling
+> off a cached build graph means acting on a view of the tree that
+> nothing revalidated. That is the stale-object failure with a head
+> start. If it is built, it must warm the cache the *manifest* agrees
+> with, never one the daemon remembers.
 
 `now stay --daemon` detaches the watcher into a background process. It
 performs the same watching and rebuilding as foreground `now stay`, plus
