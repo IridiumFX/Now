@@ -3310,16 +3310,26 @@ tests: {
 }
 ```
 
-**What of this block is implemented.** The `tests:` block is read by the
-same loader as `sources:`, so every field listed for one is accepted in the
-other — that is why `tests.exclude` and `tests.include` work. It is also why
-`tests.headers` and `tests.private` parse and do nothing.
+**What of this block is implemented, and the trap in how it is loaded.**
+The `tests:` block is read by the same loader as `sources:`, so every field
+listed for one is ACCEPTED in the other.
+
+**That is a fact about parsing and it says nothing about behaviour.** The
+two blocks land in identical structs and are then read by different code:
+`tests.exclude` is applied in test-source discovery and `tests.include` is
+read nowhere, while `sources.include` is read in five places and
+`sources.defines` is read in none. Symmetric parse, asymmetric use — and
+the parse is the visible half, which is why this table exists and why an
+earlier draft of it wrongly listed `tests.include` as working.
+
+The rule is: a field is implemented where something *reads* it, not where
+something stores it.
 
 | field | state |
 |---|---|
 | `dir` | implemented |
 | `exclude` | implemented — same glob matcher as `sources.exclude` (§26.9) |
-| `include` | implemented — literal paths, same rule as `sources.include` |
+| `include` | **parsed, ignored** — `sources.include` is read, this is not |
 | `defines` | implemented, and the one place `${project.dir}` expands (§26.10) |
 | `mode` | implemented — see below |
 | `pattern` | parsed, ignored |
@@ -9088,7 +9098,9 @@ then `exclude` patterns are applied.
 | `sources.include` | project root | Explicit additions — no glob expansion, literal paths only |
 | `tests.pattern` | `tests.dir` | Test source selection. **Not implemented** — parsed and ignored |
 | `tests.exclude` | `tests.dir` | Post-selection exclusion, same matcher as `sources.exclude`. Implemented |
-| `tests.include` | project root | Explicit additions, same rule as `sources.include` |
+| `tests.include` | project root | **Not implemented** — parsed and ignored. `sources.include` is read in five places; `tests.include` in none |
+| `sources.defines` | N/A | **Not implemented** — parsed and ignored. Use `compile.defines`; `tests.defines` is the live one for the test TU |
+| `sources.env` | N/A | **Not implemented** — parsed and ignored |
 | `assembly.include[].src` | project root | Assembly include source paths |
 | `assembly.include[].exclude` | project root | Assembly include exclusions |
 | `sources.generators[].pattern` | project root | Generator input files |

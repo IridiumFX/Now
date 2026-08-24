@@ -544,9 +544,18 @@ typedef struct {
 
 static const char *const k_dead_output[]  = { "dir", NULL };
 static const char *const k_dead_link[]    = { "script_body", NULL };
-static const char *const k_dead_sources[] = { "mode", NULL };
+/* `sources:` and `tests:` are read by the SAME loader, so both accept
+ * every field either one names — and are then read by different code.
+ * The asymmetry is the whole reason these two lists differ:
+ * `sources.include` is read in five places and `tests.include` in none;
+ * `tests.defines` reaches the test compile and `sources.defines`
+ * reaches nothing. A symmetric parse with an asymmetric use is exactly
+ * the shape that gets documented wrongly, and was — the spec claimed
+ * `tests.include` worked until 2026-08-24. */
+static const char *const k_dead_sources[] = { "mode", "defines", "env", NULL };
 static const char *const k_dead_tests[]   = { "pattern", "headers",
-                                              "private_headers", NULL };
+                                              "private_headers",
+                                              "include", NULL };
 static const char *const k_dead_deps[]    = { "exclude", "volatile", NULL };
 static const char *const k_dead_repos[]   = { "release", "snapshot",
                                               "auth", NULL };

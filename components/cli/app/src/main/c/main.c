@@ -170,6 +170,7 @@ static void usage(void) {
         "  package    Assemble distributable archive in target/pkg/\n"
         "  install    Install to local repo (~/.now/repo/)\n"
         "  init       Scaffold a new project: init [lang] [--group G] [--artifact A]\n"
+        "  sketch     Alias for init (§2.5)\n"
         "  fmt        Format .pasta files: fmt [file...] [--sorted]\n"
         "  publish    Upload package to remote registry\n"
         "  yank       Yank a published version: yank <g:a:v> --repo URL\n"
