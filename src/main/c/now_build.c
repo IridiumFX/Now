@@ -5395,9 +5395,15 @@ NOW_API void now_build_set_default_target(const char *triple,
         now_triple_parse(&g_default_target, triple);
         now_triple_fill_from_host(&g_default_target);
         g_default_target_set = 1;
+        /* Publish it before any descriptor is read: the loader merges
+         * `target_flags` against this, and a project loaded earlier
+         * would have merged against the host. The CLI sets it during
+         * argument parsing for exactly that reason. */
+        now_arch_set_effective_target(&g_default_target);
     } else {
         memset(&g_default_target, 0, sizeof(g_default_target));
         g_default_target_set = 0;
+        now_arch_set_effective_target(NULL);
     }
     clear_default_tags();
     if (tags && tag_count) {
