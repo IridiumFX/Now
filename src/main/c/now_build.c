@@ -4,6 +4,7 @@
  * Compiles source files to objects, then links into final output.
  */
 #include "now_build.h"
+#include "now_layer.h"
 #include "now_objsym.h"  /* which object actually defines main() */
 #include "now_events.h"
 #include "now_manifest.h"
@@ -5638,4 +5639,184 @@ NOW_API int now_query_includes(const NowProject *project, const char *basedir,
 
     now_build_free(&ctx);
     return (int)out->count;
+}
+
+/* ==== zero-config: compile to objects, and stop ======================
+ *
+ * `now build` in a tree with no `now.pasta` used to exit 3. It now walks
+ * the tree, compiles every source it recognises to an object, reports
+ * what it found, and stops.
+ *
+ * Stopping is the design, not a limitation. Compiling is the last step
+ * whose failure is loud: a missing include, a bad -D, a syntax error --
+ * the compiler shouts. Everything past that point fails quietly. Which
+ * objects group into which artifact, static versus shared, what gets
+ * exported, whether a symbol resolved from somewhere unintended: all of
+ * those produce a successful build of the wrong thing. So zero-config
+ * goes exactly as far as the work verifies itself and no further, and
+ * anything beyond it needs a descriptor to say so.
+ *
+ * That also means the walker never guesses an artifact kind, which is
+ * why no directory convention had to be invented to carry one. A
+ * `src/main/c` tree and a flat one compile identically here; the
+ * difference only appears once something asks to be linked, and by then
+ * there is a descriptor to ask.
+ *
+ * Configuration comes from the same three sources as any other build:
+ * any `.now-layer.pasta` above the tree, the environment, and the
+ * command line. There is no fourth source and no inferred convention --
+ * in particular, include paths are NOT guessed from the layout, because
+ * a guessed -I that happens to work is how a tree acquires a dependency
+ * nobody wrote down.
+ */
+
+/* Languages actually present under `basedir`, as a NowStrArray of ids.
+ *
+ * Detected rather than declared: there is no descriptor to declare
+ * them. A tree with C and assembly gets both, and one with neither gets
+ * an empty list and an honest report. */
+static void detect_langs(NowStrArray *dst, const char *basedir) {
+    size_t all_count = 0;
+    const char *const *all = now_lang_all_ids(&all_count);
+    const char **exts = now_lang_all_exts(all, all_count);
+    NowFileList fl;
+    size_t i;
+
+    now_strarray_init(dst);
+    if (!exts) return;
+
+    now_filelist_init(&fl);
+    if (now_discover_sources(basedir, ".", exts, &fl) != 0) {
+        now_filelist_free(&fl);
+        free((void *)exts);
+        return;
+    }
+
+    for (i = 0; i < fl.count; i++) {
+        const NowLangDef *lang = NULL;
+        const NowLangType *t = now_lang_classify(fl.paths[i], all, all_count, &lang);
+        size_t k;
+        int seen = 0;
+        /* Only things that become objects. A .h or a .md is not a
+         * language this mode has anything to do. */
+        if (!t || !lang || t->produces != NOW_PRODUCES_OBJECT) continue;
+        for (k = 0; k < dst->count; k++)
+            if (strcmp(dst->items[k], lang->id) == 0) { seen = 1; break; }
+        if (!seen) now_strarray_push(dst, lang->id);
+    }
+
+    now_filelist_free(&fl);
+    free((void *)exts);
+}
+
+/* How many of these objects define `main`.
+ *
+ * Not a guess from filenames -- now_obj_defines_symbol reads the symbol
+ * table, and returns -1 when it cannot tell, which is counted
+ * separately rather than folded into either answer. */
+static void count_entry_points(const NowFileList *objs,
+                               int *out_with, int *out_unknown) {
+    size_t i;
+    *out_with = 0;
+    *out_unknown = 0;
+    for (i = 0; i < objs->count; i++) {
+        int r = now_obj_defines_symbol(objs->paths[i], "main");
+        if (r == 1) (*out_with)++;
+        else if (r < 0) (*out_unknown)++;
+    }
+}
+
+NOW_API int now_build_objects(const char *basedir, NowResult *result) {
+    NowProject proj;
+    NowBuildCtx ctx;
+    NowStrArray langs;
+    int rc, with_main = 0, unknown = 0;
+
+    if (!basedir) return -1;
+
+    detect_langs(&langs, basedir);
+    if (langs.count == 0) {
+        fprintf(stderr, "  nothing to compile: no source files under %s\n",
+                basedir);
+        now_strarray_free(&langs);
+        if (result) { result->code = NOW_OK; result->message[0] = '\0'; }
+        return 0;
+    }
+
+    /* A project that exists only for this call. It names no artifact and
+     * no output, because it is not going to produce one -- every field
+     * here is about finding and compiling files. */
+    memset(&proj, 0, sizeof(proj));
+    proj.langs = langs;
+    proj.sources.dir = (char *)".";
+    /* Walking from "." reaches target/, where the last run's output
+     * lives. Generated sources there would be compiled as if someone
+     * had written them, and on a second run the tree would grow. This
+     * is `sources.exclude`, which the build already understands and
+     * already tests -- not a new rule taught to the walker. */
+    now_strarray_init(&proj.sources.exclude);
+    now_strarray_push(&proj.sources.exclude, "target/**");
+    now_strarray_init(&proj.compile.flags);
+    now_strarray_init(&proj.compile.warnings);
+    now_strarray_init(&proj.compile.defines);
+    now_strarray_init(&proj.compile.includes);
+    now_strarray_init(&proj.link.flags);
+    now_strarray_init(&proj.link.libs);
+    now_strarray_init(&proj.link.libdirs);
+    now_strarray_init(&proj.link.archives);
+
+    /* The same three configuration sources as a descriptor build. */
+    {
+        NowAuditReport audit;
+        now_audit_init(&audit);
+        now_layer_apply_to_project(&proj, basedir, &audit, result);
+        now_layer_report_violations(&audit, "(no descriptor)");
+        now_audit_free(&audit);
+    }
+
+    if (now_build_init(&ctx, &proj, basedir, result) != 0) {
+        now_strarray_free(&langs);
+        return -1;
+    }
+
+    rc = now_build_compile(&ctx, result);
+    if (rc != 0) {
+        now_build_free(&ctx);
+        now_strarray_free(&langs);
+        return rc;
+    }
+
+    count_entry_points(&ctx.objects, &with_main, &unknown);
+
+    /* The report is the product here. It says what was found and what it
+     * did NOT do, because "compiled 12 objects" on its own reads like a
+     * finished build. */
+    fprintf(stderr, "  no now.pasta - nothing linked\n");
+    if (unknown > 0)
+        fprintf(stderr,
+                "  %d object%s define main, %d could not be read\n",
+                with_main, with_main == 1 ? "" : "s", unknown);
+    else
+        fprintf(stderr, "  %d object%s define main\n",
+                with_main, with_main == 1 ? "" : "s");
+    fprintf(stderr,
+            "  add a now.pasta to say what to build from them\n");
+
+    /* now_build_init creates target/bin for an output that, here, is
+     * never going to arrive. An empty bin/ next to "nothing linked"
+     * reads like a build that failed halfway. rmdir only succeeds on an
+     * empty directory, so this cannot remove anything real. */
+    {
+        char *bindir = now_path_join(basedir, "target/bin");
+        if (bindir) {
+            (void)rmdir(bindir);
+            free(bindir);
+        }
+    }
+
+    now_build_free(&ctx);
+    now_strarray_free(&langs);
+    now_strarray_free(&proj.sources.exclude);
+    if (result) { result->code = NOW_OK; result->message[0] = '\0'; }
+    return 0;
 }
