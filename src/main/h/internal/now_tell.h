@@ -38,7 +38,7 @@
  *
  * `what` is a descriptor path ("sources.dir", "deps") or a computed
  * query ("source-files", "compile-cmd", "compile-flags", "include-paths",
- * "dep-path"). `argv`/`argc` carry any extra arguments the query needs.
+ * "dep-path", "config-origin"). `argv`/`argc` carry any extra arguments the query needs.
  * `format` is "text" (default), "json" or "pasta".
  *
  * Returns 0 on success, non-zero if the question could not be answered

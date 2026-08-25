@@ -185,6 +185,7 @@ static void usage(void) {
         "             tell sources.dir | deps | compile.flags\n"
         "             tell source-files | include-paths | compile-cmd FILE\n"
         "             tell dep-path g:a:v [h|lib]   [--output text|json|pasta]\n"
+        "             tell config-origin [field]           which layer set a value\n"
         "  tool:list  List tools declared in the `tools:` block\n"
         "  tool:run   Run one: tool:run <name>\n"
         "  convert    Descriptor between formats:\n"
@@ -437,7 +438,9 @@ int main(int argc, char *argv[]) {
                         "  fields are dotted:      sources.dir  compile.flags  deps\n"
                         "  queries are hyphenated: source-files  includes\n"
                         "                          compile-cmd FILE  compile-flags FILE\n"
-                        "                          dep-path g:a:v [h|lib]\n");
+                        "                          dep-path g:a:v [h|lib]\n"
+
+                        "                          config-origin [field]\n");
                 now_project_free(tp);
                 return 1;
             }

@@ -134,6 +134,42 @@ NOW_API int now_layer_apply_to_project(NowProject *p, const char *basedir,
                                        NowAuditReport *audit,
                                        NowResult *result);
 
+/* ---- Where a resolved value came from ---- */
+
+/* One resolved configuration value and the layer it came from.
+ *
+ * `origin` is the layer FILE PATH for a discovered `.now-layer.pasta`,
+ * or "project" / "now-baseline" for the two synthetic layers. The
+ * stack's own ids ("fs-layer-0") are not used here -- they answer a
+ * different question than the one being asked. */
+typedef struct {
+    char *section;   /* "compile" | "link" */
+    char *key;       /* "defines", "flags", "opt", ... */
+    char *value;     /* one array entry, or the scalar */
+    char *origin;
+} NowConfigOrigin;
+
+typedef struct {
+    NowConfigOrigin *items;
+    size_t           count;
+    size_t           cap;
+} NowConfigOrigins;
+
+/* Work out where every compile/link value in `basedir`'s project would
+ * come from. Re-reads the descriptor unmerged, because by the time
+ * anything can ask, the layers have already been merged into the live
+ * project and it would answer "project" for everything.
+ *
+ * Array entries are attributed to the lowest layer carrying them (who
+ * introduced it); scalars to the highest layer setting them (who won).
+ *
+ * Returns 0 on success. Caller frees with now_config_origins_free(). */
+NOW_API int now_layer_collect_origins(NowConfigOrigins *dst,
+                                      const char *basedir,
+                                      NowResult *result);
+
+NOW_API void now_config_origins_free(NowConfigOrigins *o);
+
 /* ---- Audit ---- */
 
 NOW_API void now_audit_init(NowAuditReport *report);
