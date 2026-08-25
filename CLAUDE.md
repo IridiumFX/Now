@@ -159,19 +159,43 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   nothing. `docs/status.md` claiming "all tiers complete, zero backlog"
   is not accurate. **Grep the source before telling a downstream team a
   field works.**
-- **`.now-layer.pasta` does not reach the build.** §25 cascading layers
-  is a complete subsystem -- discovery from the project up to the VCS
-  root, open/locked section policy, audit codes, `layers:show
-  --effective`, `layers:audit` -- and `now_build.c` never calls any of
-  it. `now_layer_merge_section()` has exactly two consumers, both of
-  them the `layers:*` commands themselves. Measured 2026-08-25: a
-  `.now-layer.pasta` carrying `compile: { defines: [X] }` shows up in
-  `layers:show --effective` and the build then fails on a source that
-  requires X. So an org or team layer configures a report, not a
-  compile. This is the `profiles:`/`properties:` problem again but
-  larger, and it is the one to check first when someone asks why their
-  org-wide flag "isn't being picked up" -- it is being picked up, and
-  then dropped.
+- **`.now-layer.pasta` reaches the build, and the gate is the point.**
+  §25 cascading layers configured a report and nothing else until
+  2026-08-25 -- `now_layer_merge_section()` had two callers and both
+  were the `layers:*` commands. `now_layer_apply_to_project()` is the
+  seam now; it is called once in `main.c` after the project loads, and
+  once per module in `now_workspace.c` after root inheritance, so
+  layers are the outermost ring and the module's own descriptor still
+  wins.
+
+  Two rules hold it together, and both are load-bearing:
+
+  1. **No layer file anywhere above the project means nothing happens.**
+     Not "an equivalent result" -- the function returns before touching
+     anything. Same discipline as the workspace inheritance gate.
+  2. **The built-in baseline claims no compile defaults.** It used to
+     declare `warnings: [Wall, Wextra]` and `opt: debug`, and
+     `now_build.c` applies neither unless the descriptor asks -- it maps
+     Wall/Wextra only when they are already in `compile.warnings` and
+     emits `-Og` only when `opt` is set. Wiring layers in while the
+     baseline still said that would have handed three unrequested flags,
+     including an optimisation level, to every project on the machine.
+     A baseline is documentation; documentation that is false is worse
+     than none.
+
+  These two are redundant *by design*, and that has a testing
+  consequence worth knowing: with an honest baseline, removing the gate
+  changes no observable behaviour, so a control that only removes the
+  gate comes back green. The control that proves the gate does anything
+  has to dirty the baseline **and** remove the gate. If you touch either
+  mechanism, run that conjunction.
+
+  `_policy: "locked"` in a layer section makes it additive: lower
+  layers may add, the project may not remove or replace, and every
+  attempt is recorded as NOW-W0401. A build warns and proceeds;
+  `--strict` refuses. Locked never silently discards the project's own
+  values -- a locked section that broke builds instead of governing
+  them would just get deleted.
 
 - **Descriptor key diagnostics.** `warn_descriptor_keys()` in
   `now_pom.c` warns on unknown keys and, separately, on recognized-but-
