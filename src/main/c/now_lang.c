@@ -268,6 +268,25 @@ NOW_API void now_lang_registry_init(void) {
      * Future: load custom language definitions from now.pasta. */
 }
 
+/* Every language `now` knows, as ids.
+ *
+ * `now_lang_classify` needs a list of active languages, which a
+ * descriptor supplies. A tree with no descriptor has no such list and
+ * still has to be classified -- that is the whole of zero-config mode --
+ * so this hands over the registry's own list. NULL-terminated, static,
+ * not owned by the caller. */
+NOW_API const char *const *now_lang_all_ids(size_t *count) {
+    static const char *ids[sizeof(registry) / sizeof(registry[0])];
+    static size_t n = 0;
+    if (n == 0) {
+        const NowLangDef **def;
+        for (def = registry; *def; def++) ids[n++] = (*def)->id;
+        ids[n] = NULL;
+    }
+    if (count) *count = n;
+    return ids;
+}
+
 NOW_API const NowLangDef *now_lang_find(const char *lang_id) {
     if (!lang_id) return NULL;
     for (const NowLangDef **def = registry; *def; def++) {

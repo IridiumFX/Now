@@ -159,6 +159,44 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   nothing. `docs/status.md` claiming "all tiers complete, zero backlog"
   is not accurate. **Grep the source before telling a downstream team a
   field works.**
+- **`now build` with no `now.pasta` compiles to objects and stops.**
+  It used to exit 3. It now walks the tree, compiles every source it
+  recognises, and says what it did not do:
+
+  ```
+  compiled 3 (32-way parallel), skipped 0 (up to date)
+  no now.pasta - nothing linked
+  2 objects define main
+  add a now.pasta to say what to build from them
+  ```
+
+  Stopping is the design. **Compiling is the last step whose failure is
+  loud** -- a missing include, a bad `-D`, a syntax error, the compiler
+  shouts. Everything past it fails quietly: which objects group into
+  which artifact, static versus shared, what gets exported, whether a
+  symbol resolved from somewhere unintended. Those produce a successful
+  build of the wrong thing. So zero-config goes exactly as far as the
+  work verifies itself and no further.
+
+  That is also why no directory convention had to be invented. The
+  walker never guesses an artifact kind, so `src/main/c` and a flat tree
+  compile identically; the difference only appears once something asks
+  to be linked, and by then there is a descriptor to ask. Languages are
+  *detected* (`now_lang_all_ids` + `now_lang_classify`), only for types
+  that produce objects -- a tree of headers is not a C project with
+  nothing to compile.
+
+  Configuration is the same three sources as any build. Include paths
+  are **not** inferred from the layout: a guessed `-I` that happens to
+  work is how a tree acquires a dependency nobody wrote down.
+
+  `sources.exclude` keeps `target/**` out of the walk. Objects there are
+  harmless (the walk looks for source extensions), but a *generated*
+  `.c` is not -- without the exclusion every run compiles the previous
+  run's generated sources plus its own, and it compounds. The test
+  plants one deliberately; a version that only checked object counts
+  passed while watching nothing.
+
 - **Three sources configure a build, in this order.** Lowest priority
   first, each appended after the last so the compiler's last-flag-wins
   gives the top of the list the final say:

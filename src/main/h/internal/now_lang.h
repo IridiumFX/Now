@@ -47,6 +47,11 @@ typedef struct {
 NOW_API void            now_lang_registry_init(void);
 NOW_API const NowLangDef *now_lang_find(const char *lang_id);
 
+/* Every language id in the registry, NULL-terminated and static.
+ * For classifying a tree that has no descriptor to name its
+ * languages -- see now_build_objects(). */
+NOW_API const char *const *now_lang_all_ids(size_t *count);
+
 NOW_API const NowLangType *now_lang_classify(const char *path,
                                               const char *const *active_langs,
                                               size_t lang_count,

@@ -1537,6 +1537,20 @@ skip_header:
     char *descriptor = now_path_join(cwd, "now.pasta");
     if (!descriptor || !now_path_exists(descriptor)) {
         free(descriptor);
+        /* Zero-config. A tree with no descriptor still has sources,
+         * and compiling them is always safe -- see
+         * now_build_objects(). Every other phase needs to know what
+         * to PRODUCE, which is exactly what the descriptor says, so
+         * only `build` takes this path. */
+        if (strcmp(phase, "build") == 0) {
+            NowResult zres;
+            int zrc;
+            memset(&zres, 0, sizeof(zres));
+            zrc = now_build_objects(cwd, &zres);
+            if (zrc != 0 && zres.message[0])
+                fprintf(stderr, "error: %s\n", zres.message);
+            return zrc == 0 ? 0 : 1;
+        }
         fprintf(stderr, "error: no now.pasta found in %s\n", cwd);
         return 3;
     }

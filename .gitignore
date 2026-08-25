@@ -33,6 +33,11 @@ src/test/resources/envcli_order/
 src/test/resources/envcli_gate/
 src/test/resources/envcli_origin/
 src/test/resources/envcli_quote/
+src/test/resources/zc_plain/
+src/test/resources/zc_empty/
+src/test/resources/zc_needs_cfg/
+src/test/resources/zc_cfg/
+src/test/resources/zc_rewalk/
 src/test/resources/entrywire_proj/
 src/test/resources/osym_proj/
 src/test/resources/pattern_proj/

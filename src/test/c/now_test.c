@@ -5583,6 +5583,212 @@ static void test_envcli_a_quoted_path_stays_one_flag(void) {
     PASS();
 }
 
+/* ---- zero-config: compile to objects and stop ---------------------
+ *
+ * `now build` in a tree with no now.pasta used to exit 3. It now walks,
+ * compiles what it recognises, and stops before linking -- because
+ * compiling is the last step whose failure is loud, and every decision
+ * past it (what links with what, static or shared, what is exported)
+ * fails silently as a successful build of the wrong thing.
+ *
+ * What these check is the boundary rather than the compiler: that it
+ * finds sources without being told where they are, that it never
+ * produces an artifact, that config still reaches it, and that a second
+ * run does not eat its own output.
+ */
+static void zc_write(const char *path, const char *body) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fputs(body, f);
+    fclose(f);
+}
+
+/* A tree with no descriptor. Deliberately NOT in src/main/c: the walker
+ * must not depend on a layout, because the layout is exactly what a
+ * tree without a descriptor has not committed to. */
+static int zc_fixture(char *dir_out, size_t cap, const char *name) {
+    char p[512];
+    snprintf(dir_out, cap, "%s/%s", NOW_TEST_RESOURCES, name);
+    rmtree_best_effort(dir_out);
+    if (now_path_exists(dir_out)) return 0;
+    now_mkdir_p(dir_out);
+    snprintf(p, sizeof(p), "%s/code", dir_out);
+    now_mkdir_p(p);
+    return 1;
+}
+
+static void test_zeroconfig_compiles_a_tree_with_no_descriptor(void) {
+    char dir[512], p[512], obj[512];
+    NowResult res;
+
+    TEST("zero-config: a tree with no now.pasta compiles to objects");
+
+    if (!zc_fixture(dir, sizeof(dir), "zc_plain")) {
+        FAIL("could not clear the fixture - cannot establish precondition");
+        return;
+    }
+    snprintf(p, sizeof(p), "%s/code/helper.c", dir);
+    zc_write(p, "int helper(void) { return 7; }\n");
+    snprintf(p, sizeof(p), "%s/code/app.c", dir);
+    zc_write(p, "int helper(void);\nint main(void) { return helper() - 7; }\n");
+
+    memset(&res, 0, sizeof(res));
+    ASSERT_EQ(now_build_objects(dir, &res), 0);
+
+    /* Objects exist... */
+    snprintf(obj, sizeof(obj), "%s/target/obj/main/code/helper.c.o", dir);
+    if (!now_path_exists(obj)) {
+        FAIL("no object was produced for a source it should have found");
+        return;
+    }
+
+    /* ...and nothing was linked. This is the half that makes it a
+     * design rather than an unfinished build. */
+    snprintf(obj, sizeof(obj), "%s/target/bin", dir);
+    if (now_path_exists(obj)) {
+        FAIL("zero-config produced an artifact; it must stop at objects");
+        return;
+    }
+    PASS();
+}
+
+/* Nothing to compile is not a failure. A tree of documentation is a
+ * legitimate thing to point this at, and exiting non-zero would make it
+ * unusable in anything that checks status. */
+static void test_zeroconfig_an_empty_tree_is_not_an_error(void) {
+    char dir[512], p[512];
+    NowResult res;
+
+    TEST("zero-config: a tree with no sources is reported, not failed");
+
+    if (!zc_fixture(dir, sizeof(dir), "zc_empty")) {
+        FAIL("could not clear the fixture - cannot establish precondition");
+        return;
+    }
+    /* A HEADER, not a README.
+     *
+     * A file no language claims proves nothing here -- classify returns
+     * NULL for it either way, so the test passes whether or not the
+     * detector filters on what actually produces an object. A .h IS
+     * claimed by C, and must still not make this a C tree with nothing
+     * to compile. Measured: with the filter removed, README.md left
+     * this green. */
+    snprintf(p, sizeof(p), "%s/code/only_a_header.h", dir);
+    zc_write(p, "int f(void);\n");
+
+    memset(&res, 0, sizeof(res));
+    ASSERT_EQ(now_build_objects(dir, &res), 0);
+    PASS();
+}
+
+/* Compiling is the last loud step, and this is what that means: with no
+ * -I and no -D the source cannot compile, and the build says so rather
+ * than producing something. The companion half -- that supplying them
+ * fixes it -- is the next test. */
+static void test_zeroconfig_a_source_that_cannot_compile_fails(void) {
+    char dir[512], p[512];
+    NowResult res;
+
+    TEST("zero-config: a source that cannot compile fails the build");
+
+    if (!zc_fixture(dir, sizeof(dir), "zc_needs_cfg")) {
+        FAIL("could not clear the fixture - cannot establish precondition");
+        return;
+    }
+    snprintf(p, sizeof(p), "%s/code/a.c", dir);
+    zc_write(p, "#ifndef WANTED\n#error \"no define\"\n#endif\n"
+                "int f(void) { return 1; }\n");
+
+    memset(&res, 0, sizeof(res));
+    now_layer_set_cli_flags(NULL, NULL);
+    if (now_build_objects(dir, &res) == 0) {
+        FAIL("a source that cannot compile produced a successful build");
+        return;
+    }
+    PASS();
+}
+
+/* ...and the configuration sources reach this mode too. Without this,
+ * zero-config would be unusable on any tree whose headers are not
+ * beside its sources -- which is most of them. */
+static void test_zeroconfig_takes_config_from_the_command_line(void) {
+    char dir[512], p[512], obj[512];
+    NowResult res;
+
+    TEST("zero-config: --cflags reaches the compile line");
+
+    if (!zc_fixture(dir, sizeof(dir), "zc_cfg")) {
+        FAIL("could not clear the fixture - cannot establish precondition");
+        return;
+    }
+    snprintf(p, sizeof(p), "%s/code/a.c", dir);
+    zc_write(p, "#ifndef WANTED\n#error \"no define\"\n#endif\n"
+                "int f(void) { return 1; }\n");
+
+    now_layer_set_cli_flags("-DWANTED", NULL);
+    memset(&res, 0, sizeof(res));
+    ASSERT_EQ(now_build_objects(dir, &res), 0);
+    now_layer_set_cli_flags(NULL, NULL);
+
+    snprintf(obj, sizeof(obj), "%s/target/obj/main/code/a.c.o", dir);
+    if (!now_path_exists(obj)) {
+        FAIL("the object was not produced even with the define supplied");
+        return;
+    }
+    PASS();
+}
+
+/* The walk starts at the tree root, which contains target/. Without an
+ * exclusion the second run compiles the first run's output, and a tree
+ * that is built twice is not the tree that was built once. */
+static void test_zeroconfig_does_not_walk_its_own_output(void) {
+    char dir[512], p[512];
+    NowResult res;
+    NowFileList a, b;
+    const char *exts[] = { ".o", ".obj", NULL };
+
+    TEST("zero-config: a second run does not compile the first run's output");
+
+    if (!zc_fixture(dir, sizeof(dir), "zc_rewalk")) {
+        FAIL("could not clear the fixture - cannot establish precondition");
+        return;
+    }
+    snprintf(p, sizeof(p), "%s/code/a.c", dir);
+    zc_write(p, "int f(void) { return 1; }\n");
+
+    memset(&res, 0, sizeof(res));
+    ASSERT_EQ(now_build_objects(dir, &res), 0);
+    now_filelist_init(&a);
+    now_discover_sources(dir, "target", exts, &a);
+
+    /* Plant a SOURCE under target/, the way a code generator would.
+     *
+     * Objects alone prove nothing: the walk looks for source
+     * extensions, and target/ holds none, so dropping the exclusion
+     * changes nothing and this test stays green while watching nothing.
+     * A generated .c is the case the exclusion exists for, and the
+     * failure it prevents compounds -- every run compiles the last
+     * run's generated sources plus its own. */
+    snprintf(p, sizeof(p), "%s/target/generated.c", dir);
+    zc_write(p, "int generated_thing(void) { return 1; }\n");
+
+    ASSERT_EQ(now_build_objects(dir, &res), 0);
+    now_filelist_init(&b);
+    now_discover_sources(dir, "target", exts, &b);
+
+    /* Same object count both times. Growth here means the walk consumed
+     * its own output, and it compounds every run. */
+    if (a.count != b.count) {
+        FAIL("the object tree grew on a second run");
+        now_filelist_free(&a);
+        now_filelist_free(&b);
+        return;
+    }
+    now_filelist_free(&a);
+    now_filelist_free(&b);
+    PASS();
+}
+
 static void test_layer_merge_strarray_exclude(void) {
     TEST("layers: !exclude: removes entries in open mode");
     NowStrArray dst;
@@ -11032,6 +11238,11 @@ int main(void) {
     test_envcli_gate_covers_env_and_cli_too();
     test_envcli_origin_names_the_variable();
     test_envcli_a_quoted_path_stays_one_flag();
+    test_zeroconfig_compiles_a_tree_with_no_descriptor();
+    test_zeroconfig_an_empty_tree_is_not_an_error();
+    test_zeroconfig_a_source_that_cannot_compile_fails();
+    test_zeroconfig_takes_config_from_the_command_line();
+    test_zeroconfig_does_not_walk_its_own_output();
     test_layer_audit_format();
     test_layer_push_project();
 

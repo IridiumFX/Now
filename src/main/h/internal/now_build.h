@@ -125,6 +125,22 @@ NOW_API int now_build_test(NowBuildCtx *ctx, NowResult *result);
 /* Clean up build context. */
 NOW_API void now_build_free(NowBuildCtx *ctx);
 
+/* Zero-config: compile every source under `basedir` to an object and
+ * stop.
+ *
+ * For a tree with no now.pasta. Compiling is the last step whose failure
+ * is loud -- what to LINK from the objects is a decision, and decisions
+ * that go wrong here produce a successful build of the wrong thing. So
+ * this goes exactly as far as the work verifies itself, reports what it
+ * found and what it did not do, and leaves the rest to a descriptor.
+ *
+ * Configuration is the usual three sources: any .now-layer.pasta above
+ * the tree, the environment, and the command line. No convention is
+ * inferred from the layout -- notably not include paths.
+ *
+ * Returns 0 on success, including when there is nothing to compile. */
+NOW_API int now_build_objects(const char *basedir, NowResult *result);
+
 /* Rebind the build's target triple and recompute the active tag set
  * (used by source-discovery's platform gate). Call after
  * now_build_init() but before compile_phase. Passing user_tags=NULL,
