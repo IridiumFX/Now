@@ -4,6 +4,7 @@
  * Compiles source files to objects, then links into final output.
  */
 #include "now_build.h"
+#include "now_objsym.h"  /* which object actually defines main() */
 #include "now_events.h"
 #include "now_manifest.h"
 #include "now_dirwalk.h"
@@ -4155,7 +4156,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
  * time. Filter out the entry-point object from the test link by basename
  * match. Library scaffolds (static/shared/header-only) have no main() in
  * production objects, so the filter is a no-op there. */
-static int is_entry_point_obj(const char *path) {
+static int entry_point_obj_by_name(const char *path) {
     const char *base = strrchr(path, '/');
     const char *bb   = strrchr(path, '\\');
     if (bb && (!base || bb > base)) base = bb;
@@ -4168,6 +4169,49 @@ static int is_entry_point_obj(const char *path) {
            strcmp(base, "main.cpp.obj")== 0 ||
            strcmp(base, "main.cc.obj") == 0 ||
            strcmp(base, "main.cxx.obj")== 0;
+}
+
+/* Does this object carry the program's entry point?
+ *
+ * ASK THE OBJECT. This used to be the filename check above and nothing
+ * else, which is a convention rather than a fact — an executable whose
+ * entry point lived in `app.c` had its `main` linked into the test
+ * binary beside the test's own, and `now test` died with
+ * `multiple definition of 'main'`. Reproduced 2026-08-25.
+ *
+ * The fallback matters as much as the check. `now_obj_defines_symbol`
+ * returns -1 for "cannot tell" — an unreadable object, or a format it
+ * does not parse — and that is NOT the same as "no". Reading it as "no"
+ * would exclude nothing and reproduce the duplicate-`main` link; so on
+ * -1 we fall back to the filename, which is exactly the behaviour that
+ * shipped before and is wrong only in the case that was already wrong. */
+static int is_entry_point_obj(const char *path) {
+    int has = now_obj_defines_symbol(path, "main");
+    if (has >= 0) return has;
+    return entry_point_obj_by_name(path);
+}
+
+/* Say what excluding the entry point costs, BEFORE the linker does.
+ *
+ * The test binary drops the object that defines `main`, and with it
+ * everything else that translation unit defined. When `main` lives in
+ * its own file that is free; when it shares a file with the code under
+ * test, the link fails with `undefined reference to <something the
+ * author can see in their own source>`, which explains nothing.
+ *
+ * Warned once per build rather than per object, and only when there is
+ * something to lose — a `main.c` holding nothing but `main` is the
+ * common case and must stay silent. */
+static void warn_entry_point_hides_symbols(const char *obj_path) {
+    int others = now_obj_other_global_count(obj_path, "main");
+    if (others <= 0) return;
+    fprintf(stderr,
+            "warning: %s defines main() and %d other global symbol(s).\n"
+            "         The test binary cannot link that object — it would\n"
+            "         duplicate main() — so those symbols are not visible\n"
+            "         to tests. Move main() into a translation unit of its\n"
+            "         own to test the rest.\n",
+            obj_path, others);
 }
 
 static int build_test_body(NowBuildCtx *ctx, NowResult *result) {
@@ -5045,7 +5089,10 @@ static int build_test_body(NowBuildCtx *ctx, NowResult *result) {
         for (size_t i = 0; i < test_objects.count; i++)
             argv[argc++] = test_objects.paths[i];
         for (size_t i = 0; i < ctx->objects.count; i++) {
-            if (is_entry_point_obj(ctx->objects.paths[i])) continue;
+            if (is_entry_point_obj(ctx->objects.paths[i])) {
+                warn_entry_point_hides_symbols(ctx->objects.paths[i]);
+                continue;
+            }
             argv[argc++] = ctx->objects.paths[i];
         }
 
@@ -5088,7 +5135,10 @@ static int build_test_body(NowBuildCtx *ctx, NowResult *result) {
         for (size_t i = 0; i < test_objects.count; i++)
             argv[argc++] = test_objects.paths[i];
         for (size_t i = 0; i < ctx->objects.count; i++) {
-            if (is_entry_point_obj(ctx->objects.paths[i])) continue;
+            if (is_entry_point_obj(ctx->objects.paths[i])) {
+                warn_entry_point_hides_symbols(ctx->objects.paths[i]);
+                continue;
+            }
             argv[argc++] = ctx->objects.paths[i];
         }
 

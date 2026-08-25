@@ -3408,6 +3408,37 @@ scheduler and does not reach the test runner.
 
 ## 8.2 Test Build Model
 
+> **How the entry point is identified (rc10).** The test binary links
+> every production object EXCEPT the one carrying the program's `main`,
+> which would otherwise collide with the test's own.
+>
+> That object used to be identified **by filename** — `main.c.o` and its
+> C++ spellings. So an executable whose entry point lived in `app.c` had
+> its `main` linked beside the test's, and `now test` failed with
+> `multiple definition of 'main'`. A filename is a convention; a symbol
+> table is a fact. `now` now reads the object's symbol table (COFF and
+> ELF64, no external tools) and asks which object actually defines
+> `main`, falling back to the filename only when the object cannot be
+> read — because "cannot tell" and "no" lead to opposite link lines.
+>
+> **A consequence worth knowing before it bites:** excluding that object
+> excludes everything else its translation unit defined. If `main()`
+> shares a file with code under test, the tests cannot see that code,
+> and `now` says so at link time rather than leaving the linker to
+> report an undefined reference to a function the author can see in
+> their own source:
+>
+> ```
+> warning: target/obj/main/app.c.o defines main() and 1 other global symbol(s).
+>          The test binary cannot link that object - it would duplicate
+>          main() - so those symbols are not visible to tests. Move main()
+>          into a translation unit of its own to test the rest.
+> ```
+>
+> Keeping `main()` alone in its own file remains the arrangement that
+> costs nothing.
+
+
 The test binary is linked from:
 
 1. **All production object files** from `target/obj/main/` — the same `.o`

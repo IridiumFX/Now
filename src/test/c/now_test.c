@@ -44,6 +44,7 @@
 #include "now_audit.h"
 #include "now_events.h"
 #include "now_watch.h"
+#include "now_objsym.h"
 #include "now_graph.h"
 #include "pico_h2.h"
 #include "alforno.h"
@@ -6536,6 +6537,192 @@ static void test_workspace_collection_root_needs_no_sources(void) {
     PASS();
 }
 
+
+/* ---- object symbol tables, and the entry point ----
+ *
+ * `now` decided which object held the program's entry point by matching
+ * the filename `main.c.o`. An executable whose entry point lived in
+ * `app.c` therefore linked its own main() into the test binary next to
+ * the test's own, and `now test` died with `multiple definition of
+ * 'main'`. A filename is a convention; a symbol table is a fact.
+ *
+ * These build a real project and read the real objects, because the
+ * thing under test is a parser of what the compiler actually emits.
+ * A hand-built fixture would test my idea of COFF rather than gcc's.
+ */
+
+static void osym_write(const char *path, const char *body) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(body, 1, strlen(body), f);
+    fclose(f);
+}
+
+/* Build a project whose entry point is NOT called main.c, and whose
+ * other translation unit has no entry point at all. Returns 0 on
+ * success and fills the two object paths. */
+static int osym_build(char *entry_obj, char *plain_obj, size_t cap) {
+    char root[512], d[512], p[512];
+    NowResult res;
+    NowProject *prj;
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"osym\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"executable\", name: \"osym\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+
+    snprintf(root, sizeof(root), "%s/osym_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+
+    snprintf(p, sizeof(p), "%s/src/main/c/app.c", root);
+    osym_write(p, "int helper(void) { return 7; }\n"
+                  "int main(void) { return helper() - 7; }\n");
+    snprintf(p, sizeof(p), "%s/src/main/c/plain.c", root);
+    osym_write(p, "int plain_fn(void) { return 3; }\n");
+
+    memset(&res, 0, sizeof(res));
+    prj = now_project_load_string(pasta, strlen(pasta), &res);
+    if (!prj) return -1;
+    if (now_build(prj, root, 0, 0, &res) != 0) { now_project_free(prj); return -1; }
+    now_project_free(prj);
+
+    snprintf(entry_obj, cap, "%s/target/obj/main/app.c.o", root);
+    if (!now_path_exists(entry_obj))
+        snprintf(entry_obj, cap, "%s/target/obj/main/app.c.obj", root);
+    snprintf(plain_obj, cap, "%s/target/obj/main/plain.c.o", root);
+    if (!now_path_exists(plain_obj))
+        snprintf(plain_obj, cap, "%s/target/obj/main/plain.c.obj", root);
+
+    return (now_path_exists(entry_obj) && now_path_exists(plain_obj)) ? 0 : -1;
+}
+
+static void test_objsym_finds_main_regardless_of_filename(void) {
+    char entry[512], plain[512];
+    TEST("objsym: main() is found by symbol, not by filename");
+
+    if (osym_build(entry, plain, sizeof(entry)) != 0) {
+        FAIL("could not build the fixture project");
+        return;
+    }
+    /* app.c.o defines main even though it is not called main.c — this
+     * is the whole bug. */
+    ASSERT_EQ(now_obj_defines_symbol(entry, "main"), 1);
+    /* plain.c.o does not. Without this the test would pass against a
+     * reader that answered 1 for everything. */
+    ASSERT_EQ(now_obj_defines_symbol(plain, "main"), 0);
+    PASS();
+}
+
+/* "Cannot tell" must be its own answer. A caller reading -1 as 0 would
+ * exclude nothing and reproduce the duplicate-main link; reading it as
+ * 1 would exclude a needed object. */
+static void test_objsym_unreadable_is_neither_yes_nor_no(void) {
+    char p[512];
+    TEST("objsym: an unreadable object answers -1, not 0");
+
+    snprintf(p, sizeof(p), "%s/osym_proj/not_an_object.txt", NOW_TEST_RESOURCES);
+    osym_write(p, "this is not an object file, it is a sentence\n");
+    ASSERT_EQ(now_obj_defines_symbol(p, "main"), -1);
+    remove(p);
+
+    snprintf(p, sizeof(p), "%s/osym_proj/does_not_exist.o", NOW_TEST_RESOURCES);
+    ASSERT_EQ(now_obj_defines_symbol(p, "main"), -1);
+    PASS();
+}
+
+/* The diagnostic depends on this count: an entry-point object that
+ * defines nothing else costs tests nothing, and must stay silent. */
+static void test_objsym_counts_what_the_entry_point_hides(void) {
+    char entry[512], plain[512];
+    int others;
+    TEST("objsym: counts the other globals an entry point hides");
+
+    if (osym_build(entry, plain, sizeof(entry)) != 0) {
+        FAIL("could not build the fixture project");
+        return;
+    }
+    /* app.c defines main AND helper, so tests lose helper. */
+    others = now_obj_other_global_count(entry, "main");
+    if (others < 1) { FAIL("expected at least one hidden global"); return; }
+
+    /* And the reader is not simply counting every symbol: a file with
+     * no main still reports its own globals against that name. */
+    if (now_obj_other_global_count(plain, "main") < 1) {
+        FAIL("plain.c.o should report its own globals");
+        return;
+    }
+    PASS();
+}
+
+
+/* THE INTEGRATION TEST, and the reason it exists.
+ *
+ * The three tests above prove `now_obj_defines_symbol` reads a symbol
+ * table correctly. None of them proves the TEST LINK asks it — and when
+ * that wiring was reverted to filename matching, all three still passed.
+ * A negative control found that; the reader was watched and its only
+ * caller was not.
+ *
+ * So this builds and tests a project the old code could not handle:
+ *
+ *   app.c  — main(), and nothing else
+ *   lib.c  — the function under test
+ *   t.c    — the test
+ *
+ * With the entry point found by symbol, app.c.o is excluded from the
+ * test link and the rest links cleanly. With it found by filename,
+ * app.c.o is kept — it is not called main.c — and the link dies on a
+ * duplicate main(). `main()` is alone in its file deliberately: that is
+ * the arrangement where excluding the object costs nothing, so a
+ * failure here is about the entry-point decision and nothing else.
+ */
+static void test_entry_point_wiring_survives_a_renamed_main(void) {
+    char root[512], d[512], p[512];
+    NowResult res;
+    NowProject *prj;
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"entrywire\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"executable\", name: \"entrywire\" },"
+        "  sources: { dir: \"src/main/c\" },"
+        "  tests:   { dir: \"src/test/c\" } }";
+
+    TEST("build: an entry point not called main.c still tests");
+
+    snprintf(root, sizeof(root), "%s/entrywire_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    if (now_path_exists(d)) {
+        FAIL("could not clear target/ - cannot establish the precondition");
+        return;
+    }
+    snprintf(d, sizeof(d), "%s/src", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+    snprintf(d, sizeof(d), "%s/src/test/c", root); now_mkdir_p(d);
+
+    /* main() alone in a file NOT called main.c */
+    snprintf(p, sizeof(p), "%s/src/main/c/app.c", root);
+    osym_write(p, "int thing(void);\nint main(void) { return thing() - 5; }\n");
+    snprintf(p, sizeof(p), "%s/src/main/c/lib.c", root);
+    osym_write(p, "int thing(void) { return 5; }\n");
+    snprintf(p, sizeof(p), "%s/src/test/c/t.c", root);
+    osym_write(p, "int thing(void);\nint main(void) { return thing() == 5 ? 0 : 1; }\n");
+
+    memset(&res, 0, sizeof(res));
+    prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+
+    if (now_test(prj, root, 0, 0, &res) != 0) {
+        now_project_free(prj);
+        FAIL(res.message[0] ? res.message
+                            : "test link failed for a non-main.c entry point");
+        return;
+    }
+    now_project_free(prj);
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -10257,6 +10444,10 @@ int main(void) {
     test_watch_notices_a_file_that_did_not_exist();
     test_workspace_root_builds_its_own_sources();
     test_workspace_collection_root_needs_no_sources();
+    test_objsym_finds_main_regardless_of_filename();
+    test_objsym_unreadable_is_neither_yes_nor_no();
+    test_objsym_counts_what_the_entry_point_hides();
+    test_entry_point_wiring_survives_a_renamed_main();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();
