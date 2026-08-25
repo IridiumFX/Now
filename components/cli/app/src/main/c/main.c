@@ -274,6 +274,11 @@ int main(int argc, char *argv[]) {
     const char *output_fmt = NULL;
     int flag_locked = 0;
     int flag_offline = 0;
+    /* --cflags / --ldflags: the third configuration source, above the
+     * descriptor and above the environment. One string each, split on
+     * whitespace (quotes honoured) by the layer that carries them. */
+    const char *cli_cflags = NULL;
+    const char *cli_ldflags = NULL;
     int flag_no_color = 0;
     int flag_tui = 0;
     const char *target_str = NULL;
@@ -301,6 +306,10 @@ int main(int argc, char *argv[]) {
             flag_locked = 1;
         else if (strcmp(argv[i], "--offline") == 0)
             flag_offline = 1;
+        else if (strcmp(argv[i], "--cflags") == 0 && i + 1 < argc)
+            cli_cflags = argv[++i];
+        else if (strcmp(argv[i], "--ldflags") == 0 && i + 1 < argc)
+            cli_ldflags = argv[++i];
         else if (strcmp(argv[i], "--no-color") == 0)
             flag_no_color = 1;
         else if (strcmp(argv[i], "--tui") == 0)
@@ -341,6 +350,12 @@ int main(int argc, char *argv[]) {
      * --locked`, which the user guide documents, resolved and rewrote
      * the lockfile exactly as if the flag were absent. */
     now_build_set_procure_opts(repo_url, flag_offline, flag_locked);
+
+    /* Alongside the other process-wide settings, and before ANY branch:
+     * every command that loads a project builds a layer stack, and the
+     * first attempt at this sat in the build path only -- so `now tell
+     * config-origin` reported on a stack the build would not have used. */
+    now_layer_set_cli_flags(cli_cflags, cli_ldflags);
 
     /* Handle version and help */
     if (strcmp(phase, "version") == 0 || strcmp(phase, "--version") == 0) {
@@ -415,6 +430,18 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "error: %s\n",
                     tres.message[0] ? tres.message : "no now.pasta here");
             return 1;
+        }
+
+        /* Layers, env and CLI apply here too. `tell` reports on the
+         * build, and a report that omits two of the three
+         * configuration sources describes a build that is not the one
+         * that runs. Measured 2026-08-25: `tell compile-flags` showed
+         * neither CFLAGS nor --cflags while the compiler got both. */
+        {
+            NowAuditReport taudit;
+            now_audit_init(&taudit);
+            now_layer_apply_to_project(tp, cwd, &taudit, &tres);
+            now_audit_free(&taudit);
         }
 
         if (strcmp(phase, "tool:list") == 0) {

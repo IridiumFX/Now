@@ -159,6 +159,50 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   nothing. `docs/status.md` claiming "all tiers complete, zero backlog"
   is not accurate. **Grep the source before telling a downstream team a
   field works.**
+- **Three sources configure a build, in this order.** Lowest priority
+  first, each appended after the last so the compiler's last-flag-wins
+  gives the top of the list the final say:
+
+  ```
+  now-baseline          (claims nothing)
+  .now-layer.pasta ...  (farthest ancestor first)
+  now.pasta             (the descriptor, after workspace inheritance)
+  CFLAGS / LDFLAGS      (the POSIX names, read for compatibility)
+  NOW_CFLAGS / NOW_LDFLAGS
+  --cflags / --ldflags
+  ```
+
+  Env and CLI are implemented as **layers**, which is most of what made
+  wiring the layer stack worth doing: precedence is stack order, the
+  merge rules are the ones already tested, and `tell config-origin`
+  names them without knowing they exist. One layer per VARIABLE, not
+  one per tier -- a value from `LDFLAGS` reported as coming from
+  `CFLAGS` sends someone to unset the wrong thing.
+
+  Reading bare `CFLAGS` is a deliberate risk: a shell that has had it
+  exported for something else quietly affects a `now` build. The
+  mitigation is not that it cannot happen, it is that the answer is one
+  command away:
+
+  ```
+  now tell config-origin
+  now tell config-origin compile.flags
+  ```
+
+  Flag strings split on whitespace **honouring double quotes**, because
+  `-I"C:\Program Files\x\include"` is an ordinary include path on this
+  machine and splitting it on spaces yields three flags, none of which
+  is a directory -- which the compiler then reports as a missing header
+  rather than as a broken flag.
+
+  `now_layer_set_cli_flags()` is called once from `main.c` alongside the
+  other process-wide settings and **before any branch**. The first
+  attempt put it in the build path only, so `tell config-origin`
+  reported on a stack the build would not have used. For the same
+  reason `tell` applies layers to its own project: a report that omits
+  two of the three sources describes a build that is not the one that
+  runs.
+
 - **`.now-layer.pasta` reaches the build, and the gate is the point.**
   §25 cascading layers configured a report and nothing else until
   2026-08-25 -- `now_layer_merge_section()` had two callers and both

@@ -29,6 +29,10 @@ src/test/resources/layer_locked/
 src/test/resources/origin_arr/
 src/test/resources/origin_scalar/
 src/test/resources/origin_none/
+src/test/resources/envcli_order/
+src/test/resources/envcli_gate/
+src/test/resources/envcli_origin/
+src/test/resources/envcli_quote/
 src/test/resources/entrywire_proj/
 src/test/resources/osym_proj/
 src/test/resources/pattern_proj/
