@@ -7,6 +7,7 @@
 #include "now_workspace.h"
 #include "now_fs.h"
 #include "now_build.h"
+#include "now_lang.h"  /* now_lang_source_exts - what counts as a source */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -565,6 +566,32 @@ NOW_API int now_workspace_topo_sort(NowWorkspace *ws,
 
 /* ---- Build all modules in order ---- */
 
+/* Does the workspace root have sources of its own?
+ *
+ * The loader DEFAULTS `sources.dir` to a language-aware path, so the
+ * field being set says nothing — an aggregate root that never wrote
+ * `sources:` still has `src/main/c` in its descriptor. The only honest
+ * question is whether that directory actually holds anything the build
+ * would compile, so it is asked by walking, the same way the build
+ * itself decides. */
+static int ws_root_has_sources(const NowProject *p, const char *basedir) {
+    const char **exts;
+    NowFileList fl;
+    int n = 0;
+
+    if (!p || !p->sources.dir) return 0;
+    exts = now_lang_source_exts((const char *const *)p->langs.items,
+                                 p->langs.count);
+    if (!exts) return 0;
+
+    now_filelist_init(&fl);
+    if (now_discover_sources(basedir, p->sources.dir, exts, &fl) == 0)
+        n = (int)fl.count;
+    now_filelist_free(&fl);
+    free((void *)exts);
+    return n > 0;
+}
+
 NOW_API int now_workspace_build(NowWorkspace *ws, int verbose, int jobs,
                                  NowResult *result) {
     int **waves = NULL;
@@ -610,7 +637,31 @@ NOW_API int now_workspace_build(NowWorkspace *ws, int verbose, int jobs,
         }
     }
 
+    /* The root's OWN sources, after its modules.
+     *
+     * A root with `modules:` used to build them and drop its own
+     * sources without a word — including the `output:` it declared,
+     * which was never produced and never mentioned. Children first,
+     * because the root's sources are the ones likely to use them. */
+    if (rc == 0 && ws_root_has_sources(ws->root, ws->root_dir)) {
+        if (verbose)
+            fprintf(stderr, "\n  building workspace root's own sources\n");
+        rc = now_build(ws->root, ws->root_dir, verbose, jobs, result);
+        if (rc != 0 && result && result->code == NOW_OK) {
+            result->code = NOW_ERR_TOOL;
+            snprintf(result->message, sizeof(result->message),
+                     "workspace root build failed");
+        }
+    }
+
     /* Free wave arrays */
+    /* And the root's own tests, for the same reason: a root with
+     * sources has tests, and they were never run either. */
+    if (rc == 0 && ws_root_has_sources(ws->root, ws->root_dir)) {
+        int trc = now_test(ws->root, ws->root_dir, verbose, jobs, result);
+        if (trc != 0) rc = trc;
+    }
+
     for (size_t i = 0; i < ws->module_count; i++)
         free(waves[i]);
     free(waves);

@@ -370,6 +370,30 @@ registry. Full plugin manifest and protocol specification in Chapter 10.
 
 ---
 
+> **A workspace root with its own sources builds them too (rc10).**
+> Until 2026-08-25 it did not: `now_is_workspace()` is
+> `modules.count > 0`, and that single boolean decided two unrelated
+> questions — *does this project have children* and *does it build
+> itself*. A root declaring `output:` alongside `modules:` produced its
+> children and silently discarded its own sources and its own declared
+> artifact, with exit code 0.
+>
+> The two shapes the tree can now distinguish without anything being
+> declared:
+>
+> | own sources | children | is a |
+> |---|---|---|
+> | yes | yes | **grouping module** — both are built, children first |
+> | no | yes | **collection** — the children are independent |
+>
+> Children are built before the root, because the root's sources are the
+> ones likely to use them, and that is the order the topological sort
+> already establishes for everything else.
+>
+> Whether a grouping module's children should be *linked into* it rather
+> than merely built before it is a separate question, and `components:`
+> already answers it explicitly for anyone who wants aggregation today.
+
 ## 1.11 Workspace Fields
 
 These fields are only meaningful in a workspace root `now.pasta`:

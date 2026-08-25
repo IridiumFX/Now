@@ -2564,6 +2564,22 @@ static void test_build_archive_drops_a_removed_source(void) {
     char root[512], d[512], p[512], lib[512];
     snprintf(root, sizeof(root), "%s/stale_obj_proj", NOW_TEST_RESOURCES);
     snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    /* BEST EFFORT is not good enough here, and this test is why.
+     *
+     * It asserts that a removed source's object leaves the archive. If
+     * the setup could not delete target/ - on Windows a lingering handle
+     * from a previous build is enough - the archive it inspects is the
+     * PREVIOUS run's, and the assertion fails for a reason that has
+     * nothing to do with the code under test. Seen intermittently on
+     * 2026-08-24 and 2026-08-25, passing 3/3 on re-run each time.
+     *
+     * A setup that cannot establish its precondition must say so, rather
+     * than let the assertion misreport it as a defect in the build. */
+    if (now_path_exists(d)) {
+        FAIL("could not remove target/ - a previous build still holds it "
+             "open; this run cannot establish its precondition");
+        return;
+    }
     snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
     snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
 
@@ -6351,6 +6367,175 @@ static void test_watch_notices_a_file_that_did_not_exist(void) {
     PASS();
 }
 
+
+/* ---- a workspace root that has sources of its own ----
+ *
+ * `now_is_workspace()` is `modules.count > 0`, and that one boolean was
+ * deciding two unrelated questions: does this project have children, and
+ * does it build itself. So a root with BOTH `modules:` and `src/main/c`
+ * built its children and discarded its own sources — including the
+ * `output:` it declared, which was never produced and never mentioned,
+ * with exit code 0.
+ *
+ * The two cases below are the two the tree can distinguish without a
+ * descriptor saying anything:
+ *
+ *   sources + children -> a GROUPING module: build both
+ *   children only      -> a COLLECTION:      build the children
+ *
+ * The second is what worked before, so it is here as the control on the
+ * first: a fix that made every root build itself would break aggregate
+ * roots, and this is what would catch it.
+ */
+
+static void grp_write(const char *path, const char *body) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(body, 1, strlen(body), f);
+    fclose(f);
+}
+
+/* Build a two-level workspace under target/. `root_src` NULL means the
+ * root has no sources of its own — the collection case. */
+static NowProject *grp_setup(const char *dir, const char *root_src) {
+    char p[512];
+    NowResult r;
+
+    /* Remove the whole tree first, and MEAN it.
+     *
+     * The first version of this test did not, and its negative control
+     * came back green: disabling the fix left the previous run's
+     * libgrproot.a on disk, grp_built() found it, and the test passed
+     * while watching nothing. A test that passes on last run's artifacts
+     * is not testing this run - the same trap the stale_obj_proj setup
+     * carries, found here by the control rather than by luck. */
+    rmtree_best_effort(dir);
+
+    snprintf(p, sizeof(p), "%s/child/src/main/c", dir);
+    now_mkdir_p(p);
+
+    snprintf(p, sizeof(p), "%s/now.pasta", dir);
+    grp_write(p,
+        "{ group: \"org.t\", artifact: \"root\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"grproot\" },"
+        "  modules: [\"child\"] }");
+
+    snprintf(p, sizeof(p), "%s/child/now.pasta", dir);
+    grp_write(p,
+        "{ group: \"org.t\", artifact: \"child\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"grpchild\" } }");
+
+    snprintf(p, sizeof(p), "%s/child/src/main/c/child.c", dir);
+    grp_write(p, "int child_fn(void) { return 2; }\n");
+
+    if (root_src) {
+        snprintf(p, sizeof(p), "%s/src/main/c", dir);
+        now_mkdir_p(p);
+        snprintf(p, sizeof(p), "%s/src/main/c/root.c", dir);
+        grp_write(p, root_src);
+    }
+
+    snprintf(p, sizeof(p), "%s/now.pasta", dir);
+    memset(&r, 0, sizeof(r));
+    return now_project_load(p, &r);
+}
+
+static int grp_built(const char *dir, const char *name) {
+    char p[512];
+    snprintf(p, sizeof(p), "%s/target/bin/lib%s.a", dir, name);
+    if (now_path_exists(p)) return 1;
+    snprintf(p, sizeof(p), "%s/target/bin/%s.lib", dir, name);
+    return now_path_exists(p);
+}
+
+/* THE BUG. A root declaring an output and holding sources produced
+ * neither, and said nothing. */
+static void test_workspace_root_builds_its_own_sources(void) {
+    NowProject *p;
+    NowWorkspace ws;
+    NowResult r;
+
+    TEST("workspace: a root with sources builds them too");
+
+    p = grp_setup("target/grp", "int root_fn(void) { return 1; }\n");
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(now_is_workspace(p), 1);
+
+    /* Precondition, asserted rather than assumed: nothing is built yet.
+     * Without this the postcondition can be satisfied by a leftover. */
+    if (grp_built("target/grp", "grproot") ||
+        grp_built("target/grp/child", "grpchild")) {
+        now_project_free(p);
+        FAIL("setup left artifacts behind - this run cannot prove anything");
+        return;
+    }
+
+    memset(&r, 0, sizeof(r));
+    memset(&ws, 0, sizeof(ws));
+    if (now_workspace_init(&ws, p, "target/grp", &r) != 0) {
+        now_project_free(p); FAIL("workspace init failed"); return;
+    }
+    if (now_workspace_build(&ws, 0, 2, &r) != 0) {
+        now_workspace_free(&ws); now_project_free(p);
+        FAIL(r.message[0] ? r.message : "workspace build failed");
+        return;
+    }
+    now_workspace_free(&ws);
+
+    if (!grp_built("target/grp/child", "grpchild")) {
+        now_project_free(p); FAIL("the module was not built"); return;
+    }
+    /* The one that used to be missing. */
+    if (!grp_built("target/grp", "grproot")) {
+        now_project_free(p);
+        FAIL("the root's own declared output was not produced");
+        return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
+/* THE CONTROL, and it is a real one: a root with no sources of its own
+ * must still work. A fix that simply always built the root would fail
+ * here with "no source files found", and that shape — a collection of
+ * modules with nothing at the top — is how most workspaces are written. */
+static void test_workspace_collection_root_needs_no_sources(void) {
+    NowProject *p;
+    NowWorkspace ws;
+    NowResult r;
+
+    TEST("workspace: a root with no sources is still fine");
+
+    p = grp_setup("target/grpc", NULL);
+    ASSERT_NOT_NULL(p);
+
+    if (grp_built("target/grpc/child", "grpchild")) {
+        now_project_free(p);
+        FAIL("setup left artifacts behind - this run cannot prove anything");
+        return;
+    }
+
+    memset(&r, 0, sizeof(r));
+    memset(&ws, 0, sizeof(ws));
+    if (now_workspace_init(&ws, p, "target/grpc", &r) != 0) {
+        now_project_free(p); FAIL("workspace init failed"); return;
+    }
+    if (now_workspace_build(&ws, 0, 2, &r) != 0) {
+        now_workspace_free(&ws); now_project_free(p);
+        FAIL(r.message[0] ? r.message : "collection build failed");
+        return;
+    }
+    now_workspace_free(&ws);
+
+    if (!grp_built("target/grpc/child", "grpchild")) {
+        now_project_free(p); FAIL("the module was not built"); return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -10070,6 +10255,8 @@ int main(void) {
     test_watch_asks_the_registry_for_extensions();
     test_watch_snapshot_sees_a_go_source();
     test_watch_notices_a_file_that_did_not_exist();
+    test_workspace_root_builds_its_own_sources();
+    test_workspace_collection_root_needs_no_sources();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();
