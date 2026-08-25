@@ -197,6 +197,33 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   values -- a locked section that broke builds instead of governing
   them would just get deleted.
 
+- **OPEN: `build: a source that goes away leaves the archive` fails
+  about 2 runs in 10.** Not a fixture problem and not the archive
+  rebuild -- both were investigated and ruled out on 2026-08-25:
+
+  - The test's preconditions are now all checked. `target/` removal was
+    already guarded; `remove(mover.c)` is guarded now too. Neither guard
+    fires on a failing run, so the source really is gone.
+  - `now_build.c` deletes the `.a` before `ar rcs` (an `ar r` inserts
+    and replaces, leaving other members alone -- Amy hit that with a
+    `git mv` on 2026-08-21). That delete is now checked too, and the
+    check does not fire either.
+
+  What is left: on a failing run `mover.c.o` is still in `ctx->objects`,
+  so the link-flags hash matches, the link is skipped as up to date, and
+  build 1's archive survives intact. The object list is built from the
+  source walk, which means the walk saw a file that had already been
+  deleted -- a stale directory enumeration, which Windows does allow
+  briefly after a delete. Not yet confirmed.
+
+  Next step: log `ctx->objects` on the second build of that fixture and
+  run until it fails. If `mover.c.o` is present, the walk is the culprit
+  and the fix belongs in `now_dirwalk.c`, not in the link decision.
+
+  This predates the layer wiring (the fixture uses
+  `now_project_load_string`, which never reaches
+  `now_layer_apply_to_project`) and is unrelated to it.
+
 - **Descriptor key diagnostics.** `warn_descriptor_keys()` in
   `now_pom.c` warns on unknown keys and, separately, on recognized-but-
   unimplemented ones. Silent acceptance is what let a correct
