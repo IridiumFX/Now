@@ -5401,6 +5401,188 @@ done:
     now_config_origins_free(&og);
 }
 
+/* ---- the environment and the command line -------------------------
+ *
+ * The third and fourth configuration sources. They are layers, so what
+ * these check is not the merge (already covered) but the three things
+ * specific to them: that the precedence order is the documented one,
+ * that a value can say which of them it came from, and that a quoted
+ * path survives the split.
+ *
+ * `setenv` is not portable to MSVC's CRT, so these use _putenv_s on
+ * Windows and setenv elsewhere, both wrapped.
+ */
+static void env_set(const char *k, const char *v) {
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
+
+static void env_clear_flag_vars(void) {
+    env_set("CFLAGS", NULL);
+    env_set("LDFLAGS", NULL);
+    env_set("NOW_CFLAGS", NULL);
+    env_set("NOW_LDFLAGS", NULL);
+    now_layer_set_cli_flags(NULL, NULL);
+}
+
+/* Order is the whole contract: gcc takes the last flag, so the source
+ * that appears last is the source that wins. Documented as
+ * descriptor -> CFLAGS -> NOW_CFLAGS -> --cflags. */
+static void test_envcli_precedence_is_the_documented_order(void) {
+    char dir[512];
+    NowProject *p;
+    NowAuditReport audit;
+    int i_env = -1, i_now = -1, i_cli = -1, i_proj = -1;
+    size_t i;
+
+    TEST("env/cli: flags arrive in descriptor, CFLAGS, NOW_CFLAGS, --cflags order");
+
+    env_clear_flag_vars();
+    p = layer_fixture_ex(dir, sizeof(dir), "envcli_order",
+                         "{ flags: [\"-DPROJ\"] }", NULL);
+    ASSERT_NOT_NULL(p);
+
+    env_set("CFLAGS", "-DENV");
+    env_set("NOW_CFLAGS", "-DNOWENV");
+    now_layer_set_cli_flags("-DCLI", NULL);
+
+    now_audit_init(&audit);
+    ASSERT_EQ(now_layer_apply_to_project(p, dir, &audit, NULL), 0);
+    now_audit_free(&audit);
+
+    for (i = 0; i < p->compile.flags.count; i++) {
+        const char *f = p->compile.flags.items[i];
+        if (strcmp(f, "-DPROJ")   == 0) i_proj = (int)i;
+        if (strcmp(f, "-DENV")    == 0) i_env  = (int)i;
+        if (strcmp(f, "-DNOWENV") == 0) i_now  = (int)i;
+        if (strcmp(f, "-DCLI")    == 0) i_cli  = (int)i;
+    }
+    env_clear_flag_vars();
+
+    if (i_proj < 0 || i_env < 0 || i_now < 0 || i_cli < 0) {
+        FAIL("a configuration source did not reach compile.flags at all");
+        now_project_free(p);
+        return;
+    }
+    if (!(i_proj < i_env && i_env < i_now && i_now < i_cli)) {
+        FAIL("the sources are not in precedence order on the compile line");
+        now_project_free(p);
+        return;
+    }
+    now_project_free(p);
+    PASS();
+}
+
+/* The gate covers all three sources, not just the layer file. With none
+ * of them present the project must come through untouched -- this is
+ * what keeps every existing descriptor on the machine building as it
+ * did before any of this landed. */
+static void test_envcli_gate_covers_env_and_cli_too(void) {
+    char dir[512];
+    NowProject *p;
+    NowAuditReport audit;
+
+    TEST("env/cli: no layer, no env, no flag means no change");
+
+    env_clear_flag_vars();
+    p = layer_fixture(dir, sizeof(dir), "envcli_gate", NULL);
+    ASSERT_NOT_NULL(p);
+
+    now_audit_init(&audit);
+    ASSERT_EQ(now_layer_apply_to_project(p, dir, &audit, NULL), 0);
+    now_audit_free(&audit);
+
+    ASSERT_EQ((int)p->compile.defines.count, 1);
+    ASSERT_EQ(layer_has_define(p, "FROM_PROJECT"), 1);
+    ASSERT_EQ((int)p->compile.flags.count, 0);
+    now_project_free(p);
+    PASS();
+}
+
+/* One layer per VARIABLE. A value from LDFLAGS reported as coming from
+ * CFLAGS sends someone to unset the wrong thing, and the whole reason
+ * plain CFLAGS is read at all is that the origin is one command away. */
+static void test_envcli_origin_names_the_variable(void) {
+    char dir[512];
+    NowProject *p;
+    NowConfigOrigins og;
+    const NowConfigOrigin *e;
+
+    TEST("env/cli: a value names the variable it came from");
+
+    env_clear_flag_vars();
+    p = layer_fixture_ex(dir, sizeof(dir), "envcli_origin", NULL, NULL);
+    ASSERT_NOT_NULL(p);
+    now_project_free(p);
+
+    env_set("CFLAGS", "-DFROM_CFLAGS");
+    env_set("LDFLAGS", "-lfromldflags");
+    now_layer_set_cli_flags("-DFROM_CLI", NULL);
+
+    ASSERT_EQ(now_layer_collect_origins(&og, dir, NULL), 0);
+    env_clear_flag_vars();
+
+    e = origin_find(&og, "flags", "-DFROM_CFLAGS");
+    if (!e) { FAIL("CFLAGS did not reach the merged config"); goto done; }
+    ASSERT_STR(e->origin, "CFLAGS");
+
+    e = origin_find(&og, "flags", "-lfromldflags");
+    if (!e) { FAIL("LDFLAGS did not reach the merged config"); goto done; }
+    /* Not "CFLAGS" -- one layer per variable is the point. */
+    ASSERT_STR(e->origin, "LDFLAGS");
+
+    e = origin_find(&og, "flags", "-DFROM_CLI");
+    if (!e) { FAIL("--cflags did not reach the merged config"); goto done; }
+    ASSERT_STR(e->origin, "--cflags");
+
+    now_config_origins_free(&og);
+    PASS();
+    return;
+done:
+    now_config_origins_free(&og);
+}
+
+/* A quoted path with a space is one flag. `-IC:\Program Files\...` is an
+ * ordinary include path here, and splitting it on whitespace yields
+ * three flags, none of which is a directory -- which the compiler then
+ * reports as a missing header rather than as a broken flag. */
+static void test_envcli_a_quoted_path_stays_one_flag(void) {
+    char dir[512];
+    NowProject *p;
+    NowAuditReport audit;
+    int found = 0;
+    size_t i;
+
+    TEST("env/cli: a quoted path with a space stays one flag");
+
+    env_clear_flag_vars();
+    p = layer_fixture_ex(dir, sizeof(dir), "envcli_quote", NULL, NULL);
+    ASSERT_NOT_NULL(p);
+
+    now_layer_set_cli_flags("-I\"C:\\Program Files\\x\\include\" -DQ", NULL);
+    now_audit_init(&audit);
+    ASSERT_EQ(now_layer_apply_to_project(p, dir, &audit, NULL), 0);
+    now_audit_free(&audit);
+    env_clear_flag_vars();
+
+    for (i = 0; i < p->compile.flags.count; i++)
+        if (strcmp(p->compile.flags.items[i],
+                   "-IC:\\Program Files\\x\\include") == 0) found = 1;
+
+    if (!found) {
+        FAIL("the quoted include path was split on its spaces");
+        now_project_free(p);
+        return;
+    }
+    /* And the flag after it still parsed as its own flag. */
+    ASSERT_EQ((int)p->compile.flags.count, 2);
+    now_project_free(p);
+    PASS();
+}
+
 static void test_layer_merge_strarray_exclude(void) {
     TEST("layers: !exclude: removes entries in open mode");
     NowStrArray dst;
@@ -10846,6 +11028,10 @@ int main(void) {
     test_origin_credits_the_layer_that_introduced_a_define();
     test_origin_credits_the_winner_of_a_scalar();
     test_origin_answers_without_any_layer_file();
+    test_envcli_precedence_is_the_documented_order();
+    test_envcli_gate_covers_env_and_cli_too();
+    test_envcli_origin_names_the_variable();
+    test_envcli_a_quoted_path_stays_one_flag();
     test_layer_audit_format();
     test_layer_push_project();
 

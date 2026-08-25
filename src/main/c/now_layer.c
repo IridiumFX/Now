@@ -748,6 +748,129 @@ NOW_API void *now_layer_merge_section(const NowLayerStack *stack,
     return effective;
 }
 
+/* ---- the environment and the command line --------------------------
+ *
+ * Three sources feed a build and these are the last two. They are pushed
+ * as LAYERS rather than merged by hand, which is most of the reason the
+ * layer stack was worth wiring up: precedence is stack order, the merge
+ * rules are the ones already tested, and `now tell config-origin` names
+ * them without knowing they exist.
+ *
+ * Order, lowest priority first:
+ *
+ *     now-baseline                 (claims nothing)
+ *     .now-layer.pasta ...         (farthest first)
+ *     project                      (the descriptor)
+ *     CFLAGS / LDFLAGS             (the POSIX names, if exported)
+ *     NOW_CFLAGS / NOW_LDFLAGS
+ *     --cflags / --ldflags
+ *
+ * One layer per VARIABLE, not one per tier: a value that came from
+ * LDFLAGS must not be reported as coming from CFLAGS, and the layer id
+ * is what `config-origin` prints. Compile and link never interact, so
+ * their relative order in the stack does not matter -- only that each
+ * NOW_ name outranks its bare name, and the flag outranks both.
+ *
+ * Reading plain `CFLAGS` is a deliberate compatibility choice and a
+ * deliberate risk: a shell that has had it exported for something else
+ * will quietly affect a `now` build. That is exactly why every value
+ * can name its source -- the mitigation is that the answer is one
+ * command away, not that the case cannot arise.
+ */
+
+/* Split a flag string on whitespace, honouring double quotes.
+ *
+ * Quotes are not decoration: `-IC:\Program Files\x\include` is an
+ * ordinary include path on this machine, and splitting it on spaces
+ * yields three flags, none of which is a directory. */
+static void split_flags(NowStrArray *dst, const char *s) {
+    const char *p = s;
+    char buf[4096];
+    size_t n = 0;
+    int in_quote = 0;
+
+    if (!s) return;
+    for (;;) {
+        char c = *p;
+        if (c == '"') { in_quote = !in_quote; p++; continue; }
+        if (c == '\0' || (!in_quote && (c == ' ' || c == '\t'))) {
+            if (n > 0) { buf[n] = '\0'; now_strarray_push(dst, buf); n = 0; }
+            if (c == '\0') break;
+            p++;
+            continue;
+        }
+        if (n + 1 < sizeof(buf)) buf[n++] = c;
+        p++;
+    }
+}
+
+/* One layer carrying one variable's flags into one section.
+ * Returns 1 if a layer was pushed, 0 if there was nothing to say. */
+static int push_flag_layer(NowLayerStack *stack, const char *id,
+                           const char *section, const char *flags) {
+    NowStrArray a;
+    PastaValue *root, *sec, *arr;
+    int idx;
+    size_t i;
+
+    if (!flags || !*flags) return 0;
+
+    now_strarray_init(&a);
+    split_flags(&a, flags);
+    if (a.count == 0) { now_strarray_free(&a); return 0; }
+
+    idx = stack_push_layer(stack);
+    if (idx < 0) { now_strarray_free(&a); return 0; }
+
+    arr = pasta_new_array();
+    for (i = 0; i < a.count; i++)
+        pasta_push(arr, pasta_new_string(a.items[i]));
+    now_strarray_free(&a);
+
+    sec  = pasta_new_map();
+    pasta_set(sec, "flags", arr);
+    root = pasta_new_map();
+    pasta_set(root, section, sec);
+
+    stack->layers[idx].id = strdup(id);
+    /* Not NOW_LAYER_FILE: these have no path, and the gate asks "was a
+     * layer file found" by looking at exactly that. */
+    stack->layers[idx].source = NOW_LAYER_BUILTIN;
+    stack->layers[idx]._root  = root;
+    layer_add_section(&stack->layers[idx], section,
+                      NOW_POLICY_OPEN, NULL, NULL, sec);
+    return 1;
+}
+
+/* Command-line flags, set once by the CLI before anything builds.
+ *
+ * A static rather than a parameter because a workspace builds its
+ * modules through now_workspace.c, which has no argv and should not
+ * grow one to carry a flag through. `--cflags` means "this
+ * invocation", and an invocation is exactly what a process is. */
+static char *g_cli_cflags  = NULL;
+static char *g_cli_ldflags = NULL;
+
+NOW_API void now_layer_set_cli_flags(const char *cflags, const char *ldflags) {
+    free(g_cli_cflags);
+    free(g_cli_ldflags);
+    g_cli_cflags  = cflags  ? strdup(cflags)  : NULL;
+    g_cli_ldflags = ldflags ? strdup(ldflags) : NULL;
+}
+
+/* Push the env and CLI layers. Returns how many were pushed, so the
+ * gate can ask whether anything at all wants to change this build. */
+static int push_env_and_cli_layers(NowLayerStack *stack) {
+    int n = 0;
+    n += push_flag_layer(stack, "CFLAGS",      "compile", getenv("CFLAGS"));
+    n += push_flag_layer(stack, "LDFLAGS",     "link",    getenv("LDFLAGS"));
+    n += push_flag_layer(stack, "NOW_CFLAGS",  "compile", getenv("NOW_CFLAGS"));
+    n += push_flag_layer(stack, "NOW_LDFLAGS", "link",    getenv("NOW_LDFLAGS"));
+    n += push_flag_layer(stack, "--cflags",    "compile", g_cli_cflags);
+    n += push_flag_layer(stack, "--ldflags",   "link",    g_cli_ldflags);
+    return n;
+}
+
 /* Print locked-section violations, if any, and say how many there were.
  *
  * Returns the violation count so a caller can decide policy: a build
@@ -829,6 +952,7 @@ NOW_API int now_layer_apply_to_project(NowProject *p, const char *basedir,
     PastaValue *eff;
     size_t i;
     int have_file_layer = 0;
+    int have_flag_layer = 0;
 
     if (!p || !basedir) return -1;
 
@@ -842,12 +966,18 @@ NOW_API int now_layer_apply_to_project(NowProject *p, const char *basedir,
     for (i = 0; i < stack.count; i++) {
         if (stack.layers[i].source == NOW_LAYER_FILE) { have_file_layer = 1; break; }
     }
-    if (!have_file_layer) {
+
+    now_layer_push_project(&stack, p);
+
+    /* Env and CLI sit above the descriptor. The gate covers all three
+     * sources now: with no layer file, no CFLAGS/LDFLAGS in the
+     * environment and no --cflags, nothing wants to change this build
+     * and it is left exactly as it was. */
+    have_flag_layer = push_env_and_cli_layers(&stack);
+    if (!have_file_layer && !have_flag_layer) {
         now_layer_stack_free(&stack);
         return 0;
     }
-
-    now_layer_push_project(&stack, p);
 
     /* compile: the merged section already contains the project's own
      * values -- it is the top layer -- so this replaces rather than
@@ -1046,6 +1176,9 @@ NOW_API int now_layer_collect_origins(NowConfigOrigins *dst,
     now_layer_stack_init(&stack);
     now_layer_discover(&stack, basedir, result);
     now_layer_push_project(&stack, raw);
+    /* Same stack the build sees, or this reports on a different build
+     * than the one that ran. */
+    push_env_and_cli_layers(&stack);
 
     now_audit_init(&audit);
     collect_section(dst, &stack, "compile", compile_arr, compile_sca, &audit);

@@ -134,6 +134,12 @@ NOW_API int now_layer_apply_to_project(NowProject *p, const char *basedir,
                                        NowAuditReport *audit,
                                        NowResult *result);
 
+/* Flags from this invocation's command line, applied above the
+ * descriptor and above the environment. Set once by the CLI before any
+ * build runs; a workspace's modules pick them up without the workspace
+ * code having to carry them. Pass NULL for either to clear it. */
+NOW_API void now_layer_set_cli_flags(const char *cflags, const char *ldflags);
+
 /* ---- Where a resolved value came from ---- */
 
 /* One resolved configuration value and the layer it came from.
