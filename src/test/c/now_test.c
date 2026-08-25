@@ -5032,6 +5032,201 @@ static void test_layer_merge_locked_audit(void) {
     PASS();
 }
 
+/* ---- layers reach the compile line --------------------------------
+ *
+ * §25 cascading layers was a complete subsystem that configured a
+ * report: `now_layer_merge_section()` had two callers and both were
+ * the `layers:*` commands, so a `.now-layer.pasta` showed up in
+ * `layers:show --effective` and never touched a build. Measured
+ * 2026-08-25 before the wiring: a layer carrying
+ * `compile: { defines: [X] }` displayed correctly and the build then
+ * failed on a source that required X.
+ *
+ * These test `now_layer_apply_to_project()`, which is the seam. The
+ * two that matter most are the gate (a project with no layer file must
+ * be untouched) and the baseline (which used to claim compile defaults
+ * `now` does not have, and would have handed them to every project on
+ * the machine the moment layers fed a build).
+ */
+
+static void layer_write(const char *path, const char *body) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fputs(body, f);
+    fclose(f);
+}
+
+/* A project directory with a descriptor, and optionally a layer file.
+ * Returns the loaded project, or NULL. */
+static NowProject *layer_fixture(char *dir_out, size_t dir_cap,
+                                 const char *name, const char *layer_body) {
+    char desc[512];
+    NowResult res;
+
+    snprintf(dir_out, dir_cap, "%s/%s", NOW_TEST_RESOURCES, name);
+    rmtree_best_effort(dir_out);
+    now_mkdir_p(dir_out);
+
+    snprintf(desc, sizeof(desc), "%s/now.pasta", dir_out);
+    layer_write(desc,
+        "{ group: \"org.t\", artifact: \"lfix\", version: \"1.0.0\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"executable\", name: \"lfix\" },"
+        "  sources: { dir: \"src/main/c\" },"
+        "  compile: { defines: [\"FROM_PROJECT\"] } }");
+
+    {
+        char lp[512];
+        snprintf(lp, sizeof(lp), "%s/.now-layer.pasta", dir_out);
+        if (layer_body) {
+            layer_write(lp, layer_body);
+        } else if (now_path_exists(lp)) {
+            /* rmtree_best_effort is best-effort, and on Windows a lock
+             * makes it a silent no-op. A leftover layer file here would
+             * make the no-layer test assert against the previous run,
+             * which is the failure mode this whole exercise keeps
+             * finding. Remove it, and if that fails, say so. */
+            remove(lp);
+            if (now_path_exists(lp)) return NULL;
+        }
+    }
+
+    memset(&res, 0, sizeof(res));
+    return now_project_load(desc, &res);
+}
+
+static int layer_has_define(const NowProject *p, const char *want) {
+    size_t i;
+    for (i = 0; i < p->compile.defines.count; i++)
+        if (strcmp(p->compile.defines.items[i], want) == 0) return 1;
+    return 0;
+}
+
+/* THE GATE. A project with no .now-layer.pasta anywhere above it must
+ * come out of this exactly as it went in. Not equivalently -- the same
+ * defines, and no acquired opt level. The built-in baseline used to
+ * declare `warnings: [Wall, Wextra]` and `opt: debug`, none of which
+ * now_build.c applies on its own, so wiring layers in without this
+ * would have changed the compile line of every project in the
+ * ecosystem. */
+static void test_layers_a_project_without_one_is_untouched(void) {
+    char dir[512];
+    NowProject *p;
+    NowAuditReport audit;
+
+    TEST("layers: a project with no layer file is untouched");
+
+    p = layer_fixture(dir, sizeof(dir), "layer_none", NULL);
+    ASSERT_NOT_NULL(p);
+
+    now_audit_init(&audit);
+    ASSERT_EQ(now_layer_apply_to_project(p, dir, &audit, NULL), 0);
+
+    ASSERT_EQ((int)p->compile.defines.count, 1);
+    ASSERT_EQ(layer_has_define(p, "FROM_PROJECT"), 1);
+    /* The baseline's phantom defaults must not have arrived. */
+    ASSERT_EQ((int)p->compile.warnings.count, 0);
+    if (p->compile.opt) { FAIL("acquired an opt level nobody asked for"); }
+    else {
+        now_audit_free(&audit);
+        now_project_free(p);
+        PASS();
+        return;
+    }
+    now_audit_free(&audit);
+    now_project_free(p);
+}
+
+static void test_layers_an_open_layer_reaches_compile(void) {
+    char dir[512];
+    NowProject *p;
+    NowAuditReport audit;
+
+    TEST("layers: an open layer's define reaches compile config");
+
+    p = layer_fixture(dir, sizeof(dir), "layer_open",
+                      "{ compile: { defines: [\"FROM_LAYER\"] } }");
+    ASSERT_NOT_NULL(p);
+
+    now_audit_init(&audit);
+    ASSERT_EQ(now_layer_apply_to_project(p, dir, &audit, NULL), 0);
+
+    /* Both: the layer's, and the project's own. A merge that dropped
+     * either would be a different bug with the same symptom. */
+    ASSERT_EQ(layer_has_define(p, "FROM_LAYER"), 1);
+    ASSERT_EQ(layer_has_define(p, "FROM_PROJECT"), 1);
+    /* Open policy, so no violations. */
+    ASSERT_EQ((int)audit.count, 0);
+
+    now_audit_free(&audit);
+    now_project_free(p);
+    PASS();
+}
+
+/* Locked means additive: a lower layer may add, but the project cannot
+ * remove or replace, and every attempt is recorded. Both values must
+ * survive -- a "locked" section that silently discarded the project's
+ * own defines would break builds rather than govern them. */
+static void test_layers_locked_is_additive_and_audited(void) {
+    char dir[512];
+    NowProject *p;
+    NowAuditReport audit;
+
+    TEST("layers: a locked section accumulates and records the override");
+
+    p = layer_fixture(dir, sizeof(dir), "layer_locked",
+                      "{ compile: { _policy: \"locked\","
+                      "             defines: [\"FROM_ORG\"] } }");
+    ASSERT_NOT_NULL(p);
+
+    now_audit_init(&audit);
+    ASSERT_EQ(now_layer_apply_to_project(p, dir, &audit, NULL), 0);
+
+    ASSERT_EQ(layer_has_define(p, "FROM_ORG"), 1);
+    ASSERT_EQ(layer_has_define(p, "FROM_PROJECT"), 1);
+
+    /* And the override was not silent. A locked section nobody is told
+     * about is decorative. */
+    if (audit.count == 0) {
+        FAIL("a locked section was overridden with no violation recorded");
+        now_audit_free(&audit);
+        now_project_free(p);
+        return;
+    }
+    ASSERT_STR(audit.items[0].code, "NOW-W0401");
+
+    now_audit_free(&audit);
+    now_project_free(p);
+    PASS();
+}
+
+/* The baseline is documentation, and it has to be true. It declared
+ * Wall/Wextra/debug while now_build.c applies none of them unless the
+ * descriptor asks. */
+static void test_layers_the_baseline_claims_no_compile_defaults(void) {
+    NowLayerStack stack;
+    const NowLayerSection *sec;
+
+    TEST("layers: the built-in baseline claims no compile defaults");
+
+    now_layer_stack_init(&stack);
+    if (stack.count == 0) {
+        FAIL("baseline layer missing");
+        now_layer_stack_free(&stack);
+        return;
+    }
+    sec = now_layer_find_section(&stack.layers[0], "compile");
+    if (!sec) {
+        FAIL("baseline has no compile section to merge onto");
+        now_layer_stack_free(&stack);
+        return;
+    }
+    /* Present, and empty. */
+    ASSERT_EQ((int)pasta_count((const PastaValue *)sec->data), 0);
+    now_layer_stack_free(&stack);
+    PASS();
+}
+
 static void test_layer_merge_strarray_exclude(void) {
     TEST("layers: !exclude: removes entries in open mode");
     NowStrArray dst;
@@ -10470,6 +10665,10 @@ int main(void) {
     test_layer_merge_open();
     test_layer_merge_locked_audit();
     test_layer_merge_strarray_exclude();
+    test_layers_a_project_without_one_is_untouched();
+    test_layers_an_open_layer_reaches_compile();
+    test_layers_locked_is_additive_and_audited();
+    test_layers_the_baseline_claims_no_compile_defaults();
     test_layer_audit_format();
     test_layer_push_project();
 

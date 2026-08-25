@@ -176,16 +176,20 @@ static void init_baseline(NowLayer *layer) {
     PastaValue *root = pasta_new_map();
     layer->_root = root;
 
-    /* @compile: open, defaults */
+    /* @compile: open, and deliberately EMPTY.
+     *
+     * This used to declare `warnings: [Wall, Wextra]` and `opt: debug`,
+     * which `now` does not do: now_build.c maps Wall/Wextra only when
+     * they are already in compile.warnings, and emits -Og only when opt
+     * is set. So the baseline was describing a tool that does not
+     * exist -- harmless while layers only fed a report, and three
+     * unrequested flags for every project on the machine the moment
+     * they fed a build. A baseline that lies is worse than no baseline;
+     * the section stays so layers have something to merge onto. */
     PastaValue *compile = pasta_new_map();
-    PastaValue *warnings = pasta_new_array();
-    pasta_push(warnings, pasta_new_string("Wall"));
-    pasta_push(warnings, pasta_new_string("Wextra"));
-    pasta_set(compile, "warnings", warnings);
-    pasta_set(compile, "opt", pasta_new_string("debug"));
     pasta_set(root, "compile", compile);
     layer_add_section(layer, "compile", NOW_POLICY_OPEN,
-                      "Default compiler settings", NULL, compile);
+                      "Compiler settings (no built-in defaults)", NULL, compile);
 
     /* @repos: open, central registry */
     PastaValue *repos = pasta_new_map();
@@ -373,10 +377,53 @@ NOW_API int now_layer_push_project(NowLayerStack *stack,
             pasta_push(d, pasta_new_string(project->compile.defines.items[i]));
         pasta_set(compile, "defines", d);
     }
+    if (project->compile.flags.count > 0) {
+        PastaValue *f = pasta_new_array();
+        for (size_t i = 0; i < project->compile.flags.count; i++)
+            pasta_push(f, pasta_new_string(project->compile.flags.items[i]));
+        pasta_set(compile, "flags", f);
+    }
+    if (project->compile.includes.count > 0) {
+        PastaValue *inc = pasta_new_array();
+        for (size_t i = 0; i < project->compile.includes.count; i++)
+            pasta_push(inc, pasta_new_string(project->compile.includes.items[i]));
+        pasta_set(compile, "includes", inc);
+    }
+    if (project->compile.std)
+        pasta_set(compile, "std", pasta_new_string(project->compile.std));
     if (project->compile.opt)
         pasta_set(compile, "opt", pasta_new_string(project->compile.opt));
     pasta_set(root, "compile", compile);
     layer_add_section(layer, "compile", NOW_POLICY_OPEN, NULL, NULL, compile);
+
+    /* link section. The baseline declares @link and layers may set it,
+     * but the project's own link config was never pushed -- so a layer
+     * merged against nothing and a project's libs were invisible to the
+     * policy that was supposed to govern them. */
+    {
+        PastaValue *link = pasta_new_map();
+        int any = 0;
+        struct { const char *key; const NowStrArray *arr; } lk[] = {
+            { "flags",    &project->link.flags    },
+            { "libs",     &project->link.libs     },
+            { "libdirs",  &project->link.libdirs  },
+            { "archives", &project->link.archives },
+        };
+        for (size_t k = 0; k < sizeof(lk) / sizeof(lk[0]); k++) {
+            if (lk[k].arr->count == 0) continue;
+            PastaValue *a = pasta_new_array();
+            for (size_t i = 0; i < lk[k].arr->count; i++)
+                pasta_push(a, pasta_new_string(lk[k].arr->items[i]));
+            pasta_set(link, lk[k].key, a);
+            any = 1;
+        }
+        if (any) {
+            pasta_set(root, "link", link);
+            layer_add_section(layer, "link", NOW_POLICY_OPEN, NULL, NULL, link);
+        } else {
+            pasta_free(link);
+        }
+    }
 
     /* private_groups section */
     if (project->private_groups.count > 0) {
@@ -699,4 +746,132 @@ NOW_API void *now_layer_merge_section(const NowLayerStack *stack,
     }
 
     return effective;
+}
+
+/* Print locked-section violations, if any, and say how many there were.
+ *
+ * Returns the violation count so a caller can decide policy: a build
+ * warns, `--strict` refuses. Warning by default is the same call
+ * `schema:check` makes -- a policy an org set six months ago should not
+ * stop someone's build the first time they hit it, but it must never be
+ * silent either, because a silently-dropped override is how a locked
+ * section becomes decorative. */
+NOW_API size_t now_layer_report_violations(const NowAuditReport *report,
+                                           const char *who) {
+    char *text;
+    if (!report || report->count == 0) return 0;
+    text = now_audit_format(report);
+    if (text) {
+        fprintf(stderr, "  layers: %llu locked-section override%s%s%s\n%s",
+                (unsigned long long)report->count,
+                report->count == 1 ? "" : "s",
+                who ? " in " : "", who ? who : "", text);
+        free(text);
+    }
+    return report->count;
+}
+
+/* ---- layers reach the build ----------------------------------------
+ *
+ * Until 2026-08-25 this whole subsystem configured a report and nothing
+ * else. `now_layer_merge_section()` had exactly two callers and both
+ * were the `layers:*` commands; `now_build.c` never mentioned layers.
+ * A `.now-layer.pasta` carrying `compile: { defines: [X] }` showed up
+ * in `layers:show --effective` and then the build failed on a source
+ * that required X. An org layer was a document about a build, not an
+ * input to one.
+ *
+ * Two things had to be true before wiring it in could be safe.
+ *
+ * The first is the gate below: a project with no `.now-layer.pasta`
+ * anywhere above it must build exactly as it did before. Not
+ * "equivalently" -- identically. Same discipline as the workspace
+ * inheritance gate, and for the same reason: a machine full of
+ * descriptors that never asked for this must not acquire it because a
+ * feature landed.
+ *
+ * The second was that the built-in baseline had to stop claiming
+ * defaults `now` does not have. It declared `warnings: [Wall, Wextra]`
+ * and `opt: debug`, and `now_build.c` applies neither unless the
+ * descriptor asks -- it maps Wall/Wextra only when they are already in
+ * `compile.warnings`, and `-Og` only when `opt` is set. So merging the
+ * baseline into a build would have handed every project on the machine
+ * three flags it never wrote, including an optimisation level. That
+ * was not a merge hazard to design around; it was the baseline being
+ * wrong about its own tool, and it is fixed rather than worked around.
+ */
+
+/* Replace a NowStrArray from a merged Pasta array. Absent key means the
+ * layers had nothing to say, and the project keeps what it had. */
+static void strarray_from_pasta(NowStrArray *dst, const PastaValue *arr) {
+    size_t i, n;
+    if (!dst || !arr || pasta_type(arr) != PASTA_ARRAY) return;
+    now_strarray_free(dst);
+    now_strarray_init(dst);
+    n = pasta_count(arr);
+    for (i = 0; i < n; i++) {
+        const PastaValue *e = pasta_array_get(arr, i);
+        if (e && pasta_type(e) == PASTA_STRING)
+            now_strarray_push(dst, pasta_get_string(e));
+    }
+}
+
+static void str_from_pasta(char **dst, const PastaValue *v) {
+    if (!dst || !v || pasta_type(v) != PASTA_STRING) return;
+    free(*dst);
+    *dst = strdup(pasta_get_string(v));
+}
+
+NOW_API int now_layer_apply_to_project(NowProject *p, const char *basedir,
+                                       NowAuditReport *audit,
+                                       NowResult *result) {
+    NowLayerStack stack;
+    PastaValue *eff;
+    size_t i;
+    int have_file_layer = 0;
+
+    if (!p || !basedir) return -1;
+
+    now_layer_stack_init(&stack);
+    now_layer_discover(&stack, basedir, result);
+
+    /* The gate. `now_layer_discover` only ever pushes NOW_LAYER_FILE
+     * layers, and the baseline is NOW_LAYER_BUILTIN, so this asks
+     * exactly "did we find a .now-layer.pasta". Checked before the
+     * project is pushed, because that goes on as a FILE layer too. */
+    for (i = 0; i < stack.count; i++) {
+        if (stack.layers[i].source == NOW_LAYER_FILE) { have_file_layer = 1; break; }
+    }
+    if (!have_file_layer) {
+        now_layer_stack_free(&stack);
+        return 0;
+    }
+
+    now_layer_push_project(&stack, p);
+
+    /* compile: the merged section already contains the project's own
+     * values -- it is the top layer -- so this replaces rather than
+     * appends. Appending would double every flag the project wrote. */
+    eff = (PastaValue *)now_layer_merge_section(&stack, "compile", audit);
+    if (eff) {
+        strarray_from_pasta(&p->compile.flags,    pasta_map_get(eff, "flags"));
+        strarray_from_pasta(&p->compile.warnings, pasta_map_get(eff, "warnings"));
+        strarray_from_pasta(&p->compile.defines,  pasta_map_get(eff, "defines"));
+        strarray_from_pasta(&p->compile.includes, pasta_map_get(eff, "includes"));
+        str_from_pasta(&p->compile.std, pasta_map_get(eff, "std"));
+        str_from_pasta(&p->compile.opt, pasta_map_get(eff, "opt"));
+        pasta_free(eff);
+    }
+
+    eff = (PastaValue *)now_layer_merge_section(&stack, "link", audit);
+    if (eff) {
+        strarray_from_pasta(&p->link.flags,    pasta_map_get(eff, "flags"));
+        strarray_from_pasta(&p->link.libs,     pasta_map_get(eff, "libs"));
+        strarray_from_pasta(&p->link.libdirs,  pasta_map_get(eff, "libdirs"));
+        strarray_from_pasta(&p->link.archives, pasta_map_get(eff, "archives"));
+        pasta_free(eff);
+    }
+
+    now_layer_stack_free(&stack);
+    return 0;
 }
