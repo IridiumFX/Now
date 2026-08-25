@@ -1521,6 +1521,31 @@ skip_header:
         return 3;
     }
 
+    /* Cascading layers (\u00a725) reach the build from here. Before
+     * 2026-08-25 they reached `layers:show` and stopped, so an org or
+     * team `.now-layer.pasta` configured a report rather than a
+     * compile. Applied once, before any phase dispatches, so every
+     * phase sees one resolved configuration. Does nothing at all when
+     * no layer file was found. */
+    {
+        NowAuditReport laudit;
+        int strict_layers = 0;
+        for (int ai = 2; ai < argc; ai++)
+            if (strcmp(argv[ai], "--strict") == 0) strict_layers = 1;
+
+        now_audit_init(&laudit);
+        now_layer_apply_to_project(project, cwd, &laudit, &result);
+        if (now_layer_report_violations(&laudit, project->artifact) > 0 &&
+            strict_layers) {
+            now_audit_free(&laudit);
+            now_project_free(project);
+            fprintf(stderr, "error: a locked layer section was overridden "
+                            "(--strict)\n");
+            return 3;
+        }
+        now_audit_free(&laudit);
+    }
+
     /* Build event stream (specs/now-events-v1.md). Opened here rather
      * than at startup because the project is what names the run, and
      * silent when --events / $NOW_EVENTS name nothing — a build tool

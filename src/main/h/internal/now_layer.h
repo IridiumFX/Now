@@ -111,6 +111,29 @@ NOW_API void now_layer_merge_strarray(NowStrArray *dst,
                                        const NowStrArray *src,
                                        NowSectionPolicy policy);
 
+/* Print locked-section violations and return how many there were.
+ * Zero means the layers agreed; a caller under --strict treats any
+ * non-zero as fatal. */
+NOW_API size_t now_layer_report_violations(const NowAuditReport *report,
+                                           const char *who);
+
+/* ---- Apply layers to a project ---- */
+
+/* Merge every discovered `.now-layer.pasta` above `basedir` into the
+ * project's compile and link configuration, so the layers actually
+ * reach the compile line rather than only `layers:show`.
+ *
+ * Does nothing at all when no layer file was found -- a project that
+ * never asked for layers must build byte-identically to before. Records
+ * locked-section overrides in `audit`; the caller decides whether a
+ * violation is a warning or a failure.
+ *
+ * Returns 0 on success (including the nothing-to-do case), -1 on bad
+ * arguments. */
+NOW_API int now_layer_apply_to_project(NowProject *p, const char *basedir,
+                                       NowAuditReport *audit,
+                                       NowResult *result);
+
 /* ---- Audit ---- */
 
 NOW_API void now_audit_init(NowAuditReport *report);

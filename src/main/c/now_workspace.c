@@ -5,6 +5,7 @@
  * using Kahn's algorithm for wave-based parallel execution.
  */
 #include "now_workspace.h"
+#include "now_layer.h"
 #include "now_fs.h"
 #include "now_build.h"
 #include "now_lang.h"  /* now_lang_source_exts - what counts as a source */
@@ -431,6 +432,19 @@ NOW_API int now_workspace_init(NowWorkspace *ws, NowProject *root,
          * in place for every later phase. */
         if (workspace_inherits(root))
             apply_root_inheritance(root, ws->modules[i].project);
+
+        /* Then any .now-layer.pasta above the MODULE, not above the
+         * workspace root -- a layer beside a module is more specific
+         * than one beside its parent, and discovery walks upward from
+         * where it starts, so starting at the module reaches both. */
+        {
+            NowAuditReport laudit;
+            now_audit_init(&laudit);
+            now_layer_apply_to_project(ws->modules[i].project,
+                                       ws->modules[i].dir, &laudit, NULL);
+            now_layer_report_violations(&laudit, mod_name);
+            now_audit_free(&laudit);
+        }
     }
 
     /* Build adjacency list for the DAG.
