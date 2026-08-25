@@ -3,6 +3,11 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <utime.h>
+#endif
+#ifdef _WIN32
   #include <direct.h>
   #include <windows.h>
   #define rmdir _rmdir
@@ -2559,6 +2564,130 @@ static int file_contains_bytes(const char *path, const char *needle) {
  * NOT need: no header changes, no stale timestamps, nothing about the
  * object is out of date. That is why the dependency graph could not see
  * it, and why this needs a test of its own. */
+/* The same defect as the test above, pinned so it cannot hide.
+ *
+ * `test_build_archive_drops_a_removed_source` caught this once in
+ * roughly eighteen runs, because it depended on which way an mtime
+ * comparison happened to fall: the link phase skips when the artifact
+ * looks newer than every object, and only then does the link-flags
+ * hash -- the one thing that notices the OBJECT LIST changing -- get
+ * consulted. When the timing went the other way the link ran anyway and
+ * the bug was invisible.
+ *
+ * A guard that fires one run in eighteen is not a guard. This one makes
+ * the artifact newer on purpose, so "up to date" is certain and the
+ * hash comparison is the only thing standing between a removed source
+ * and a stale archive. It fails every time when that comparison is
+ * broken.
+ */
+static void test_build_relinks_when_the_object_list_changes(void) {
+    TEST("build: a newer artifact does not excuse a changed object list");
+
+    char root[512], d[512], p[512], lib[512];
+    NowResult res;
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"relink\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"relink\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+
+    snprintf(root, sizeof(root), "%s/relink_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    if (now_path_exists(d)) {
+        FAIL("could not remove target/ - cannot establish the precondition");
+        return;
+    }
+    snprintf(d, sizeof(d), "%s/src", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+
+    {
+        FILE *fp;
+        snprintf(p, sizeof(p), "%s/src/main/c/keep.c", root);
+        fp = fopen(p, "wb");
+        if (!fp) { FAIL("cannot write keep.c"); return; }
+        fputs("int keep_me(void) { return 1; }\n", fp);
+        fclose(fp);
+        snprintf(p, sizeof(p), "%s/src/main/c/mover.c", root);
+        fp = fopen(p, "wb");
+        if (!fp) { FAIL("cannot write mover.c"); return; }
+        fputs("int moves_away(void) { return 2; }\n", fp);
+        fclose(fp);
+    }
+
+    memset(&res, 0, sizeof(res));
+    {
+        NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+        ASSERT_NOT_NULL(prj);
+        if (now_build(prj, root, 0, 0, &res) != 0) {
+            FAIL(res.message); now_project_free(prj); return;
+        }
+        now_project_free(prj);
+    }
+
+    snprintf(lib, sizeof(lib), "%s/target/bin/librelink.a", root);
+    if (file_contains_bytes(lib, "mover") != 1) {
+        FAIL("setup: mover.c.o was not in the first archive");
+        return;
+    }
+
+    /* The source goes away... */
+    snprintf(p, sizeof(p), "%s/src/main/c/mover.c", root);
+    remove(p);
+    if (now_path_exists(p)) {
+        FAIL("could not remove mover.c - cannot establish the precondition");
+        return;
+    }
+
+    /* ...and the artifact is made newer than every object, which is the
+     * condition under which the link phase is entitled to skip.
+     *
+     * Set explicitly rather than by touching. The first version of this
+     * opened the archive for append and closed it, which on Windows
+     * does not move the last-write time when nothing is written -- so
+     * the precondition was not established and the test inherited the
+     * very timing-dependence it was written to remove: it caught the
+     * reverted fix 2 runs in 5 instead of 5 in 5. A test that assumes
+     * its own setup worked is the same defect as a build that assumes
+     * its own delete worked. */
+    {
+        struct utimbuf tb;
+        struct stat lst;
+        if (stat(lib, &lst) != 0) { FAIL("cannot stat the archive"); return; }
+        tb.actime  = lst.st_atime;
+        tb.modtime = lst.st_mtime + 30;   /* comfortably after every object */
+        if (utime(lib, &tb) != 0) { FAIL("cannot set the archive mtime"); return; }
+        if (stat(lib, &lst) != 0 || (long long)lst.st_mtime <= 0) {
+            FAIL("archive mtime did not take");
+            return;
+        }
+    }
+
+    {
+        NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
+        ASSERT_NOT_NULL(prj);
+        if (now_build(prj, root, 0, 0, &res) != 0) {
+            FAIL(res.message); now_project_free(prj); return;
+        }
+        now_project_free(prj);
+    }
+
+    {
+        int still_there = file_contains_bytes(lib, "mover");
+        int keep_there  = file_contains_bytes(lib, "keep");
+
+        snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+        snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+
+        if (keep_there != 1) { FAIL("the surviving object left the archive"); return; }
+        if (still_there != 0) {
+            FAIL("a newer artifact was taken as up to date while the "
+                 "object list had changed");
+            return;
+        }
+    }
+    PASS();
+}
+
 static void test_build_archive_drops_a_removed_source(void) {
     TEST("build: a source that goes away leaves the archive");
 
@@ -11488,6 +11617,7 @@ int main(void) {
     test_build_warnings_reach_test_compile();
     test_build_each_names_binaries_by_source();
     test_build_archive_drops_a_removed_source();
+    test_build_relinks_when_the_object_list_changes();
     test_build_fail_fast_stops_starting_work();
     test_events_encode_decode_roundtrip();
     test_events_detail_survives_escaping();

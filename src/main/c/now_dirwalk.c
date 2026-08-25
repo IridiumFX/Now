@@ -46,6 +46,46 @@ NOW_API void now_dirwalk_free(NowDirwalkCache *cache) {
 NOW_API const NowDirCacheEntry *now_dirwalk_get(const NowDirwalkCache *cache,
                                                   const char *dir_path,
                                                   long long cur_mtime) {
+#ifdef _WIN32
+    /* The premise of this cache does not hold on Windows.
+     *
+     * It skips readdir() when a directory's mtime is unchanged, which
+     * assumes the mtime moves when the directory's contents change.
+     * POSIX requires exactly that on link/unlink. Windows does not do
+     * it. Measured 2026-08-25 on this machine, NTFS, 300 and 200
+     * trials:
+     *
+     *     deleting a file left the directory mtime unchanged  165/300
+     *     adding   a file left the directory mtime unchanged  112/200
+     *
+     * And it never catches up -- rechecking after 50ms and 500ms gave
+     * the same count, so this is not a lazy flush to wait out. A stale
+     * entry stays stale until something else happens to move the
+     * timestamp.
+     *
+     * What that produced: a source deleted from a directory kept being
+     * compiled and kept its object in the archive, and a source ADDED
+     * was silently not compiled at all. The first showed up as an
+     * intermittent test failure about two runs in ten
+     * (`build: a source that goes away leaves the archive`); the second
+     * would show up as a link error naming a function whose file is
+     * sitting right there.
+     *
+     * The cache saves one readdir() per directory per build, next to
+     * spawning a compiler per file. That is not worth a build that is
+     * silently wrong about which files exist. It stays enabled on
+     * POSIX, where the guarantee it needs is in the standard.
+     *
+     * If Windows ever gets a cheap reliable signal here -- a USN
+     * journal read, a change-notification handle -- this is the place
+     * to put it. Do not re-enable on mtime alone.
+     *
+     * Cost of turning it off, measured on the test suite (which runs
+     * many builds): 71s disabled vs 70s enabled. It buys nothing here,
+     * and it was buying it by sometimes being wrong. */
+    (void)cache; (void)dir_path; (void)cur_mtime;
+    return NULL;
+#else
     if (!cache || !dir_path) return NULL;
     for (size_t i = 0; i < cache->count; i++) {
         if (strcmp(cache->entries[i].dir_path, dir_path) == 0) {
@@ -55,6 +95,7 @@ NOW_API const NowDirCacheEntry *now_dirwalk_get(const NowDirwalkCache *cache,
         }
     }
     return NULL;
+#endif
 }
 
 static NowDirCacheEntry *find_or_grow(NowDirwalkCache *cache, const char *dir_path) {
