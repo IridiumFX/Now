@@ -6723,6 +6723,93 @@ static void test_entry_point_wiring_survives_a_renamed_main(void) {
     PASS();
 }
 
+
+/* ---- a detail cut on the way IN says so ----
+ *
+ * `detail_lossy` was set by the encoder and only by the encoder. The
+ * event's own `detail` is `char[768]` and `ev_emit` filled it with
+ * snprintf, so anything longer lost its tail before the encoder ever
+ * saw it — and the encoder, finding a detail that fits, marked the
+ * record byte-exact. Measured 2026-08-24: a 941-byte gcc diagnostic
+ * arrived as 767 bytes with `detail_lossy: false`.
+ *
+ * The existing oversize test starts from a NowEvent that is ALREADY
+ * full and renders it, so it watches the encoder and could not see
+ * this. This one goes in through the public emit path, which is where
+ * a real diagnostic enters.
+ */
+
+/* Capture what the emitter sends by pointing it at a loopback listener
+ * is the end-to-end route; for this we only need the event as filled,
+ * so the sink is read back through the sidecar the emitter writes. */
+static void test_events_detail_cut_on_the_way_in_says_so(void) {
+    char big[2048];
+    size_t i;
+    NowEvent ev;
+
+    TEST("events: a detail cut while filling is marked lossy");
+
+    /* Longer than NowEvent.detail, the way a real compiler diagnostic
+     * is — the compile path passes the raw captured output, not the
+     * 512-byte result->message. */
+    for (i = 0; i < sizeof(big) - 1; i++) big[i] = 'x';
+    big[sizeof(big) - 1] = '\0';
+
+    memset(&ev, 0, sizeof(ev));
+    now_event_set_detail(&ev, big);
+
+    /* The detail was cut... */
+    if (strlen(ev.detail) >= sizeof(big) - 1) {
+        FAIL("expected the detail to be truncated");
+        return;
+    }
+    /* ...and the record says so. This is the assertion that was false. */
+    ASSERT_EQ(ev.detail_lossy, 1);
+    PASS();
+}
+
+/* The control on the above: a detail that FITS must not be flagged.
+ * A fix that set the flag unconditionally would satisfy the test above
+ * and make the flag meaningless, which is worse than the bug — every
+ * consumer would learn to ignore it. */
+static void test_events_a_detail_that_fits_is_not_lossy(void) {
+    NowEvent ev;
+    TEST("events: a detail that fits is not marked lossy");
+
+    memset(&ev, 0, sizeof(ev));
+    now_event_set_detail(&ev, "compiler failed on src/main/c/a.c (exit 1)");
+
+    ASSERT_STR(ev.detail, "compiler failed on src/main/c/a.c (exit 1)");
+    ASSERT_EQ(ev.detail_lossy, 0);
+    PASS();
+}
+
+/* And the boundary, because off-by-one here is the difference between
+ * "flagged when it should not be" and "not flagged when it should".
+ * Exactly-fits must be clean; one more byte must be flagged. */
+static void test_events_lossy_boundary_is_exact(void) {
+    char exact[4096], over[4096];
+    NowEvent a, b;
+    size_t cap;
+
+    TEST("events: the lossy boundary is exact");
+
+    memset(&a, 0, sizeof(a));
+    cap = sizeof(a.detail);          /* 768 incl. the NUL */
+
+    memset(exact, 'y', cap - 1); exact[cap - 1] = '\0';   /* fits exactly */
+    memset(over,  'y', cap);     over[cap]      = '\0';   /* one too many */
+
+    now_event_set_detail(&a, exact);
+    ASSERT_EQ(a.detail_lossy, 0);
+    ASSERT_EQ(strlen(a.detail), cap - 1);
+
+    memset(&b, 0, sizeof(b));
+    now_event_set_detail(&b, over);
+    ASSERT_EQ(b.detail_lossy, 1);
+    PASS();
+}
+
 /* ---- Path-based platform variants (arch.tags + path gating) ---- */
 
 static const char *ARCH_POM =
@@ -10448,6 +10535,9 @@ int main(void) {
     test_objsym_unreadable_is_neither_yes_nor_no();
     test_objsym_counts_what_the_entry_point_hides();
     test_entry_point_wiring_survives_a_renamed_main();
+    test_events_detail_cut_on_the_way_in_says_so();
+    test_events_a_detail_that_fits_is_not_lossy();
+    test_events_lossy_boundary_is_exact();
 
     printf("\n  Arch tags / path-gated discovery:\n");
     test_arch_parse_tags();

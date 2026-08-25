@@ -395,9 +395,16 @@ NOW_API size_t now_event_render(char *out, size_t out_cap,
     /* text */
     {
         int w;
+        /* A cut detail must LOOK cut. The record carries detail_lossy,
+         * but a person watching the stream reads this line and nothing
+         * else — and a compiler diagnostic that stops mid-token looks
+         * exactly like one that ended there. Same fault as the flag
+         * itself, one layer out. */
+        const char *cut = ev->detail_lossy ? " [truncated]" : "";
         if (ev->module[0] && ev->detail[0])
-            w = snprintf(out, out_cap, "%s  %-14s %s: %s",
-                         ev->ts, now_event_name(ev->event), ev->module, ev->detail);
+            w = snprintf(out, out_cap, "%s  %-14s %s: %s%s",
+                         ev->ts, now_event_name(ev->event), ev->module,
+                         ev->detail, cut);
         else if (ev->module[0])
             w = snprintf(out, out_cap, "%s  %-14s %s",
                          ev->ts, now_event_name(ev->event), ev->module);
@@ -406,8 +413,8 @@ NOW_API size_t now_event_render(char *out, size_t out_cap,
                          ev->ts, now_event_name(ev->event),
                          ev->ok ? "ok" : "FAILED", ev->code);
         else if (ev->detail[0])
-            w = snprintf(out, out_cap, "%s  %-14s %s",
-                         ev->ts, now_event_name(ev->event), ev->detail);
+            w = snprintf(out, out_cap, "%s  %-14s %s%s",
+                         ev->ts, now_event_name(ev->event), ev->detail, cut);
         else
             w = snprintf(out, out_cap, "%s  %-14s %s",
                          ev->ts, now_event_name(ev->event), ev->phase);
@@ -1110,6 +1117,21 @@ NOW_API void now_events_open(const char *url, const char *wire,
 
 /* Fill the envelope, send, append to the sidecar. The sidecar is the
  * record and the datagram is the notification — §6. */
+NOW_API void now_event_set_detail(NowEvent *ev, const char *detail) {
+    if (!ev) return;
+    ev->detail[0] = '\0';
+    if (!detail) return;
+
+    {
+        int w = snprintf(ev->detail, sizeof(ev->detail), "%s", detail);
+        if (w < 0 || (size_t)w >= sizeof(ev->detail)) {
+            size_t keep = utf8_back_off(ev->detail, strlen(ev->detail));
+            ev->detail[keep] = '\0';
+            ev->detail_lossy = 1;
+        }
+    }
+}
+
 static void ev_emit(NowEventType type, const char *module,
                     const char *detail, int code,
                     const NowEventCounts *counts) {
@@ -1127,7 +1149,32 @@ static void ev_emit(NowEventType type, const char *module,
     ev.ok = g_ev.ok;
     snprintf(ev.project, sizeof(ev.project), "%s", g_ev.project);
     if (module) snprintf(ev.module, sizeof(ev.module), "%s", module);
-    if (detail) snprintf(ev.detail, sizeof(ev.detail), "%s", detail);
+
+    /* THE DETAIL IS TRUNCATED HERE TOO, and until 2026-08-25 it happened
+     * in silence.
+     *
+     * `detail_lossy` was set by the encoder, and only by the encoder,
+     * when shortening to fit the datagram. Both the spec and two
+     * handovers therefore said the flag had exactly one cause left —
+     * true of the encoder, and false of the event, because the value
+     * reaching it had already been cut at this struct boundary.
+     *
+     * The compile path passes the RAW captured compiler output, not
+     * `result->message`, so a long diagnostic arrives whole and loses
+     * its tail right here. Measured on 2026-08-24: a 941-byte gcc
+     * diagnostic became a 767-byte blob ending mid-token, carrying
+     * `detail_lossy: false`. A consumer reading that is entitled to
+     * believe the detail is complete.
+     *
+     * snprintf reports what it WOULD have written, which is the only
+     * way to tell a value that just fits from one that did not. The
+     * encoder ORs its own truncation onto this, so the flag now means
+     * what it says: this detail is not byte-exact, wherever it was cut.
+     *
+     * Backed off a UTF-8 boundary for the same reason the encoder does
+     * it — gcc quotes identifiers with U+2018/U+2019, so a cut at 767
+     * lands inside a character often enough to matter. */
+    now_event_set_detail(&ev, detail);
     ev.code = code;
     ev.elapsed_ms = (type == NOW_EVENT_RUN_STARTED)
                   ? -1
