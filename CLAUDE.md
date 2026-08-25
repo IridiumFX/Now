@@ -279,32 +279,54 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   values -- a locked section that broke builds instead of governing
   them would just get deleted.
 
-- **OPEN: `build: a source that goes away leaves the archive` fails
-  about 2 runs in 10.** Not a fixture problem and not the archive
-  rebuild -- both were investigated and ruled out on 2026-08-25:
+- **A changed object list forces a relink; a newer artifact does not
+  excuse it.** `link_flags_hash` covers the object list, so it is the
+  only thing that notices a source being added or removed -- the mtime
+  check cannot, because a deleted file has no mtime to be newer than.
 
-  - The test's preconditions are now all checked. `target/` removal was
-    already guarded; `remove(mover.c)` is guarded now too. Neither guard
-    fires on a failing run, so the source really is gone.
-  - `now_build.c` deletes the `.a` before `ar rcs` (an `ar r` inserts
-    and replaces, leaving other members alone -- Amy hit that with a
-    `git mv` on 2026-08-21). That delete is now checked too, and the
-    check does not fire either.
+  It was neutered from 2026-08-?? to 2026-08-25: compile handed the link
+  phase `ctx->last_link_flags_hash` *after* writing the new value into
+  the manifest, so the link compared the current hash against itself,
+  which is equal by construction. The link then skipped whenever its
+  mtime check said "up to date", and the previous artifact survived --
+  including the `remove()` before `ar rcs` that exists precisely to stop
+  objects accumulating. Deleting a source left its object in the
+  archive; the same hole would keep a stale executable.
 
-  What is left: on a failing run `mover.c.o` is still in `ctx->objects`,
-  so the link-flags hash matches, the link is skipped as up to date, and
-  build 1's archive survives intact. The object list is built from the
-  source walk, which means the walk saw a file that had already been
-  deleted -- a stale directory enumeration, which Windows does allow
-  briefly after a delete. Not yet confirmed.
+  Intermittent only because the mtime check decided it: when the
+  artifact happened to look older than an object, the link ran and hid
+  the bug. It failed about 1 run in 18 of its own test, which is why it
+  survived several sessions. **Hand the link phase the PREVIOUS hash**,
+  captured before the manifest is updated.
 
-  Next step: log `ctx->objects` on the second build of that fixture and
-  run until it fails. If `mover.c.o` is present, the walk is the culprit
-  and the fix belongs in `now_dirwalk.c`, not in the link decision.
+  `test_build_relinks_when_the_object_list_changes` is the guard, and it
+  is deliberately not the flaky one: it sets the artifact's mtime 30s
+  into the future with `utime()`, so "up to date" is certain and the
+  hash comparison is the only thing left. With the fix reverted it fails
+  5 runs out of 5. Its first version touched the archive with
+  `fopen(..., "ab")`, which does not move the mtime on Windows when
+  nothing is written -- so it inherited the timing-dependence it existed
+  to remove and caught the bug only 2 in 5. **A test that assumes its
+  own setup worked is the same defect as a build that assumes its own
+  delete worked.**
 
-  This predates the layer wiring (the fixture uses
-  `now_project_load_string`, which never reaches
-  `now_layer_apply_to_project`) and is unrelated to it.
+- **The dirwalk cache is disabled on Windows, and the reason is
+  measured.** It skips `readdir()` when a directory's mtime is
+  unchanged, which assumes the mtime moves when the contents change.
+  POSIX requires that on link/unlink. Windows does not do it -- on this
+  machine, NTFS:
+
+  ```
+  deleting a file left the directory mtime unchanged  165/300
+  adding   a file left the directory mtime unchanged  112/200
+  ```
+
+  and it never catches up (same counts after 50ms and 500ms, so it is
+  not a lazy flush to wait out). A stale entry stays stale. That means a
+  source ADDED to a directory could be silently not compiled, which is
+  the worse half. Turning it off cost 1 second on a 70-second suite
+  full of builds. Do not re-enable on mtime alone; a USN-journal or
+  change-notification signal would be the way.
 
 - **Descriptor key diagnostics.** `warn_descriptor_keys()` in
   `now_pom.c` warns on unknown keys and, separately, on recognized-but-

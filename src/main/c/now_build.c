@@ -3417,6 +3417,33 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         char *lfh = link_flags_hash(ctx->project, &ctx->objects);
         int lfh_changed = (lfh && (!manifest.link_flags_hash ||
                                     strcmp(lfh, manifest.link_flags_hash) != 0));
+
+        /* The PREVIOUS hash, captured before this build overwrites it.
+         *
+         * This is what the link phase needs, and it used to be handed
+         * the new one -- assigned from manifest.link_flags_hash after
+         * the line below had already replaced it. So the link compared
+         * the current hash against itself, which is equal by
+         * construction, and then skipped the link whenever its mtime
+         * check said "up to date".
+         *
+         * What that cost: `link_flags_hash` covers the OBJECT LIST, so
+         * it is the only thing that notices a source being added or
+         * removed. With it neutered, deleting a source left the
+         * previous artifact in place -- the archive was never
+         * rewritten, so the delete-before-`ar` that exists precisely to
+         * stop objects accumulating never ran. Intermittent because the
+         * mtime check decided it: when the artifact happened to look
+         * older than an object the link ran and hid the bug.
+         *
+         * Measured 2026-08-25: `build: a source that goes away leaves
+         * the archive` failed 1 in ~18 runs of the test alone, and the
+         * object list at link time was already correct -- the objects
+         * were right and the archive was simply not rebuilt from them. */
+        free(ctx->last_link_flags_hash);
+        ctx->last_link_flags_hash = manifest.link_flags_hash
+                                  ? strdup(manifest.link_flags_hash) : NULL;
+
         if (lfh_changed) {
             free(manifest.link_flags_hash);
             manifest.link_flags_hash = lfh;
@@ -3425,11 +3452,6 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         }
         if (compiled > 0 || manifest_dirty || lfh_changed)
             now_manifest_save(&manifest, manifest_path);
-        /* Hand the current link_flags_hash forward so the link phase
-         * doesn't need to reload the manifest just to compare. */
-        free(ctx->last_link_flags_hash);
-        ctx->last_link_flags_hash = manifest.link_flags_hash
-                                  ? strdup(manifest.link_flags_hash) : NULL;
     }
     if (g_timing_on) now_timing_mark("  .manifest_save");
 

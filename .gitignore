@@ -38,6 +38,7 @@ src/test/resources/zc_empty/
 src/test/resources/zc_needs_cfg/
 src/test/resources/zc_cfg/
 src/test/resources/zc_rewalk/
+src/test/resources/relink_proj/
 src/test/resources/entrywire_proj/
 src/test/resources/osym_proj/
 src/test/resources/pattern_proj/
