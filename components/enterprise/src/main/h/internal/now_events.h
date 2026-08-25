@@ -225,6 +225,17 @@ NOW_API void now_events_phase_finished(const char *phase, int ok,
 /* Rate-limited to one per second inside the emitter; callers may call it
  * as often as is convenient. */
 NOW_API void now_events_progress(const NowEventCounts *counts);
+/* Put `detail` into an event, truncating to the struct's capacity and
+ * SAYING SO when it does.
+ *
+ * Named and public because it was neither: the copy was an inline
+ * snprintf in ev_emit, so a diagnostic longer than NowEvent.detail lost
+ * its tail and the record still claimed to be byte-exact. Nothing could
+ * observe that without standing up an emitter and a listener, which is
+ * why it survived two handovers that both described `detail_lossy` as
+ * having exactly one cause. */
+NOW_API void now_event_set_detail(NowEvent *ev, const char *detail);
+
 NOW_API void now_events_module_failed(const char *module, const char *detail);
 NOW_API void now_events_test_failed(const char *name, const char *detail);
 /* Pass NULL for `counts` to reuse the last set the emitter was given.
