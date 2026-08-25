@@ -875,3 +875,197 @@ NOW_API int now_layer_apply_to_project(NowProject *p, const char *basedir,
     now_layer_stack_free(&stack);
     return 0;
 }
+
+/* ---- where a resolved value came from ------------------------------
+ *
+ * Once layers feed the build, "why is this flag here" stops having an
+ * obvious answer: a define on the compile line might be the project's,
+ * a team layer's, or an org layer's three directories up. `now tell
+ * config-origin` answers it.
+ *
+ * This recomputes rather than recording. By the time any phase runs,
+ * `now_layer_apply_to_project()` has already merged the layers INTO the
+ * project, so asking the live project where its values came from would
+ * answer "the project" for every one of them. So the descriptor is
+ * re-read from disk in its unmerged state and the stack rebuilt around
+ * it. That costs a few file reads on an introspection command nobody
+ * runs in a loop, and it keeps the apply path free of bookkeeping that
+ * exists only for a report -- which is the mistake this whole subsystem
+ * was already making.
+ *
+ * Two different questions, depending on kind:
+ *
+ *   - An ARRAY entry is attributed to the LOWEST layer carrying it,
+ *     because arrays accumulate and the interesting fact is who
+ *     introduced the value.
+ *   - A SCALAR is attributed to the HIGHEST layer setting it, because
+ *     scalars replace and the interesting fact is who won.
+ */
+
+static const char *layer_label(const NowLayer *l) {
+    if (!l) return "?";
+    /* `fs-layer-0` is what the stack calls a discovered file, which
+     * tells a reader nothing. The path is the answer to the question
+     * actually being asked. */
+    if (l->source == NOW_LAYER_FILE && l->path) return l->path;
+    return l->id ? l->id : "?";
+}
+
+static int section_array_has(const NowLayerSection *s, const char *key,
+                             const char *value) {
+    const PastaValue *arr;
+    size_t j, n;
+    if (!s) return 0;
+    arr = pasta_map_get((const PastaValue *)s->data, key);
+    if (!arr || pasta_type(arr) != PASTA_ARRAY) return 0;
+    n = pasta_count(arr);
+    for (j = 0; j < n; j++) {
+        const PastaValue *e = pasta_array_get(arr, j);
+        if (e && pasta_type(e) == PASTA_STRING &&
+            strcmp(pasta_get_string(e), value) == 0) return 1;
+    }
+    return 0;
+}
+
+static const char *section_scalar(const NowLayerSection *s, const char *key) {
+    const PastaValue *v;
+    if (!s) return NULL;
+    v = pasta_map_get((const PastaValue *)s->data, key);
+    if (!v || pasta_type(v) != PASTA_STRING) return NULL;
+    return pasta_get_string(v);
+}
+
+static int origins_push(NowConfigOrigins *dst, const char *section,
+                        const char *key, const char *value, const char *origin) {
+    NowConfigOrigin *it;
+    if (dst->count >= dst->cap) {
+        size_t nc = dst->cap ? dst->cap * 2 : 16;
+        NowConfigOrigin *tmp = realloc(dst->items, nc * sizeof(*tmp));
+        if (!tmp) return -1;
+        dst->items = tmp;
+        dst->cap = nc;
+    }
+    it = &dst->items[dst->count++];
+    it->section = strdup(section);
+    it->key     = strdup(key);
+    it->value   = strdup(value ? value : "");
+    it->origin  = strdup(origin ? origin : "?");
+    return 0;
+}
+
+static void collect_section(NowConfigOrigins *dst, const NowLayerStack *st,
+                            const char *section, const char *const *arr_keys,
+                            const char *const *scalar_keys,
+                            NowAuditReport *audit) {
+    PastaValue *eff = (PastaValue *)now_layer_merge_section(st, section, audit);
+    size_t k;
+    if (!eff) return;
+
+    for (k = 0; arr_keys[k]; k++) {
+        const PastaValue *a = pasta_map_get(eff, arr_keys[k]);
+        size_t i, n;
+        if (!a || pasta_type(a) != PASTA_ARRAY) continue;
+        n = pasta_count(a);
+        for (i = 0; i < n; i++) {
+            const PastaValue *e = pasta_array_get(a, i);
+            const char *val, *who = "?";
+            size_t li;
+            if (!e || pasta_type(e) != PASTA_STRING) continue;
+            val = pasta_get_string(e);
+            /* lowest layer carrying it — who introduced the value */
+            for (li = 0; li < st->count; li++) {
+                if (section_array_has(
+                        now_layer_find_section(&st->layers[li], section),
+                        arr_keys[k], val)) {
+                    who = layer_label(&st->layers[li]);
+                    break;
+                }
+            }
+            origins_push(dst, section, arr_keys[k], val, who);
+        }
+    }
+
+    for (k = 0; scalar_keys[k]; k++) {
+        const PastaValue *v = pasta_map_get(eff, scalar_keys[k]);
+        const char *val, *who = "?";
+        size_t li;
+        if (!v || pasta_type(v) != PASTA_STRING) continue;
+        val = pasta_get_string(v);
+        /* Highest layer that SETS the key -- who won.
+         *
+         * Deliberately not "highest layer whose value equals the merged
+         * one": with only one layer setting a scalar those are the same
+         * answer, and with two they differ only when both chose the
+         * same string. Asking who set it at all is both the honest
+         * question and the one whose answer changes if this walk is
+         * ever reversed, which is what makes it testable. */
+        for (li = st->count; li-- > 0; ) {
+            if (section_scalar(now_layer_find_section(&st->layers[li], section),
+                               scalar_keys[k])) {
+                who = layer_label(&st->layers[li]);
+                break;
+            }
+        }
+        origins_push(dst, section, scalar_keys[k], val, who);
+    }
+
+    pasta_free(eff);
+}
+
+NOW_API int now_layer_collect_origins(NowConfigOrigins *dst,
+                                      const char *basedir,
+                                      NowResult *result) {
+    static const char *const compile_arr[] =
+        { "flags", "warnings", "defines", "includes", NULL };
+    static const char *const compile_sca[] = { "std", "opt", NULL };
+    static const char *const link_arr[] =
+        { "flags", "libs", "libdirs", "archives", NULL };
+    static const char *const link_sca[] = { NULL };
+
+    NowLayerStack stack;
+    NowAuditReport audit;
+    NowProject *raw;
+    NowResult lres;
+    char desc[PATH_MAX];
+
+    if (!dst || !basedir) return -1;
+    memset(dst, 0, sizeof(*dst));
+
+    snprintf(desc, sizeof(desc), "%s/now.pasta", basedir);
+    memset(&lres, 0, sizeof(lres));
+    raw = now_project_load(desc, &lres);
+    if (!raw) {
+        if (result) {
+            result->code = lres.code;
+            snprintf(result->message, sizeof(result->message),
+                     "%s", lres.message);
+        }
+        return -1;
+    }
+
+    now_layer_stack_init(&stack);
+    now_layer_discover(&stack, basedir, result);
+    now_layer_push_project(&stack, raw);
+
+    now_audit_init(&audit);
+    collect_section(dst, &stack, "compile", compile_arr, compile_sca, &audit);
+    collect_section(dst, &stack, "link", link_arr, link_sca, &audit);
+    now_audit_free(&audit);
+
+    now_layer_stack_free(&stack);
+    now_project_free(raw);
+    return 0;
+}
+
+NOW_API void now_config_origins_free(NowConfigOrigins *o) {
+    size_t i;
+    if (!o) return;
+    for (i = 0; i < o->count; i++) {
+        free(o->items[i].section);
+        free(o->items[i].key);
+        free(o->items[i].value);
+        free(o->items[i].origin);
+    }
+    free(o->items);
+    memset(o, 0, sizeof(*o));
+}

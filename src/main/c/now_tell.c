@@ -5,6 +5,7 @@
  */
 #include "now_tell.h"
 #include "now_build.h"
+#include "now_layer.h"
 #include "now_procure.h"   /* now_repo_dep_path — where a dep landed */
 #include "now_fs.h"
 #include "pasta.h"
@@ -173,6 +174,68 @@ static void tell_deps(FILE *out, const NowProject *p, const char *fmt) {
 static int tell_computed(FILE *out, const NowProject *p, const char *basedir,
                          const char *what, const char *const *argv, int argc,
                          const char *fmt, NowResult *result) {
+    /* config-origin [<field>] — which layer put this on the compile line.
+     *
+     * Once .now-layer.pasta feeds the build, "why is this flag here" has
+     * three possible answers and no way to tell them apart from the
+     * compile line. `--explain` was the other candidate for this, but it
+     * already answers a different question ("why did this rebuild"), and
+     * one flag answering two questions is how a flag stops being read.
+     *
+     * Optional argument narrows to one dotted field, exactly as `tell`
+     * spells it elsewhere: `now tell config-origin compile.defines`. */
+    if (strcmp(what, "config-origin") == 0) {
+        NowConfigOrigins og;
+        const char *want = (argc >= 1) ? argv[0] : NULL;
+        size_t i;
+        int shown = 0;
+
+        if (now_layer_collect_origins(&og, basedir, result) != 0) return -1;
+
+        if (is_json(fmt)) fputs("[", out);
+        for (i = 0; i < og.count; i++) {
+            char path[128];
+            snprintf(path, sizeof(path), "%s.%s",
+                     og.items[i].section, og.items[i].key);
+            if (want && strcmp(want, path) != 0) continue;
+
+            if (is_json(fmt)) {
+                if (shown) fputs(", ", out);
+                fputs("{\"field\": ", out);   esc_json(out, path);
+                fputs(", \"value\": ", out);  esc_json(out, og.items[i].value);
+                fputs(", \"origin\": ", out); esc_json(out, og.items[i].origin);
+                fputs("}", out);
+            } else if (is_pasta(fmt)) {
+                if (shown) fputs("\n", out);
+                fprintf(out, "{ field: \"%s\", value: \"%s\", origin: \"%s\" }",
+                        path, og.items[i].value, og.items[i].origin);
+            } else {
+                /* Two columns, value first: the value is what you saw on
+                 * the compile line and came here to look up. */
+                fprintf(out, "%-28s %-24s %s\n",
+                        og.items[i].value, path, og.items[i].origin);
+            }
+            shown++;
+        }
+        if (is_json(fmt)) fputs("]\n", out);
+        else if (is_pasta(fmt) && shown) fputs("\n", out);
+
+        now_config_origins_free(&og);
+
+        /* An unknown field name is an error for the same reason it is in
+         * tell_field: printing nothing for a typo is how a script comes
+         * to believe a value is unset. */
+        if (want && shown == 0) {
+            if (result) {
+                result->code = NOW_ERR_NOT_FOUND;
+                snprintf(result->message, sizeof(result->message),
+                         "no configuration value under '%s'", want);
+            }
+            return -1;
+        }
+        return 0;
+    }
+
     if (strcmp(what, "source-files") == 0) {
         NowFileList fl;
         if (now_query_sources(p, basedir, &fl, result) < 0) return -1;

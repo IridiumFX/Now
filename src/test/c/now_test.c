@@ -2628,8 +2628,24 @@ static void test_build_archive_drops_a_removed_source(void) {
     }
 
     /* The source moves away. Nothing else changes — no header edits, no
-     * touched timestamps. */
+     * touched timestamps.
+     *
+     * Checked, for the same reason the target/ removal above is checked:
+     * on Windows a lingering handle makes remove() a silent no-op, and
+     * then mover.c is still there, still compiles, and is still in the
+     * archive -- which this test reports as "the removed source's object
+     * is still in the archive". That reads as a defect in incremental
+     * rebuild, and sends the next person to the wrong file. Seen once in
+     * 11 runs on 2026-08-25.
+     *
+     * The precondition of this test is that the source is GONE. If it is
+     * not gone, there is no test to run. */
     remove(mover);
+    if (now_path_exists(mover)) {
+        FAIL("could not remove mover.c - something still holds it open; "
+             "this run cannot establish its precondition");
+        return;
+    }
 
     {
         NowProject *prj = now_project_load_string(pasta, strlen(pasta), &res);
@@ -5058,9 +5074,12 @@ static void layer_write(const char *path, const char *body) {
 
 /* A project directory with a descriptor, and optionally a layer file.
  * Returns the loaded project, or NULL. */
-static NowProject *layer_fixture(char *dir_out, size_t dir_cap,
-                                 const char *name, const char *layer_body) {
+static NowProject *layer_fixture_ex(char *dir_out, size_t dir_cap,
+                                    const char *name,
+                                    const char *project_compile,
+                                    const char *layer_body) {
     char desc[512];
+    char body[1024];
     NowResult res;
 
     snprintf(dir_out, dir_cap, "%s/%s", NOW_TEST_RESOURCES, name);
@@ -5068,12 +5087,15 @@ static NowProject *layer_fixture(char *dir_out, size_t dir_cap,
     now_mkdir_p(dir_out);
 
     snprintf(desc, sizeof(desc), "%s/now.pasta", dir_out);
-    layer_write(desc,
+    snprintf(body, sizeof(body),
         "{ group: \"org.t\", artifact: \"lfix\", version: \"1.0.0\","
         "  langs: [\"c\"],"
         "  output: { type: \"executable\", name: \"lfix\" },"
         "  sources: { dir: \"src/main/c\" },"
-        "  compile: { defines: [\"FROM_PROJECT\"] } }");
+        "  compile: %s }",
+        project_compile ? project_compile
+                        : "{ defines: [\"FROM_PROJECT\"] }");
+    layer_write(desc, body);
 
     {
         char lp[512];
@@ -5093,6 +5115,11 @@ static NowProject *layer_fixture(char *dir_out, size_t dir_cap,
 
     memset(&res, 0, sizeof(res));
     return now_project_load(desc, &res);
+}
+
+static NowProject *layer_fixture(char *dir_out, size_t dir_cap,
+                                 const char *name, const char *layer_body) {
+    return layer_fixture_ex(dir_out, dir_cap, name, NULL, layer_body);
 }
 
 static int layer_has_define(const NowProject *p, const char *want) {
@@ -5225,6 +5252,153 @@ static void test_layers_the_baseline_claims_no_compile_defaults(void) {
     ASSERT_EQ((int)pasta_count((const PastaValue *)sec->data), 0);
     now_layer_stack_free(&stack);
     PASS();
+}
+
+/* ---- config-origin ------------------------------------------------
+ *
+ * With layers feeding the build, a define on the compile line has three
+ * possible sources and the compile line says nothing about which. These
+ * check the attribution rules, which differ by kind on purpose: an array
+ * entry is credited to the LOWEST layer carrying it (who introduced the
+ * value), a scalar to the HIGHEST layer setting it (who won).
+ *
+ * The second one is the one that would rot quietly -- get it backwards
+ * and every scalar reports the org layer that lost, which reads
+ * plausibly and sends someone editing the wrong file.
+ */
+static const NowConfigOrigin *origin_find(const NowConfigOrigins *o,
+                                          const char *key, const char *value) {
+    size_t i;
+    for (i = 0; i < o->count; i++)
+        if (strcmp(o->items[i].key, key) == 0 &&
+            strcmp(o->items[i].value, value) == 0)
+            return &o->items[i];
+    return NULL;
+}
+
+static void test_origin_credits_the_layer_that_introduced_a_define(void) {
+    char dir[512];
+    NowProject *p;
+    NowConfigOrigins og;
+    const NowConfigOrigin *e;
+
+    TEST("config-origin: a define is credited to the layer that introduced it");
+
+    /* SHARED is in BOTH. That is the whole point: with a value in one
+     * layer only, walking the stack up or down finds the same answer and
+     * the rule under test is unobservable. The first version of this
+     * test did exactly that and passed with the walk reversed. */
+    p = layer_fixture_ex(dir, sizeof(dir), "origin_arr",
+                         "{ defines: [\"SHARED\", \"FROM_PROJECT\"] }",
+                         "{ compile: { defines: [\"SHARED\", \"FROM_LAYER\"] } }");
+    ASSERT_NOT_NULL(p);
+    now_project_free(p);   /* collect re-reads the descriptor itself */
+
+    ASSERT_EQ(now_layer_collect_origins(&og, dir, NULL), 0);
+
+    /* Credited to the layer, because arrays accumulate and the useful
+     * fact is who put the value there first -- not who repeated it. */
+    e = origin_find(&og, "defines", "SHARED");
+    if (!e) { FAIL("the shared define is not in the origins"); goto done; }
+    if (!strstr(e->origin, ".now-layer.pasta")) {
+        FAIL("a define in both was credited to the project, not the layer");
+        goto done;
+    }
+
+    e = origin_find(&og, "defines", "FROM_LAYER");
+    if (!e) { FAIL("the layer's own define is missing"); goto done; }
+    if (!strstr(e->origin, ".now-layer.pasta")) {
+        FAIL("the layer's define was not credited to the layer file");
+        goto done;
+    }
+
+    e = origin_find(&og, "defines", "FROM_PROJECT");
+    if (!e) { FAIL("the project's define is missing"); goto done; }
+    ASSERT_STR(e->origin, "project");
+
+    now_config_origins_free(&og);
+    PASS();
+    return;
+done:
+    now_config_origins_free(&og);
+}
+
+/* A scalar set by BOTH must name the one that won. Same reasoning as
+ * above and the opposite direction: scalars replace rather than
+ * accumulate, so the interesting fact is who is on the compile line,
+ * not who asked first. */
+static void test_origin_credits_the_winner_of_a_scalar(void) {
+    char dir[512];
+    NowProject *p;
+    NowConfigOrigins og;
+    const NowConfigOrigin *e;
+
+    TEST("config-origin: a scalar set by both is credited to the winner");
+
+    p = layer_fixture_ex(dir, sizeof(dir), "origin_scalar",
+                         "{ defines: [\"FROM_PROJECT\"], opt: \"speed\" }",
+                         "{ compile: { opt: \"size\" } }");
+    ASSERT_NOT_NULL(p);
+    now_project_free(p);
+
+    ASSERT_EQ(now_layer_collect_origins(&og, dir, NULL), 0);
+
+    /* The project's value is the one that survives... */
+    e = origin_find(&og, "opt", "speed");
+    if (!e) { FAIL("the winning opt value is not in the origins"); goto done; }
+    /* ...and it must be credited to the project, not to the layer it
+     * beat. Crediting the loser sends someone to edit the wrong file,
+     * and it reads entirely plausibly while doing so. */
+    ASSERT_STR(e->origin, "project");
+
+    /* The losing value must not be reported as if it were in effect. */
+    if (origin_find(&og, "opt", "size")) {
+        FAIL("a scalar that lost the merge is reported as effective");
+        goto done;
+    }
+
+    now_config_origins_free(&og);
+    PASS();
+    return;
+done:
+    now_config_origins_free(&og);
+}
+
+/* No layer file anywhere: everything is the project's, and the query
+ * still answers rather than erroring. Someone debugging a build should
+ * not have to know whether layers are in play before they can ask. */
+static void test_origin_answers_without_any_layer_file(void) {
+    char dir[512];
+    NowProject *p;
+    NowConfigOrigins og;
+    const NowConfigOrigin *e;
+
+    TEST("config-origin: answers for a project with no layers at all");
+
+    p = layer_fixture(dir, sizeof(dir), "origin_none", NULL);
+    ASSERT_NOT_NULL(p);
+    now_project_free(p);
+
+    ASSERT_EQ(now_layer_collect_origins(&og, dir, NULL), 0);
+    e = origin_find(&og, "defines", "FROM_PROJECT");
+    if (!e) { FAIL("the project's own define is not in the origins"); goto done; }
+    ASSERT_STR(e->origin, "project");
+
+    /* And nothing was attributed to the baseline, which claims nothing. */
+    {
+        size_t i;
+        for (i = 0; i < og.count; i++) {
+            if (strcmp(og.items[i].origin, "now-baseline") == 0) {
+                FAIL("a value was credited to a baseline that claims none");
+                goto done;
+            }
+        }
+    }
+    now_config_origins_free(&og);
+    PASS();
+    return;
+done:
+    now_config_origins_free(&og);
 }
 
 static void test_layer_merge_strarray_exclude(void) {
@@ -10669,6 +10843,9 @@ int main(void) {
     test_layers_an_open_layer_reaches_compile();
     test_layers_locked_is_additive_and_audited();
     test_layers_the_baseline_claims_no_compile_defaults();
+    test_origin_credits_the_layer_that_introduced_a_define();
+    test_origin_credits_the_winner_of_a_scalar();
+    test_origin_answers_without_any_layer_file();
     test_layer_audit_format();
     test_layer_push_project();
 

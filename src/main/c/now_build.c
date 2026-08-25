@@ -3915,8 +3915,32 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
              * the thing holding the past. This is also the one failure
              * in this family a header-dependency graph cannot catch:
              * nothing about that object is stale, it simply should not
-             * be in the list. */
+             * be in the list.
+             *
+             * And the delete is CHECKED, because the whole paragraph
+             * above is about what happens when it does not take effect.
+             * `remove()` on Windows fails while anything holds the file
+             * open -- a reader, an indexer, the previous `ar` -- and it
+             * fails silently. `ar rcs` then inserts into the archive
+             * that survived, which is the accumulating behaviour this
+             * delete exists to prevent: same symptom Amy reported, from
+             * the fix rather than from the bug.
+             *
+             * Found 2026-08-25 as an intermittent test failure, about
+             * two runs in ten, reporting a removed source's object still
+             * in the archive. Nothing was wrong with the object list. */
             remove(out_file);
+            if (now_path_exists(out_file)) {
+                if (result) {
+                    result->code = NOW_ERR_IO;
+                    snprintf(result->message, sizeof(result->message),
+                             "cannot replace %s: it is still open by another "
+                             "process. Refusing to add to the old archive - "
+                             "it would keep objects whose sources are gone.",
+                             out_file);
+                }
+                return -1;
+            }
 
             size_t need = ctx->objects.count + 8;
             const char **argv = (const char **)malloc(need * sizeof(char *));
