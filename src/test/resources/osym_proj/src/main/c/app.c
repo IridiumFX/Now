@@ -1,2 +1,0 @@
-int helper(void) { return 7; }
-int main(void) { return helper() - 7; }

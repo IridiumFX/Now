@@ -1,1 +1,0 @@
-{ group: "org.t", artifact: "lfix", version: "1.0.0",  langs: ["c"],  output: { type: "executable", name: "lfix" },  sources: { dir: "src/main/c" },  compile: { defines: ["FROM_PROJECT"] } }

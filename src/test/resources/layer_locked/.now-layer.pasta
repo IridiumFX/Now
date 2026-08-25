@@ -1,1 +1,0 @@
-{ compile: { _policy: "locked",             defines: ["FROM_ORG"] } }

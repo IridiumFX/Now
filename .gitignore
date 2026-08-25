@@ -20,5 +20,13 @@ target/
 src/test/resources/arch_tree/
 src/test/resources/arch_build/
 src/test/resources/exclude_proj/
+# Fixture trees the suite writes from scratch on every run. Committing
+# them means the checkout disagrees with the test the moment either one
+# changes, and the test is the authority.
+src/test/resources/layer_none/
+src/test/resources/layer_open/
+src/test/resources/layer_locked/
+src/test/resources/entrywire_proj/
+src/test/resources/osym_proj/
 src/test/resources/pattern_proj/
 src/test/resources/ws_libcap/
