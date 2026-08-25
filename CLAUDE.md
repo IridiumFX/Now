@@ -159,6 +159,20 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   nothing. `docs/status.md` claiming "all tiers complete, zero backlog"
   is not accurate. **Grep the source before telling a downstream team a
   field works.**
+- **`.now-layer.pasta` does not reach the build.** §25 cascading layers
+  is a complete subsystem -- discovery from the project up to the VCS
+  root, open/locked section policy, audit codes, `layers:show
+  --effective`, `layers:audit` -- and `now_build.c` never calls any of
+  it. `now_layer_merge_section()` has exactly two consumers, both of
+  them the `layers:*` commands themselves. Measured 2026-08-25: a
+  `.now-layer.pasta` carrying `compile: { defines: [X] }` shows up in
+  `layers:show --effective` and the build then fails on a source that
+  requires X. So an org or team layer configures a report, not a
+  compile. This is the `profiles:`/`properties:` problem again but
+  larger, and it is the one to check first when someone asks why their
+  org-wide flag "isn't being picked up" -- it is being picked up, and
+  then dropped.
+
 - **Descriptor key diagnostics.** `warn_descriptor_keys()` in
   `now_pom.c` warns on unknown keys and, separately, on recognized-but-
   unimplemented ones. Silent acceptance is what let a correct
