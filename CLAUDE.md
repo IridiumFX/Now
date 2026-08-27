@@ -350,8 +350,8 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   their own manifest at `target/.now-manifest-test`. If you see a
   layout-shaped crash after a header edit, it is a real regression now,
   not the tool being like that.
-- **`now test` links and passes now's own suite** — 345/345, measured on
-  a clean `target/` on 2026-08-19. This entry used to say it could not,
+- **`now test` links and passes now's own suite** — 430/430, re-measured via the self-host path on 2026-08-25 (was 345/345 on
+  a clean `target/` on 2026-08-19). This entry used to say it could not,
   because test objects missed `NOW_STATIC` and expected `__imp_` DLL
   imports; `now_build.c:4138` now builds them with production flags plus
   the test-only defines, so they get it. A false gotcha is worse than an
