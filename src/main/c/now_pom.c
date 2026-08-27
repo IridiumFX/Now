@@ -475,7 +475,8 @@ static void load_inherit(NowInherit *dst, const PastaValue *src) {
 /* Top-level keys the loader reads and acts on. */
 static const char *const k_known_keys[] = {
     "group", "artifact", "version", "name", "description", "url", "license",
-    "lang", "langs", "std", "sources", "tests", "output", "compile", "link",
+    "lang", "langs", "std", "sources", "tests", "output", "outputs",
+    "compile", "link",
     "deps", "depends", "repos", "convergence", "private_groups", "resolve",
     "plugins",
     "components", "vendored", "modules", "java", "arch", "target_flags",
@@ -691,6 +692,50 @@ static void load_output(NowOutput *dst, const PastaValue *src) {
     dst->type = dup_map_str(src, "type");
     dst->name = dup_map_str(src, "name");
     dst->dir  = dup_map_str(src, "dir");
+}
+
+/* `outputs: [ {...}, {...} ]`
+ *
+ * Implemented in the same commit that parses it. A field that loads and
+ * does nothing is the failure mode this project keeps finding -- see
+ * the note about `profiles:` in CLAUDE.md -- so `outputs` goes into
+ * k_known_keys and into the link phase together or not at all. */
+static void load_outputs(NowOutputList *dst, const PastaValue *src) {
+    size_t i, n;
+    if (!src || pasta_type(src) != PASTA_ARRAY) return;
+    n = pasta_count(src);
+    for (i = 0; i < n; i++) {
+        const PastaValue *e = pasta_array_get(src, i);
+        NowOutput o;
+        if (!e || pasta_type(e) != PASTA_MAP) continue;
+        memset(&o, 0, sizeof(o));
+        o.type  = dup_map_str(e, "type");
+        o.name  = dup_map_str(e, "name");
+        o.dir   = dup_map_str(e, "dir");
+        o.entry = dup_map_str(e, "entry");
+        if (dst->count >= dst->cap) {
+            size_t nc = dst->cap ? dst->cap * 2 : 4;
+            NowOutput *tmp = (NowOutput *)realloc(dst->items, nc * sizeof(*tmp));
+            if (!tmp) { free(o.type); free(o.name); free(o.dir); free(o.entry); return; }
+            dst->items = tmp;
+            dst->cap = nc;
+        }
+        dst->items[dst->count++] = o;
+    }
+}
+
+static void now_outputs_free(NowOutputList *l) {
+    size_t i;
+    if (!l) return;
+    for (i = 0; i < l->count; i++) {
+        free(l->items[i].type);
+        free(l->items[i].name);
+        free(l->items[i].dir);
+        free(l->items[i].entry);
+    }
+    free(l->items);
+    l->items = NULL;
+    l->count = l->cap = 0;
 }
 
 static void load_arch(NowArchDict *dst, const PastaValue *src) {
@@ -1149,6 +1194,7 @@ NOW_API void now_project_free(NowProject *p) {
     free(p->output.type);
     free(p->output.name);
     free(p->output.dir);
+    now_outputs_free(&p->outputs);
     now_compile_free(&p->compile);
     now_link_free(&p->link);
     now_target_flags_free(&p->target_flags);
@@ -1260,6 +1306,7 @@ NOW_API NowProject *now_project_load(const char *path, NowResult *result) {
 
     /* Output (§1.4) */
     load_output(&p->output, pasta_map_get(root, "output"));
+    load_outputs(&p->outputs, pasta_map_get(root, "outputs"));
 
     /* Compile & link (§1.5) */
     load_compile(&p->compile, pasta_map_get(root, "compile"));
@@ -1392,6 +1439,7 @@ NOW_API NowProject *now_project_load_string(const char *input, size_t len,
     load_sources(&p->sources, pasta_map_get(root, "sources"));
     load_sources(&p->tests,   pasta_map_get(root, "tests"));
     load_output(&p->output, pasta_map_get(root, "output"));
+    load_outputs(&p->outputs, pasta_map_get(root, "outputs"));
     load_compile(&p->compile, pasta_map_get(root, "compile"));
     load_link(&p->link,       pasta_map_get(root, "link"));
     load_target_flags(&p->target_flags, pasta_map_get(root, "target_flags"));

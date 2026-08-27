@@ -17,6 +17,7 @@
 #include "now.h"
 
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
@@ -3621,7 +3622,21 @@ static char *link_flags_hash(const NowProject *p, const NowFileList *objects) {
 
 /* The body; now_build_link below wraps it so the phase events pair on
  * every exit path rather than on the ones someone remembered. */
-static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
+/* One thing to link.
+ *
+ * `build_link_body` linked `ctx->objects` into `p->output` and could
+ * therefore produce exactly one artifact per module. Two executables
+ * sharing a directory had to be two modules with two descriptors
+ * repeating one compile configuration. Naming what to link and what to
+ * call it makes the body indifferent to how many there are. */
+typedef struct {
+    const char        *type;      /* NULL means executable */
+    const char        *name;      /* NULL means the artifact name */
+    const NowFileList *objects;
+} NowLinkTarget;
+
+static int build_link_body(NowBuildCtx *ctx, const NowLinkTarget *tgt,
+                           NowResult *result) {
     const NowProject *p = ctx->project;
     const char *basedir = ctx->basedir;
 
@@ -3632,12 +3647,12 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
     }
 
     /* Header-only modules legitimately have nothing to link. */
-    if (p->output.type && strcmp(p->output.type, "header-only") == 0) {
+    if (tgt->type && strcmp(tgt->type, "header-only") == 0) {
         if (result) { result->code = NOW_OK; result->message[0] = '\0'; }
         return 0;
     }
 
-    if (ctx->objects.count == 0) {
+    if ((*tgt->objects).count == 0) {
         if (result) {
             result->code = NOW_ERR_NOT_FOUND;
             snprintf(result->message, sizeof(result->message),
@@ -3647,8 +3662,8 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
     }
 
     /* Determine output type and name */
-    const char *out_type = p->output.type ? p->output.type : "executable";
-    const char *out_name = p->output.name ? p->output.name : p->artifact;
+    const char *out_type = tgt->type ? tgt->type : "executable";
+    const char *out_name = tgt->name ? tgt->name : p->artifact;
     if (!out_name) out_name = "a";
 
     /* Build output path */
@@ -3717,8 +3732,8 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
                 }                                                           \
             } while (0)
 
-            for (size_t i = 0; up_to_date && i < ctx->objects.count; i++)
-                NOW_INPUT_NEWER(ctx->objects.paths[i]);
+            for (size_t i = 0; up_to_date && i < (*tgt->objects).count; i++)
+                NOW_INPUT_NEWER((*tgt->objects).paths[i]);
 
             /* Dependency archives: in a workspace this is how module B
              * learns that module A's .a was rebuilt. Nothing else carries
@@ -3760,7 +3775,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
                  * Use ctx->last_link_flags_hash when set (compile ran in
                  * this process); fall back to loading the manifest only
                  * when running `now link` standalone. */
-                char *cur_lfh = link_flags_hash(p, &ctx->objects);
+                char *cur_lfh = link_flags_hash(p, &(*tgt->objects));
                 const char *prev_lfh = ctx->last_link_flags_hash;
                 NowManifest standalone_manifest;
                 int loaded_standalone = 0;
@@ -3799,7 +3814,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
              * exercise. */
             remove(out_file);
 
-            size_t need = ctx->objects.count + 8;
+            size_t need = (*tgt->objects).count + 8;
             const char **argv = (const char **)malloc(need * sizeof(char *));
             if (!argv) return -1;
             int argc = 0;
@@ -3808,8 +3823,8 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
             char out_buf[520];
             snprintf(out_buf, sizeof(out_buf), "/OUT:%s", out_file);
             argv[argc++] = out_buf;
-            for (size_t i = 0; i < ctx->objects.count; i++)
-                argv[argc++] = ctx->objects.paths[i];
+            for (size_t i = 0; i < (*tgt->objects).count; i++)
+                argv[argc++] = (*tgt->objects).paths[i];
             argv[argc] = NULL;
 
             int rc = now_exec(argv, ctx->verbose);
@@ -3824,7 +3839,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
             }
         } else {
             /* Executable or DLL: link.exe /OUT:file obj... libs... */
-            size_t need = ctx->objects.count + p->link.flags.count
+            size_t need = (*tgt->objects).count + p->link.flags.count
                         + p->link.libdirs.count + ctx->dep_libdirs.count
                         + p->link.libs.count + ctx->dep_libs.count + 16;
             const char **argv = (const char **)malloc(need * sizeof(char *));
@@ -3844,8 +3859,8 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
                 argv[argc++] = p->link.flags.items[i];
 
             /* Object files */
-            for (size_t i = 0; i < ctx->objects.count; i++)
-                argv[argc++] = ctx->objects.paths[i];
+            for (size_t i = 0; i < (*tgt->objects).count; i++)
+                argv[argc++] = (*tgt->objects).paths[i];
 
             /* Library directories: /LIBPATH:dir. Heap-sized to the count
              * (a fixed cap dropped the tail on large workspaces). */
@@ -3916,7 +3931,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
         size_t link_repro_nflags = 0;
         if (link_repro.enabled) {
             if (link_repro.sort_inputs)
-                now_repro_sort_filelist(&ctx->objects);
+                now_repro_sort_filelist(&(*tgt->objects));
             now_repro_link_flags(&link_repro, 0, &link_repro_flags, &link_repro_nflags);
         }
 
@@ -3934,7 +3949,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
              *
              * Measured: with the archive deleted first, the same tree
              * produces an archive containing only the current objects —
-             * so `ctx->objects` was right all along and the archive was
+             * so `(*tgt->objects)` was right all along and the archive was
              * the thing holding the past. This is also the one failure
              * in this family a header-dependency graph cannot catch:
              * nothing about that object is stale, it simply should not
@@ -3965,15 +3980,15 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
                 return -1;
             }
 
-            size_t need = ctx->objects.count + 8;
+            size_t need = (*tgt->objects).count + 8;
             const char **argv = (const char **)malloc(need * sizeof(char *));
             if (!argv) return -1;
             int argc = 0;
             argv[argc++] = ctx->toolchain.ar;
             argv[argc++] = "rcs";
             argv[argc++] = out_file;
-            for (size_t i = 0; i < ctx->objects.count; i++)
-                argv[argc++] = ctx->objects.paths[i];
+            for (size_t i = 0; i < (*tgt->objects).count; i++)
+                argv[argc++] = (*tgt->objects).paths[i];
             argv[argc] = NULL;
 
             int rc = now_exec(argv, ctx->verbose);
@@ -3993,7 +4008,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
                 if (strcmp(p->langs.items[i], "c++") == 0) { has_cxx = 1; break; }
             }
 
-            size_t need = ctx->objects.count + p->link.flags.count
+            size_t need = (*tgt->objects).count + p->link.flags.count
                         + p->link.libdirs.count + ctx->dep_libdirs.count
                         + p->link.archives.count
                         + p->link.libs.count + ctx->dep_libs.count
@@ -4012,7 +4027,7 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
 
             if (is_shared) argv[argc++] = "-shared";
 
-            warn_link_target_missing(p, basedir, p->output.type);
+            warn_link_target_missing(p, basedir, tgt->type);
 
             /* link.inherit_target: carry the target/ABI flags over from
              * compile.flags. Emitted before link.flags so an explicit
@@ -4052,8 +4067,8 @@ static int build_link_body(NowBuildCtx *ctx, NowResult *result) {
             }
 
             /* Object files */
-            for (size_t i = 0; i < ctx->objects.count; i++)
-                argv[argc++] = ctx->objects.paths[i];
+            for (size_t i = 0; i < (*tgt->objects).count; i++)
+                argv[argc++] = (*tgt->objects).paths[i];
 
             /* Library directories: -L prepended. Heap-sized to the
              * libdir count — a fixed cap here silently dropped the tail
@@ -5286,10 +5301,200 @@ run_test_bin:
  * listener can tell "this phase failed" from "this phase is still
  * running", which is the whole reason to send the pair. */
 
+/* ---- one set of objects, several artifacts -------------------------
+ *
+ * `outputs:` lets a module produce more than one thing. Nothing lists
+ * object files, because the symbol table already knows which object is
+ * which:
+ *
+ *   - an executable links its ENTRY object plus every object that
+ *     defines no entry point;
+ *   - a library takes the objects that define no entry point.
+ *
+ * So `server.c` and `client.c` sitting beside `core.c` produce two
+ * programs and share the core, and neither one drags in the other's
+ * main(). The rule is the same one that fixed the entry-point bug on
+ * 2026-08-24: a filename is a convention, a symbol table is a fact.
+ *
+ * Everything here is checked before anything is linked. A wrong entry
+ * name that produced a link error naming a duplicate `main` would send
+ * someone to read the linker's manual instead of their descriptor.
+ */
+
+/* Does this object supply an entry point? Three-way: 1 yes, 0 no,
+ * -1 the object could not be read. Unreadable is NOT treated as "no" --
+ * that would silently drop an object out of every library. */
+static int obj_has_entry(const char *obj_path) {
+    return now_obj_defines_symbol(obj_path, "main");
+}
+
+/* The object built from `src`, matched by the path the compile phase
+ * recorded rather than by reconstructing the mangling here. */
+static const char *object_for_source(const NowBuildCtx *ctx,
+                                     const char *basedir, const char *src) {
+    char *want = now_obj_path_ex(basedir, src, ctx->project->sources.dir,
+                                 ctx->target_dir, ".o");
+    size_t i;
+    const char *found = NULL;
+    if (!want) return NULL;
+    for (i = 0; i < ctx->objects.count; i++) {
+        if (strcmp(ctx->objects.paths[i], want) == 0) {
+            found = ctx->objects.paths[i];
+            break;
+        }
+    }
+    free(want);
+    return found;
+}
+
+/* Every one of these is reported before anything links, so the message
+ * names the descriptor rather than leaving the linker to complain about
+ * a duplicate main() the author never wrote. */
+static int link_target_failed(NowResult *result, const char *fmt, ...) {
+    va_list ap;
+    if (!result) return -1;
+    result->code = NOW_ERR_SCHEMA;
+    va_start(ap, fmt);
+    vsnprintf(result->message, sizeof(result->message), fmt, ap);
+    va_end(ap);
+    return -1;
+}
+
+static int build_link_outputs(NowBuildCtx *ctx, NowResult *result) {
+    const NowProject *p = ctx->project;
+    const char *basedir = ctx->basedir;
+    NowFileList shared;          /* objects with no entry point */
+    const char **entry_obj;      /* per output, or NULL */
+    size_t i, j;
+    int rc = 0;
+    int unreadable = 0;
+
+    now_filelist_init(&shared);
+    entry_obj = (const char **)calloc(p->outputs.count, sizeof(*entry_obj));
+    if (!entry_obj) { now_filelist_free(&shared); return -1; }
+
+    /* Which objects are entry points, once. */
+    for (i = 0; i < ctx->objects.count; i++) {
+        int r = obj_has_entry(ctx->objects.paths[i]);
+        if (r == 0) now_filelist_push(&shared, ctx->objects.paths[i]);
+        else if (r < 0) {
+            unreadable++;
+            /* Cannot tell, so keep it: dropping it would remove a
+             * symbol from every artifact with no error anywhere. */
+            now_filelist_push(&shared, ctx->objects.paths[i]);
+        }
+    }
+    if (unreadable > 0)
+        fprintf(stderr, "  warning: %d object%s could not be read for an "
+                        "entry point and were linked into every output\n",
+                unreadable, unreadable == 1 ? "" : "s");
+
+    /* Resolve and check every entry BEFORE linking anything. */
+    for (i = 0; i < p->outputs.count && rc == 0; i++) {
+        const NowOutput *o = &p->outputs.items[i];
+        const char *type = o->type ? o->type : "executable";
+
+        if (strcmp(type, "executable") != 0) continue;
+
+        if (!o->entry || !o->entry[0]) {
+            /* One main in the whole module is unambiguous; more than one
+             * is not, and guessing is how the wrong program gets built. */
+            size_t mains = 0;
+            const char *only = NULL;
+            for (j = 0; j < ctx->objects.count; j++)
+                if (obj_has_entry(ctx->objects.paths[j]) == 1) {
+                    mains++;
+                    only = ctx->objects.paths[j];
+                }
+            if (mains == 1) { entry_obj[i] = only; continue; }
+            rc = link_target_failed(result,
+                    "output '%s' has no `entry:` and the module defines "
+                    "%llu entry points - name the source that supplies main()",
+                    o->name ? o->name : "?", (unsigned long long)mains);
+            break;
+        }
+
+        entry_obj[i] = object_for_source(ctx, basedir, o->entry);
+        if (!entry_obj[i]) {
+            rc = link_target_failed(result,
+                    "output '%s': entry '%s' produced no object - is it "
+                    "under sources.dir, and did it compile?",
+                    o->name ? o->name : "?", o->entry);
+            break;
+        }
+        if (obj_has_entry(entry_obj[i]) == 0) {
+            rc = link_target_failed(result,
+                    "output '%s': entry '%s' defines no main()",
+                    o->name ? o->name : "?", o->entry);
+            break;
+        }
+        for (j = 0; j < i; j++)
+            if (entry_obj[j] && strcmp(entry_obj[j], entry_obj[i]) == 0) {
+                rc = link_target_failed(result,
+                        "outputs '%s' and '%s' name the same entry '%s'",
+                        p->outputs.items[j].name ? p->outputs.items[j].name : "?",
+                        o->name ? o->name : "?", o->entry);
+                break;
+            }
+        if (rc != 0) break;
+    }
+
+    /* An entry point nobody claimed is a program that will not be built.
+     * Not an error -- it may be deliberate -- but never silent. */
+    if (rc == 0) {
+        for (i = 0; i < ctx->objects.count; i++) {
+            int claimed = 0;
+            if (obj_has_entry(ctx->objects.paths[i]) != 1) continue;
+            for (j = 0; j < p->outputs.count; j++)
+                if (entry_obj[j] && strcmp(entry_obj[j], ctx->objects.paths[i]) == 0)
+                    claimed = 1;
+            if (!claimed)
+                fprintf(stderr, "  warning: %s defines main() and no output "
+                                "claims it - nothing will be built from it\n",
+                        ctx->objects.paths[i]);
+        }
+    }
+
+    /* Then link, one artifact at a time. */
+    for (i = 0; i < p->outputs.count && rc == 0; i++) {
+        const NowOutput *o = &p->outputs.items[i];
+        const char *type = o->type ? o->type : "executable";
+        NowLinkTarget tgt;
+        NowFileList set;
+
+        now_filelist_init(&set);
+        if (strcmp(type, "executable") == 0 && entry_obj[i])
+            now_filelist_push(&set, entry_obj[i]);
+        for (j = 0; j < shared.count; j++)
+            now_filelist_push(&set, shared.paths[j]);
+
+        tgt.type    = o->type;
+        tgt.name    = o->name;
+        tgt.objects = &set;
+        rc = build_link_body(ctx, &tgt, result);
+        now_filelist_free(&set);
+    }
+
+    free(entry_obj);
+    now_filelist_free(&shared);
+    return rc;
+}
+
 NOW_API int now_build_link(NowBuildCtx *ctx, NowResult *result) {
     int rc;
     now_events_phase_started("link");
-    rc = build_link_body(ctx, result);
+    if (ctx->project && ctx->project->outputs.count > 0) {
+        rc = build_link_outputs(ctx, result);
+    } else {
+        /* The single-output path, unchanged. A descriptor that never
+         * mentions `outputs:` links exactly as it did before this
+         * existed -- same gate as workspace inheritance and layers. */
+        NowLinkTarget tgt;
+        tgt.type    = ctx->project ? ctx->project->output.type : NULL;
+        tgt.name    = ctx->project ? ctx->project->output.name : NULL;
+        tgt.objects = &ctx->objects;
+        rc = build_link_body(ctx, &tgt, result);
+    }
     now_events_phase_finished("link", rc == 0, NULL);
     return rc;
 }
