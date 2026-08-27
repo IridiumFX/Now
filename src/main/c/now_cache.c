@@ -230,9 +230,28 @@ NOW_API int now_cache_clean(void) {
 
 /* ---- Cache statistics ---- */
 
+/* Walking the object cache to size it.
+ *
+ * Bounded and symlink-free on purpose. This used to recurse with no
+ * depth limit, and on the POSIX side it classified entries with
+ * `stat()`, which FOLLOWS symlinks -- so a link pointing at an ancestor
+ * made `now cache:stats` walk forever. miggy reported it hanging for
+ * twelve minutes on 2026-08-26 with another build running; the cause
+ * there was more likely a large cache reached across the WSL/Windows
+ * boundary, where traversal is several times slower, but "runs forever
+ * on a link" is a failure this should not have available to it either
+ * way. There is no lock anywhere in here, so it was never blocking on
+ * a concurrent build.
+ *
+ * A symlink is skipped rather than followed: for a count and a total
+ * size, following one would double-count the target. */
+#define NOW_CACHE_WALK_MAX_DEPTH 64
+
 #ifdef _WIN32
-static void walk_cache_dir(const char *dir, int *count, long long *total_size) {
+static void walk_cache_dir_at(const char *dir, int *count,
+                              long long *total_size, int depth) {
     char pattern[PATH_MAX];
+    if (depth > NOW_CACHE_WALK_MAX_DEPTH) return;
     snprintf(pattern, sizeof(pattern), "%s\\*", dir);
 
     WIN32_FIND_DATAA fdata;
@@ -241,11 +260,14 @@ static void walk_cache_dir(const char *dir, int *count, long long *total_size) {
 
     do {
         if (fdata.cFileName[0] == '.') continue;
+        /* A junction has FILE_ATTRIBUTE_DIRECTORY set too, so without
+         * this the walk descends through it. */
+        if (fdata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
         char *child = now_path_join(dir, fdata.cFileName);
         if (!child) continue;
 
         if (fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            walk_cache_dir(child, count, total_size);
+            walk_cache_dir_at(child, count, total_size, depth + 1);
         } else {
             (*count)++;
             *total_size += ((long long)fdata.nFileSizeHigh << 32) | fdata.nFileSizeLow;
@@ -256,8 +278,11 @@ static void walk_cache_dir(const char *dir, int *count, long long *total_size) {
     FindClose(h);
 }
 #else
-static void walk_cache_dir(const char *dir, int *count, long long *total_size) {
-    DIR *d = opendir(dir);
+static void walk_cache_dir_at(const char *dir, int *count,
+                              long long *total_size, int depth) {
+    DIR *d;
+    if (depth > NOW_CACHE_WALK_MAX_DEPTH) return;
+    d = opendir(dir);
     if (!d) return;
 
     struct dirent *entry;
@@ -267,9 +292,15 @@ static void walk_cache_dir(const char *dir, int *count, long long *total_size) {
         if (!child) continue;
 
         struct stat st;
-        if (stat(child, &st) == 0) {
+        /* lstat, not stat: stat follows a symlink, and a link pointing
+         * at an ancestor turns this walk into a loop. */
+        if (lstat(child, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) {
+                free(child);
+                continue;
+            }
             if (S_ISDIR(st.st_mode)) {
-                walk_cache_dir(child, count, total_size);
+                walk_cache_dir_at(child, count, total_size, depth + 1);
             } else {
                 (*count)++;
                 *total_size += (long long)st.st_size;
@@ -854,7 +885,7 @@ NOW_API int now_cache_print_stats(void) {
 
     int count = 0;
     long long total_size = 0;
-    walk_cache_dir(root, &count, &total_size);
+    walk_cache_dir_at(root, &count, &total_size, 0);
     free(root);
 
     if (total_size < 1024)
