@@ -139,7 +139,30 @@ typedef struct {
     char *type;            /* executable | static | shared | header-only */
     char *name;
     char *dir;
+    /* `outputs:` only. The source whose object supplies main() for this
+     * executable, relative to the module. Which object that is gets
+     * settled by reading the symbol table, not by matching the
+     * filename -- see now_obj_defines_symbol(). NULL for a library, and
+     * NULL for a lone executable in a tree with exactly one main(). */
+    char *entry;
 } NowOutput;
+
+/* `outputs:` -- more than one artifact from one set of objects.
+ *
+ * A module has always been able to produce one thing. Several
+ * executables sharing a directory had to be several modules, which
+ * meant several descriptors and several copies of the same compile
+ * configuration for sources that were already sitting together.
+ *
+ * Each executable names its entry source; it links against that
+ * object plus every object in the module that defines no entry point.
+ * A library output takes the no-entry-point set. Nothing lists files,
+ * because the symbol table already knows which objects are which. */
+typedef struct {
+    NowOutput *items;
+    size_t     count;
+    size_t     cap;
+} NowOutputList;
 
 /* Per-field inheritance policy (§1.11).
  *
@@ -336,6 +359,7 @@ struct NowProject {
 
     /* Workspace (§1.11) */
     NowStrArray modules;
+    NowOutputList outputs;         /* §1.4b -- empty means `output:` alone */
     NowInherit  inherit_defaults;  /* root: policy applied to every module */
     NowInherit  inherit;           /* module: override of the root policy */
     char       *workspace_mode;    /* monorepo | aggregate | inferred */

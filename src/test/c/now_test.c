@@ -5918,6 +5918,242 @@ static void test_zeroconfig_does_not_walk_its_own_output(void) {
     PASS();
 }
 
+/* ---- outputs: several artifacts from one set of objects -----------
+ *
+ * A module could produce exactly one thing. Two programs sharing a
+ * directory had to be two modules with two descriptors repeating one
+ * compile configuration, for sources already sitting together.
+ *
+ * `outputs:` lets each executable name its entry source; it links that
+ * object plus every object with no entry point, and a library takes the
+ * no-entry-point set. Nothing lists object files, because the symbol
+ * table already knows which is which -- the same rule that fixed the
+ * entry-point bug on 2026-08-24.
+ */
+static int mo_fixture(char *dir_out, size_t cap, const char *name,
+                      const char *outputs_block, int with_second_main) {
+    char p[512];
+    FILE *f;
+
+    snprintf(dir_out, cap, "%s/%s", NOW_TEST_RESOURCES, name);
+    rmtree_best_effort(dir_out);
+    if (now_path_exists(dir_out)) return 0;
+    snprintf(p, sizeof(p), "%s/src/main/c", dir_out);
+    now_mkdir_p(p);
+
+    snprintf(p, sizeof(p), "%s/now.pasta", dir_out);
+    f = fopen(p, "wb");
+    if (!f) return 0;
+    fprintf(f, "{ group: \"org.t\", artifact: \"mo\", version: \"1\","
+               "  langs: [\"c\"], sources: { dir: \"src/main/c\" },"
+               "  outputs: [ %s ] }", outputs_block);
+    fclose(f);
+
+    snprintf(p, sizeof(p), "%s/src/main/c/core.c", dir_out);
+    f = fopen(p, "wb");
+    if (!f) return 0;
+    fputs("int core_value(void) { return 42; }\n", f);
+    fclose(f);
+
+    snprintf(p, sizeof(p), "%s/src/main/c/server.c", dir_out);
+    f = fopen(p, "wb");
+    if (!f) return 0;
+    fputs("int core_value(void);\nint main(void) { return core_value() - 42; }\n", f);
+    fclose(f);
+
+    if (with_second_main) {
+        snprintf(p, sizeof(p), "%s/src/main/c/client.c", dir_out);
+        f = fopen(p, "wb");
+        if (!f) return 0;
+        fputs("int core_value(void);\nint main(void) { return core_value() - 42; }\n", f);
+        fclose(f);
+    }
+    return 1;
+}
+
+static int mo_build(const char *dir, NowResult *res) {
+    char desc[512];
+    NowProject *prj;
+    int rc;
+    snprintf(desc, sizeof(desc), "%s/now.pasta", dir);
+    memset(res, 0, sizeof(*res));
+    prj = now_project_load(desc, res);
+    if (!prj) return -99;
+    rc = now_build(prj, dir, 0, 0, res);
+    now_project_free(prj);
+    return rc;
+}
+
+static void test_outputs_two_programs_and_a_library(void) {
+    char dir[512], p[512];
+    NowResult res;
+
+    TEST("outputs: two executables and a library from one folder");
+
+    if (!mo_fixture(dir, sizeof(dir), "mo_three",
+            "{ type: \"executable\", name: \"server\", entry: \"src/main/c/server.c\" },"
+            "{ type: \"executable\", name: \"client\", entry: \"src/main/c/client.c\" },"
+            "{ type: \"static\", name: \"core\" }", 1)) {
+        FAIL("could not build the fixture - cannot establish precondition");
+        return;
+    }
+
+    if (mo_build(dir, &res) != 0) { FAIL(res.message); return; }
+
+    snprintf(p, sizeof(p), "%s/target/bin/server.exe", dir);
+    if (!now_path_exists(p)) {
+        snprintf(p, sizeof(p), "%s/target/bin/server", dir);
+        if (!now_path_exists(p)) { FAIL("server was not linked"); return; }
+    }
+    snprintf(p, sizeof(p), "%s/target/bin/client.exe", dir);
+    if (!now_path_exists(p)) {
+        snprintf(p, sizeof(p), "%s/target/bin/client", dir);
+        if (!now_path_exists(p)) { FAIL("client was not linked"); return; }
+    }
+    snprintf(p, sizeof(p), "%s/target/bin/libcore.a", dir);
+    if (!now_path_exists(p)) { FAIL("the library was not archived"); return; }
+
+    /* And the library did NOT absorb either entry point -- that is the
+     * half a "did it link?" check would miss. */
+    if (file_contains_bytes(p, "server.c.o") == 1 ||
+        file_contains_bytes(p, "client.c.o") == 1) {
+        FAIL("the library absorbed an entry-point object");
+        return;
+    }
+    PASS();
+}
+
+/* Every one of these is refused BEFORE anything links, so the message
+ * names the descriptor rather than leaving the linker to complain about
+ * a duplicate main() nobody wrote. */
+static void test_outputs_an_entry_that_is_not_one_is_refused(void) {
+    char dir[512];
+    NowResult res;
+
+    TEST("outputs: an entry source with no main() is refused");
+
+    if (!mo_fixture(dir, sizeof(dir), "mo_badentry",
+            "{ type: \"executable\", name: \"s\", entry: \"src/main/c/core.c\" }", 0)) {
+        FAIL("could not build the fixture");
+        return;
+    }
+    if (mo_build(dir, &res) == 0) {
+        FAIL("an entry that defines no main() was accepted");
+        return;
+    }
+    if (!strstr(res.message, "main")) {
+        FAIL("refused, but the message does not say why");
+        return;
+    }
+    PASS();
+}
+
+static void test_outputs_two_outputs_cannot_share_an_entry(void) {
+    char dir[512];
+    NowResult res;
+
+    TEST("outputs: two outputs cannot claim the same entry");
+
+    if (!mo_fixture(dir, sizeof(dir), "mo_dupentry",
+            "{ type: \"executable\", name: \"a\", entry: \"src/main/c/server.c\" },"
+            "{ type: \"executable\", name: \"b\", entry: \"src/main/c/server.c\" }", 0)) {
+        FAIL("could not build the fixture");
+        return;
+    }
+    if (mo_build(dir, &res) == 0) {
+        FAIL("two outputs sharing one entry were accepted");
+        return;
+    }
+    PASS();
+}
+
+/* Ambiguity is refused; the unambiguous case is not. An executable with
+ * no `entry:` is fine when the module has exactly one main() -- that is
+ * what every single-output descriptor has always meant. */
+static void test_outputs_no_entry_is_fine_when_there_is_only_one_main(void) {
+    char dir[512], p[512];
+    NowResult res;
+
+    TEST("outputs: no entry is allowed when only one main() exists");
+
+    if (!mo_fixture(dir, sizeof(dir), "mo_solo",
+            "{ type: \"executable\", name: \"solo\" }", 0)) {
+        FAIL("could not build the fixture");
+        return;
+    }
+    if (mo_build(dir, &res) != 0) { FAIL(res.message); return; }
+
+    snprintf(p, sizeof(p), "%s/target/bin/solo.exe", dir);
+    if (!now_path_exists(p)) {
+        snprintf(p, sizeof(p), "%s/target/bin/solo", dir);
+        if (!now_path_exists(p)) { FAIL("solo was not linked"); return; }
+    }
+    PASS();
+}
+
+static void test_outputs_ambiguous_entry_is_refused(void) {
+    char dir[512];
+    NowResult res;
+
+    TEST("outputs: no entry with two main()s is refused, not guessed");
+
+    if (!mo_fixture(dir, sizeof(dir), "mo_ambig",
+            "{ type: \"executable\", name: \"s\" }", 1)) {
+        FAIL("could not build the fixture");
+        return;
+    }
+    if (mo_build(dir, &res) == 0) {
+        FAIL("an ambiguous entry point was guessed rather than refused");
+        return;
+    }
+    PASS();
+}
+
+/* The gate: a descriptor that never says `outputs:` links exactly as it
+ * did before this existed. */
+static void test_outputs_absent_leaves_the_single_path_alone(void) {
+    char root[512], p[512];
+    NowResult res;
+    NowProject *prj;
+    const char *pasta =
+        "{ group: \"org.t\", artifact: \"single\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"executable\", name: \"single\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+
+    TEST("outputs: a descriptor without it uses the single-output path");
+
+    snprintf(root, sizeof(root), "%s/mo_single", NOW_TEST_RESOURCES);
+    rmtree_best_effort(root);
+    if (now_path_exists(root)) { FAIL("could not clear the fixture"); return; }
+    snprintf(p, sizeof(p), "%s/src/main/c", root);
+    now_mkdir_p(p);
+    {
+        FILE *f;
+        snprintf(p, sizeof(p), "%s/src/main/c/main.c", root);
+        f = fopen(p, "wb");
+        if (!f) { FAIL("cannot write main.c"); return; }
+        fputs("int main(void) { return 0; }\n", f);
+        fclose(f);
+    }
+
+    memset(&res, 0, sizeof(res));
+    prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+    ASSERT_EQ((int)prj->outputs.count, 0);
+    if (now_build(prj, root, 0, 0, &res) != 0) {
+        FAIL(res.message); now_project_free(prj); return;
+    }
+    now_project_free(prj);
+
+    snprintf(p, sizeof(p), "%s/target/bin/single.exe", root);
+    if (!now_path_exists(p)) {
+        snprintf(p, sizeof(p), "%s/target/bin/single", root);
+        if (!now_path_exists(p)) { FAIL("the single output was not linked"); return; }
+    }
+    PASS();
+}
+
 static void test_layer_merge_strarray_exclude(void) {
     TEST("layers: !exclude: removes entries in open mode");
     NowStrArray dst;
@@ -11372,6 +11608,12 @@ int main(void) {
     test_zeroconfig_a_source_that_cannot_compile_fails();
     test_zeroconfig_takes_config_from_the_command_line();
     test_zeroconfig_does_not_walk_its_own_output();
+    test_outputs_two_programs_and_a_library();
+    test_outputs_an_entry_that_is_not_one_is_refused();
+    test_outputs_two_outputs_cannot_share_an_entry();
+    test_outputs_no_entry_is_fine_when_there_is_only_one_main();
+    test_outputs_ambiguous_entry_is_refused();
+    test_outputs_absent_leaves_the_single_path_alone();
     test_layer_audit_format();
     test_layer_push_project();
 

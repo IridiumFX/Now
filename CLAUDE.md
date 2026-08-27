@@ -159,6 +159,47 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   nothing. `docs/status.md` claiming "all tiers complete, zero backlog"
   is not accurate. **Grep the source before telling a downstream team a
   field works.**
+- **`outputs:` — several artifacts from one set of objects.** A module
+  produced exactly one thing until 2026-08-25, so two programs sharing a
+  directory had to be two modules with two descriptors repeating one
+  compile configuration for sources already sitting together.
+
+  ```
+  outputs: [
+    { type: "executable", name: "server", entry: "src/main/c/server.c" }
+    { type: "executable", name: "client", entry: "src/main/c/client.c" }
+    { type: "static",     name: "core" }
+  ]
+  ```
+
+  **Nothing lists object files.** An executable links its `entry`
+  object plus every object that defines no entry point; a library takes
+  the no-entry-point set. Which is which comes from
+  `now_obj_defines_symbol()`, not from the filename — the same rule
+  that fixed the entry-point bug the day before. So `server` and
+  `client` share `core.c.o` and neither drags in the other's `main()`.
+
+  An object whose symbol table cannot be read is kept in every artifact
+  rather than dropped: dropping it would remove a symbol from
+  everything with no error anywhere. It warns.
+
+  Everything is validated **before anything links** — an entry that
+  produced no object, an entry that defines no `main()`, two outputs
+  claiming one entry, and an executable with no `entry:` in a module
+  with more than one `main()`. Each is refused with a message naming
+  the descriptor, because the alternative is the linker complaining
+  about a duplicate `main` the author never wrote. `entry:` may be
+  omitted when the module has exactly one `main()`, which is what every
+  single-output descriptor has always meant. An entry point no output
+  claims warns — it is a program that will not be built.
+
+  **`output:` singular is untouched.** A descriptor that never says
+  `outputs:` takes the same code path it always did; `now` itself is
+  the standing proof, since its own descriptor is single-output.
+  `build_link_body` now takes a `NowLinkTarget` (what to link, what to
+  call it) instead of reading `p->output` and `ctx->objects` directly —
+  that is the whole reason it can run more than once.
+
 - **`now build` with no `now.pasta` compiles to objects and stops.**
   It used to exit 3. It now walks the tree, compiles every source it
   recognises, and says what it did not do:
