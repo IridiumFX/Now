@@ -6154,6 +6154,103 @@ static void test_outputs_absent_leaves_the_single_path_alone(void) {
     PASS();
 }
 
+/* ---- the link sees objects in a canonical order -------------------
+ *
+ * The parallel compile pushes objects as jobs FINISH, and completion
+ * order is a property of the scheduler, not of the source. The link
+ * command line inherited it, and object order changes code layout.
+ *
+ * miggy measured it on 2026-08-26 across `git worktree` checkouts of one
+ * commit: six different artifacts from seven fresh checkouts, three
+ * sizes, 80,525 differing bytes between two of them -- `.data`
+ * identical, `.text`/`.rodata` not, and the divergence starting at one
+ * symbol where two translation units of a module swapped places. It
+ * cost them a published measurement: `-mstrict-align` at 16 bytes on
+ * RV64, against a build whose own spread was 24.
+ *
+ * Reproduced here before the fix, 6 fresh directories with 24
+ * translation units each: worst pairwise difference 94 bytes. After:
+ * 2 bytes, which is the PE header's build timestamp and nothing else.
+ *
+ * This asserts the invariant rather than comparing binaries, because
+ * comparing binaries on Windows measures the timestamp too.
+ */
+static void test_build_object_order_is_canonical(void) {
+    TEST("build: the link gets objects in sorted order, not completion order");
+
+    char root[512], d[512], p[512];
+    NowResult res;
+    NowProject *prj;
+    NowBuildCtx ctx;
+    size_t i;
+    int sorted_ok = 1;
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"objorder\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"executable\", name: \"objorder\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+
+    snprintf(root, sizeof(root), "%s/objorder_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    if (now_path_exists(d)) {
+        FAIL("could not clear target/ - cannot establish the precondition");
+        return;
+    }
+    snprintf(d, sizeof(d), "%s/src", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+
+    /* Enough units that the scheduler can finish them out of order, and
+     * named so that completion order and sorted order are unlikely to
+     * coincide by luck. */
+    for (i = 0; i < 12; i++) {
+        FILE *f;
+        snprintf(p, sizeof(p), "%s/src/main/c/u%02u.c", root, (unsigned)i);
+        f = fopen(p, "wb");
+        if (!f) { FAIL("cannot write a source"); return; }
+        fprintf(f, "int u%02u(void) { return %u; }\n", (unsigned)i, (unsigned)i);
+        fclose(f);
+    }
+    snprintf(p, sizeof(p), "%s/src/main/c/main.c", root);
+    {
+        FILE *f = fopen(p, "wb");
+        if (!f) { FAIL("cannot write main.c"); return; }
+        fputs("int main(void) { return 0; }\n", f);
+        fclose(f);
+    }
+
+    memset(&res, 0, sizeof(res));
+    prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+
+    if (now_build_init(&ctx, prj, root, &res) != 0) {
+        FAIL("build init failed"); now_project_free(prj); return;
+    }
+    if (now_build_compile(&ctx, &res) != 0) {
+        FAIL(res.message[0] ? res.message : "compile failed");
+        now_build_free(&ctx); now_project_free(prj); return;
+    }
+
+    if (ctx.objects.count < 12) {
+        FAIL("too few objects to say anything about their order");
+        now_build_free(&ctx); now_project_free(prj); return;
+    }
+    for (i = 1; i < ctx.objects.count; i++)
+        if (strcmp(ctx.objects.paths[i - 1], ctx.objects.paths[i]) > 0)
+            sorted_ok = 0;
+
+    now_build_free(&ctx);
+    now_project_free(prj);
+    snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+
+    if (!sorted_ok) {
+        FAIL("objects reach the link in completion order, so the layout "
+             "depends on the scheduler rather than the source");
+        return;
+    }
+    PASS();
+}
+
 static void test_layer_merge_strarray_exclude(void) {
     TEST("layers: !exclude: removes entries in open mode");
     NowStrArray dst;
@@ -11860,6 +11957,7 @@ int main(void) {
     test_build_each_names_binaries_by_source();
     test_build_archive_drops_a_removed_source();
     test_build_relinks_when_the_object_list_changes();
+    test_build_object_order_is_canonical();
     test_build_fail_fast_stops_starting_work();
     test_events_encode_decode_roundtrip();
     test_events_detail_survives_escaping();

@@ -2620,6 +2620,8 @@ static int build_java_test(NowBuildCtx *ctx, NowResult *result) {
     return rc;
 }
 
+static int cmp_path_ptr(const void *a, const void *b);
+
 NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
     const NowProject *p = ctx->project;
     int errors = 0;
@@ -3454,6 +3456,36 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         if (compiled > 0 || manifest_dirty || lfh_changed)
             now_manifest_save(&manifest, manifest_path);
     }
+    /* Canonical order for everything downstream.
+     *
+     * The parallel compile pushes objects as jobs FINISH, so the list is
+     * in completion order, and completion order is a property of the
+     * scheduler rather than of the source. The link command line
+     * inherited that, and object order changes code layout: same commit,
+     * same toolchain, same machine, different ROM.
+     *
+     * miggy measured it on 2026-08-26 across `git worktree` checkouts of
+     * one commit: six different hashes from seven fresh checkouts, at
+     * three different sizes, 80,525 differing bytes between two of them,
+     * `.data` identical and `.text`/`.rodata` not. The divergence began
+     * at one symbol -- two translation units of one module reaching the
+     * linker the other way round. It cost them a published measurement:
+     * they had `-mstrict-align` at 16 bytes on RV64 and the build's own
+     * spread is 24.
+     *
+     * Within one directory it mostly hides. A rebuild that skips
+     * everything pushes in source-iteration order, which is stable, so
+     * only the runs that actually compile something move -- which is why
+     * their builds 2 and 3 agreed and build 1 did not.
+     *
+     * `link_flags_hash` already sorted a COPY for exactly this reason
+     * ("the parallel compile pushes objects as jobs finish"). The
+     * instability was known and compensated for where it would have
+     * caused spurious relinks, and not where it changed the output. */
+    if (ctx->objects.count > 1)
+        qsort(ctx->objects.paths, ctx->objects.count,
+              sizeof(*ctx->objects.paths), cmp_path_ptr);
+
     if (g_timing_on) now_timing_mark("  .manifest_save");
 
     /* Save dirwalk cache — any new entries discovered during this build */
