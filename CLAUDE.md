@@ -159,6 +159,35 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   nothing. `docs/status.md` claiming "all tiers complete, zero backlog"
   is not accurate. **Grep the source before telling a downstream team a
   field works.**
+- **A source edited inside the last build's timestamp tick used to be
+  invisible.** The staleness check cleared an entry on its mtime alone:
+  when the recorded mtime matched, the content was never hashed and the
+  size was never consulted. Measured 2026-08-27: write a source, build,
+  rewrite it in the same second with different content AND a different
+  size (32 bytes to 82), build again — `compiled 0, skipped 2 (up to
+  date)`, and the program kept its old behaviour. A second of delay and
+  it compiled correctly.
+
+  That is a build silently missing a real source change, which is a
+  different order of problem from rebuilding too often. Reachable by
+  anything that edits between builds faster than the clock ticks: a
+  script, a generator, an editor autosave, CI.
+
+  Git calls it the racily clean case. The fix is the same: an entry
+  whose recorded mtime is **not strictly older** than the manifest's own
+  timestamp has to be hashed rather than believed. `NowManifest.written_at`
+  is that timestamp, taken from the manifest file's mtime at load — no
+  format change, works with existing manifests. Cost: hashing only the
+  sources whose mtime falls in the manifest's own second, normally none.
+
+  **What it does NOT catch, deliberately:** a source whose content
+  changes while its mtime is moved BACKWARDS (`rsync --times`, a
+  restored archive). No mtime-based scheme can, and demanding it would
+  mean hashing every source on every build. The test constructs the real
+  condition — manifest and source pinned to one second — rather than
+  forging an older timestamp; an earlier version did the latter and
+  failed against a correct fix.
+
 - **Objects reach the link in sorted order, and that is load-bearing.**
   The parallel compile pushes each object as its job FINISHES, so the
   list was in completion order — a property of the scheduler, not of the

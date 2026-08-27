@@ -36,6 +36,16 @@ typedef struct {
      * resize, the index is dropped and rebuilt on the next lookup. */
     int              *index_buckets;    /* entry idx or -1; size = index_cap */
     size_t            index_cap;        /* power-of-2, 0 if unbuilt */
+    /* When this manifest was last written, in whole seconds.
+     *
+     * An entry whose recorded mtime is not strictly older than this is
+     * "racily clean": the source could have been edited after the
+     * manifest was written and still carry that same timestamp, because
+     * the filesystem cannot tell the two moments apart. Such an entry
+     * must be hashed rather than believed. Git calls this the racily
+     * clean case and solves it the same way. Zero means "unknown",
+     * which is treated as racy. */
+    long long         written_at;
 } NowManifest;
 
 NOW_API void now_manifest_init(NowManifest *m);
@@ -82,7 +92,11 @@ NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
  * distrust shows up is `rm -rf target` at the top of every loop — which
  * costs far more than the check it is working around. `reason` may be
  * NULL, which makes this identical to the call above. */
+/* `written_at` is the manifest's own timestamp; pass
+ * m->written_at. See the note on that field for why an entry
+ * whose mtime matches it cannot be taken at face value. */
 NOW_API int now_manifest_needs_rebuild_ex(const NowManifestEntry *entry,
+                                long long written_at,
                                            const char *basedir,
                                            const char *source,
                                            const char *flags_hash,

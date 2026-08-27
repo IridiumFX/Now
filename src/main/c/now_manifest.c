@@ -330,7 +330,7 @@ NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
                                 const char *source,
                                 const char *flags_hash,
                                 NowStatCache *stat_cache) {
-    return now_manifest_needs_rebuild_ex(entry, basedir, source, flags_hash,
+    return now_manifest_needs_rebuild_ex(entry, 0, basedir, source, flags_hash,
                                           stat_cache, NULL, 0);
 }
 
@@ -339,6 +339,7 @@ NOW_API int now_manifest_needs_rebuild(const NowManifestEntry *entry,
     snprintf(reason, reason_cap, __VA_ARGS__); } while (0)
 
 NOW_API int now_manifest_needs_rebuild_ex(const NowManifestEntry *entry,
+                                long long written_at,
                                 const char *basedir,
                                 const char *source,
                                 const char *flags_hash,
@@ -364,6 +365,36 @@ NOW_API int now_manifest_needs_rebuild_ex(const NowManifestEntry *entry,
     long long cur_mtime = 0;
     if (!now_stat_cached(stat_cache, full, &cur_mtime)) {
         WHY("source is missing or unreadable"); free(full); return 1; }
+
+    /* An entry recorded in the same second the manifest was written
+     * cannot be cleared on its timestamp alone: an edit made after that
+     * write carries the same second, so "mtime unchanged" and "content
+     * unchanged" stop being the same statement.
+     *
+     * Measured 2026-08-27 without this: write a source, build, rewrite
+     * it in the same second with DIFFERENT CONTENT AND A DIFFERENT SIZE
+     * (32 bytes to 82), build again -- reported "compiled 0, skipped 2
+     * (up to date)" and the program kept the old behaviour. A second of
+     * delay before the build and it compiled correctly. That is a build
+     * silently missing a real source change, which is worse than any
+     * amount of rebuilding.
+     *
+     * Cost: hashing only those sources whose recorded mtime falls in the
+     * manifest's own second -- normally none, at most the ones just
+     * compiled. */
+    if (cur_mtime == entry->mtime &&
+        (written_at == 0 || entry->mtime >= written_at)) {
+        char *racy_hash = now_sha256_file(full);
+        if (!racy_hash) { WHY("source unreadable"); free(full); return 1; }
+        if (!entry->source_hash ||
+            strcmp(racy_hash, entry->source_hash) != 0) {
+            free(racy_hash);
+            free(full);
+            WHY("source changed within the last build's timestamp tick");
+            return 1;
+        }
+        free(racy_hash);
+    }
 
     if (cur_mtime != entry->mtime) {
         /* mtime differs — hash to confirm */
@@ -555,6 +586,14 @@ NOW_API int now_manifest_load(NowManifest *m, const char *path) {
     now_manifest_init(m);
 
     if (!now_path_exists(path)) return 0;  /* no manifest yet → empty */
+
+    /* When this manifest was written. Every entry whose recorded mtime
+     * lands in the same second has to be hashed rather than believed —
+     * see the note on NowManifest.written_at. */
+    {
+        struct stat mst;
+        if (stat(path, &mst) == 0) m->written_at = (long long)mst.st_mtime;
+    }
 
     unsigned char *raw = NULL;
     size_t raw_len = 0;
