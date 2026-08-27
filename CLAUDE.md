@@ -159,6 +159,28 @@ a 40-parameter prototype came out with 24 arguments — and *compiled*.
   nothing. `docs/status.md` claiming "all tiers complete, zero backlog"
   is not accurate. **Grep the source before telling a downstream team a
   field works.**
+- **Objects reach the link in sorted order, and that is load-bearing.**
+  The parallel compile pushes each object as its job FINISHES, so the
+  list was in completion order — a property of the scheduler, not of the
+  source — and object order changes code layout. miggy measured it
+  2026-08-26 across `git worktree` checkouts of one commit: six
+  different artifacts from seven fresh checkouts, three sizes, 80,525
+  differing bytes between two, `.data` identical and `.text`/`.rodata`
+  not. It cost them a published measurement (`-mstrict-align` at 16
+  bytes, against a build whose own spread was 24).
+
+  Within one directory it mostly hides: a rebuild that skips everything
+  pushes in source order, which is stable, so only runs that actually
+  compile move. `now reproducible:check` builds twice in the same
+  directory and so cannot see it at all.
+
+  `link_flags_hash` had already sorted a COPY for exactly this reason
+  ("the parallel compile pushes objects as jobs finish") — the
+  instability was known and compensated for where it caused spurious
+  relinks, and not where it changed the output. Reproduced here at 94
+  differing bytes across 6 fresh directories; after sorting, 2, which
+  is the PE header timestamp and nothing else.
+
 - **`outputs:` — several artifacts from one set of objects.** A module
   produced exactly one thing until 2026-08-25, so two programs sharing a
   directory had to be two modules with two descriptors repeating one
