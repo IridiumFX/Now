@@ -6251,6 +6251,151 @@ static void test_build_object_order_is_canonical(void) {
     PASS();
 }
 
+/* ---- a change inside the last build's tick is still a change -------
+ *
+ * The staleness check cleared a source on its mtime alone: if the
+ * recorded mtime matched, the content was never hashed. So an edit
+ * landing in the same filesystem tick as the previous build was
+ * invisible, and the build reported "up to date" about a file whose
+ * bytes had changed.
+ *
+ * Measured 2026-08-27: write a source, build, rewrite it in the same
+ * second with different content AND a different size (32 bytes to 82),
+ * build again -- "compiled 0, skipped 2 (up to date)", and the program
+ * kept the old behaviour. One second of delay and it compiled. Size
+ * alone did not save it, because size was never consulted either.
+ *
+ * That is a build silently missing a real source change, which is a
+ * different order of problem from rebuilding too often. Git calls this
+ * the racily clean case; the fix is the same one: an entry whose mtime
+ * is not strictly older than the manifest's own timestamp has to be
+ * hashed rather than believed.
+ *
+ * This test does no sleeping. It writes, builds, rewrites and builds as
+ * fast as it can, which is exactly the condition -- a script or a
+ * generator editing between builds, which is how a peer would hit it.
+ */
+static void test_build_sees_a_change_within_the_same_tick(void) {
+    TEST("build: a source rewritten inside the last build's tick rebuilds");
+
+    char root[512], d[512], p[512];
+    NowResult res;
+    NowProject *prj;
+    const char *pasta =
+        "{ group: \"org.test\", artifact: \"racy\", version: \"1\","
+        "  langs: [\"c\"],"
+        "  output: { type: \"static\", name: \"racy\" },"
+        "  sources: { dir: \"src/main/c\" } }";
+
+    snprintf(root, sizeof(root), "%s/racy_proj", NOW_TEST_RESOURCES);
+    snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+    if (now_path_exists(d)) {
+        FAIL("could not clear target/ - cannot establish the precondition");
+        return;
+    }
+    snprintf(d, sizeof(d), "%s/src", root); rmtree_best_effort(d);
+    snprintf(d, sizeof(d), "%s/src/main/c", root); now_mkdir_p(d);
+    snprintf(p, sizeof(p), "%s/src/main/c/mod.c", root);
+
+    {
+        FILE *f = fopen(p, "wb");
+        if (!f) { FAIL("cannot write mod.c"); return; }
+        fputs("int mod_value(void) { return 1; }\n", f);
+        fclose(f);
+    }
+
+    memset(&res, 0, sizeof(res));
+    prj = now_project_load_string(pasta, strlen(pasta), &res);
+    ASSERT_NOT_NULL(prj);
+    if (now_build(prj, root, 0, 0, &res) != 0) {
+        FAIL(res.message); now_project_free(prj); return;
+    }
+    /* Construct the racily-clean condition exactly, rather than
+     * waiting for it.
+     *
+     * The condition is: a source whose recorded mtime falls in the
+     * same second the manifest was written, edited afterwards. The
+     * filesystem cannot separate those two moments, so "mtime
+     * unchanged" stops implying "content unchanged".
+     *
+     * Two earlier versions of this test were wrong in opposite
+     * directions. One rewrote the file quickly and hoped both landed
+     * in one tick -- it passed with the fix reverted, three runs out
+     * of three, because the first build took longer than a second.
+     * The other rewound the mtime to its original value, which is a
+     * FORGED timestamp older than the manifest: no mtime-based
+     * scheme detects that, and demanding it would have meant hashing
+     * every source on every build. Pinning the manifest and the
+     * source to one second is the real case and the fixable one.
+     */
+    {
+        struct stat sst;
+        struct utimbuf keep;
+        char mpath[512];
+        FILE *f;
+
+        if (stat(p, &sst) != 0) {
+            FAIL("cannot stat mod.c"); now_project_free(prj); return;
+        }
+
+        /* Put the manifest in the same second as the source it
+         * recorded. This is what happens naturally when a build is
+         * fast, which is when a script would hit it. */
+        snprintf(mpath, sizeof(mpath), "%s/target/.now-manifest", root);
+        keep.actime = sst.st_atime;
+        keep.modtime = sst.st_mtime;
+        if (utime(mpath, &keep) != 0) {
+            FAIL("cannot set the manifest mtime - no precondition");
+            now_project_free(prj);
+            return;
+        }
+
+        f = fopen(p, "wb");
+        if (!f) { FAIL("cannot rewrite mod.c"); now_project_free(prj); return; }
+        fputs("int mod_marker_after_edit(void) { return 7; }\n"
+              "int mod_value(void) { return mod_marker_after_edit() + 35; }\n", f);
+        fclose(f);
+
+        /* Same timestamp, different bytes, different size. */
+        if (utime(p, &keep) != 0) {
+            FAIL("cannot hold the mtime"); now_project_free(prj); return;
+        }
+        {
+            struct stat after;
+            if (stat(p, &after) != 0 || after.st_mtime != sst.st_mtime) {
+                FAIL("mtime did not stay put - precondition not established");
+                now_project_free(prj);
+                return;
+            }
+        }
+    }
+
+    if (now_build(prj, root, 0, 0, &res) != 0) {
+        FAIL(res.message); now_project_free(prj); return;
+    }
+    now_project_free(prj);
+
+    /* The archive must carry the edited translation unit. Checking for a
+     * symbol that exists only in the new text says the compile happened,
+     * which "did the build report a rebuild" would not. */
+    {
+        char lib[512];
+        int has_new;
+        snprintf(lib, sizeof(lib), "%s/target/bin/libracy.a", root);
+        has_new = file_contains_bytes(lib, "mod_marker_after_edit");
+
+        snprintf(d, sizeof(d), "%s/src", root);    rmtree_best_effort(d);
+        snprintf(d, sizeof(d), "%s/target", root); rmtree_best_effort(d);
+
+        if (has_new != 1) {
+            FAIL("the edit was not compiled - the build cleared a changed "
+                 "source on its mtime alone");
+            return;
+        }
+    }
+    PASS();
+}
+
 static void test_layer_merge_strarray_exclude(void) {
     TEST("layers: !exclude: removes entries in open mode");
     NowStrArray dst;
@@ -11290,7 +11435,7 @@ static void test_cache_deps_for_key_resolves_proj_token(void) {
     ASSERT_NOT_NULL(e);
     char reason[512];
     reason[0] = '\0';
-    int rebuild = now_manifest_needs_rebuild_ex(e, basedir, "mod.c", "fh",
+    int rebuild = now_manifest_needs_rebuild_ex(e, m.written_at, basedir, "mod.c", "fh",
                                                 NULL, reason, sizeof reason);
     if (rebuild != 0)
         printf("    (reason: %s)\n", reason);
@@ -11958,6 +12103,7 @@ int main(void) {
     test_build_archive_drops_a_removed_source();
     test_build_relinks_when_the_object_list_changes();
     test_build_object_order_is_canonical();
+    test_build_sees_a_change_within_the_same_tick();
     test_build_fail_fast_stops_starting_work();
     test_events_encode_decode_roundtrip();
     test_events_detail_survives_escaping();

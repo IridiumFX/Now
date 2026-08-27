@@ -2850,7 +2850,8 @@ NOW_API int now_build_compile(NowBuildCtx *ctx, NowResult *result) {
         /* Check manifest for incremental skip */
         const NowManifestEntry *entry = now_manifest_find(&manifest, src);
         char why[512];
-        int need = now_manifest_needs_rebuild_ex(entry, ctx->basedir, src, fhash,
+        int need = now_manifest_needs_rebuild_ex(entry, manifest.written_at,
+                                                  ctx->basedir, src, fhash,
                                                   &ctx->stat_cache,
                                                   g_explain ? why : NULL,
                                                   g_explain ? sizeof(why) : 0);
